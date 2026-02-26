@@ -98,24 +98,59 @@ def login():
 
 
 def get_books(token):
-    log("📚 Fetching book library...")
-    resp = requests.post(
-        f"{BASE_URL}/ObjectBook/AuthorObjectBookList",
-        headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
-        json={
-            "PageIndex": 1, "PageSize": 100,
-            "fromLanguage": "", "fromBookName": "", "toBookName": "",
-            "translationStatus": None, "roleTypeStatus": None,
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    # Navigate common response shapes
-    data = body.get("data", {})
-    books = data.get("list") or data.get("items") or (data if isinstance(data, list) else [])
-    log(f"   Found {len(books)} book(s).")
-    return books
+    """Fetches ALL books across all pages so newly added books are never missed."""
+    log("📚 Fetching full book list (all pages)...")
+    all_books = []
+    page = 1
+    page_size = 100
+
+    while True:
+        resp = requests.post(
+            f"{BASE_URL}/ObjectBook/AuthorObjectBookList",
+            headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
+            json={
+                "PageIndex": page, "PageSize": page_size,
+                "fromLanguage": "", "fromBookName": "", "toBookName": "",
+                "translationStatus": None, "roleTypeStatus": None,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        data = body.get("data", {})
+
+        # On first page, log structure to help debug field names
+        if page == 1:
+            log(f"   📋 Response keys: {list(body.keys())}")
+            if isinstance(data, dict):
+                log(f"   📋 'data' keys: {list(data.keys())}")
+                for key in data:
+                    val = data[key]
+                    if isinstance(val, list) and len(val) > 0:
+                        log(f"   📋 First item in '{key}': {json.dumps(val[0], ensure_ascii=False)}")
+            elif isinstance(data, list) and len(data) > 0:
+                log(f"   📋 First book item: {json.dumps(data[0], ensure_ascii=False)}")
+
+        books = (
+            (data.get("list") if isinstance(data, dict) else None)
+            or (data.get("items") if isinstance(data, dict) else None)
+            or (data.get("records") if isinstance(data, dict) else None)
+            or (data if isinstance(data, list) else [])
+        )
+
+        if not books:
+            break  # no more pages
+
+        all_books.extend(books)
+        log(f"   Page {page}: {len(books)} book(s).")
+
+        if len(books) < page_size:
+            break  # last page reached
+
+        page += 1
+
+    log(f"   ✅ Total books: {len(all_books)}")
+    return all_books
 
 
 def get_available_chapters(token, book_id):
@@ -154,13 +189,29 @@ def run():
     claimed_chapters = []
     errors = []
 
-    for book in books:
+    for i, book in enumerate(books):
+        # Debug: show all fields on the first book so we know exact field names
+        if i == 0:
+            log(f"   📋 Book fields available: {list(book.keys())}")
+            log(f"   📋 First book data: {json.dumps(book, ensure_ascii=False)}")
+
         # Try multiple possible field names for book ID and name
-        book_id   = book.get("bookId") or book.get("objectBookId") or book.get("id")
-        book_name = book.get("bookName") or book.get("name") or book.get("toBookName") or f"Book #{book_id}"
+        book_id = (
+            book.get("bookId")
+            or book.get("objectBookId")
+            or book.get("id")
+            or book.get("bookCode")
+        )
+        book_name = (
+            book.get("bookName")
+            or book.get("name")
+            or book.get("toBookName")
+            or book.get("outputBookName")
+            or f"Book #{book_id}"
+        )
 
         if not book_id:
-            log(f"⚠️  Could not find book ID in: {list(book.keys())}")
+            log(f"⚠️  Could not find book ID in fields: {list(book.keys())}")
             continue
 
         log(f"📖 Checking: {book_name} (ID: {book_id})")
