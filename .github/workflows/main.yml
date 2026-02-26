@@ -2,9 +2,9 @@ name: CDReader Chapter Checker
 
 on:
   schedule:
-    # Runs every 5 minutes — adjust as needed
+    # Runs every 10 minutes — adjust as needed
     # Format: minute hour day month weekday
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:  # allows manual trigger from GitHub UI
 
 jobs:
