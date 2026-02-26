@@ -1,5 +1,5 @@
 """
-CDReader Chapter Checker & Auto-Claimer
+CDReader Chapter Checker & Auto-Claimer v2
 """
 
 import requests
