@@ -1,5 +1,5 @@
 """
-CDReader Chapter Checker & Auto-Claimer v2
+CDReader Chapter Checker & Auto-Claimer
 """
 
 import requests
@@ -155,7 +155,7 @@ def run():
     errors = []
 
     for book in books:
-        book_id   = book.get("bookId") or book.get("objectBookId") or book.get("id")
+        book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
         book_name = (
             book.get("toBookName")
             or book.get("bookName")
