@@ -228,6 +228,7 @@ def run():
         send_telegram("\n".join(lines))
     else:
         log("Check complete - no available chapters found this run.")
+        send_telegram("✅ CDReader check ran — no chapters available right now.")
 
     if errors:
         log(f"Errors: {errors}")
