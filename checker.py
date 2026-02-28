@@ -131,8 +131,16 @@ def get_available_chapters(token, book_id):
     )
     resp.raise_for_status()
     body = resp.json()
-    data = body.get("data", [])
-    return data if isinstance(data, list) else []
+    data = body.get("data", {})
+    # API returns data as dict with "dto" key containing the chapter list
+    if isinstance(data, dict):
+        chapters = data.get("dto") or data.get("list") or data.get("dtolist") or []
+    elif isinstance(data, list):
+        chapters = data
+    else:
+        chapters = []
+    log(f"    Chapter API response: code={body.get('code')}, chapters found={len(chapters)}")
+    return chapters
 
 def claim_chapter(token, chapter_id):
     resp = requests.get(
@@ -177,7 +185,7 @@ def run():
         log(f"  {len(chapters)} chapter(s) available!")
 
         for ch in chapters:
-            chapter_id   = ch.get("chapterId") or ch.get("objectChapterId") or ch.get("id")
+            chapter_id   = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
             chapter_name = ch.get("chapterName") or ch.get("name") or f"Chapter #{chapter_id}"
 
             if DRY_RUN:
