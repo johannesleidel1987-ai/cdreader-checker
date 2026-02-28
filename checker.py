@@ -163,6 +163,9 @@ def run():
     errors = []
 
     for book in books:
+        # Stop processing more books if a chapter was already claimed
+        if claimed_chapters:
+            break
         book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
         book_name = (
             book.get("toBookName")
@@ -195,17 +198,23 @@ def run():
 
             try:
                 result = claim_chapter(token, chapter_id)
+                # API returns status=True and message=SaveSuccess on success
                 success = (
-                    result.get("code") == 0
-                    or result.get("success") is True
-                    or result.get("status") == 200
+                    result.get("status") is True
+                    or result.get("message") == "SaveSuccess"
+                    or result.get("code") == "311"
+                    or result.get("code") == 0
                 )
+                no_chapter = result.get("message") == "NoChapterNumber"
                 if success:
-                    log(f"  Claimed: {chapter_name}")
+                    log(f"  ✅ Successfully claimed: {chapter_name}")
                     claimed_chapters.append((book_name, chapter_name, "claimed"))
+                    # Platform only allows one claim at a time — stop immediately
+                    break  # stop checking more chapters in this book
+                elif no_chapter:
+                    log(f"  ⏭  Not claimable right now: {chapter_name}")
                 else:
-                    log(f"  Claim response: {result}")
-                    claimed_chapters.append((book_name, chapter_name, f"response: {result}"))
+                    log(f"  ⚠️  Unexpected response: {result}")
             except Exception as e:
                 log(f"  Error claiming {chapter_name}: {e}")
                 errors.append(f"{book_name} / {chapter_name}: {e}")
