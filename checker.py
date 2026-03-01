@@ -408,7 +408,37 @@ For each row, "original" is the English source and "content" is the German pre-t
             text = text.split("\n", 1)[-1]
             text = text.rsplit("```", 1)[0].strip()
 
-        rephrased = json.loads(text)
+        # Fix unescaped newlines/tabs inside JSON string values (common Gemini issue)
+        import re as _re
+        def _fix_json_strings(s):
+            # Replace literal newlines/tabs inside JSON string values with escaped versions
+            result = []
+            in_string = False
+            escape_next = False
+            for ch in s:
+                if escape_next:
+                    result.append(ch)
+                    escape_next = False
+                elif ch == '\\':
+                    result.append(ch)
+                    escape_next = True
+                elif ch == '"' and not escape_next:
+                    in_string = not in_string
+                    result.append(ch)
+                elif in_string and ch == '\n':
+                    result.append('\\n')
+                elif in_string and ch == '\r':
+                    result.append('\\r')
+                elif in_string and ch == '\t':
+                    result.append('\\t')
+                else:
+                    result.append(ch)
+            return ''.join(result)
+
+        try:
+            rephrased = json.loads(text)
+        except json.JSONDecodeError:
+            rephrased = json.loads(_fix_json_strings(text))
         log(f"  Gemini returned {len(rephrased)} rows.")
         return rephrased
 
@@ -553,6 +583,9 @@ def find_active_chapter(token, books):
             # Only process active (not yet finished) tasks: status=0 means in-progress
             if task.get("status", 1) != 0:
                 continue
+            # Skip if already finished (finishTime set = completed, even if status not updated yet)
+            if task.get("finishTime") is not None:
+                continue
 
             # Extract chapter ID — the proc_id
             proc_id = task.get("chapterId") or task.get("objectChapterId")
@@ -620,7 +653,7 @@ def run():
     if active:
         active_book, active_ch_name, active_proc_id = active
         log(f"Found active chapter: {active_ch_name} (proc_id={active_proc_id})")
-        claimed_chapters.append((active_book, active_ch_name, None, "already-claimed"))
+        claimed_chapters.append((active_book, active_ch_name, None, "already-claimed", None))
     else:
         # ── Phase 1: Claim ──
         for book in books:
@@ -652,7 +685,7 @@ def run():
 
                 if DRY_RUN:
                     log(f"  [DRY RUN] Would claim: {ch_name}")
-                    claimed_chapters.append((book, ch_name, ch_id, "dry-run"))
+                    claimed_chapters.append((book, ch_name, ch_id, "dry-run", None))
                     break
 
                 result = claim_chapter(token, ch_id)
@@ -666,7 +699,16 @@ def run():
 
                 if success:
                     log(f"  ✅ Claimed: {ch_name}")
-                    claimed_chapters.append((book, ch_name, ch_id, "claimed"))
+                    # Try to extract proc_id directly from claim response data
+                    claim_proc_id = None
+                    rdata = result.get("data")
+                    if isinstance(rdata, dict):
+                        claim_proc_id = (rdata.get("chapterId") or rdata.get("id")
+                                        or rdata.get("objectChapterId"))
+                    elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
+                        claim_proc_id = int(rdata)
+                    log(f"  Claim response data: {rdata} → proc_id={claim_proc_id}")
+                    claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id))
                     break
                 elif no_chapter:
                     log(f"  ⏭  Not claimable right now: {ch_name}")
@@ -679,7 +721,9 @@ def run():
         return
 
     # ── Phase 2-6: Process each claimed chapter ──
-    book, ch_name, ch_id, status = claimed_chapters[0]
+    entry = claimed_chapters[0]
+    book, ch_name, ch_id, status = entry[0], entry[1], entry[2], entry[3]
+    claim_proc_id = entry[4] if len(entry) > 4 else None
     book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
     book_name = book.get("toBookName") or book.get("bookName") or book.get("name") or ""
 
@@ -704,16 +748,13 @@ def run():
             send_telegram(msg)
             return
     else:
-        # Freshly claimed — use Task Center to get proc_id (most reliable)
-        log("  Waiting 3s for platform to register claim...")
-        time.sleep(3)
-        active_after = find_active_chapter(token, books)
-        if active_after:
-            _, _, proc_id = active_after
-            log(f"  proc_id from Task Center after claim: {proc_id}")
+        # Freshly claimed — try proc_id from claim response first
+        proc_id = claim_proc_id
+        if proc_id:
+            log(f"  proc_id from claim response: {proc_id}")
         else:
-            # Fallback: try AuthorChapterList with correct book id
-            log("  Task Center found nothing yet, trying AuthorChapterList...")
+            # Fallback: AuthorChapterList (with correct book id)
+            log("  No proc_id in claim response, trying AuthorChapterList...")
             proc_id, _ = find_chapter_processing_id(token, book, ch_name)
         if not proc_id:
             msg = (
@@ -733,6 +774,13 @@ def run():
     if not rows:
         msg = f"⚠️ <b>CDReader:</b> No rows fetched for {ch_name}. Manual action required."
         send_telegram(msg)
+        return
+
+    # Guard: if modifChapterContent is already populated on the first row,
+    # this chapter was already processed by a previous run (Task Center finishTime lags).
+    first_row_modified = rows[0].get("modifChapterContent") or ""
+    if first_row_modified.strip():
+        log(f"  ⏭  Chapter already processed (modifChapterContent present) — skipping.")
         return
 
     # Fetch glossary
