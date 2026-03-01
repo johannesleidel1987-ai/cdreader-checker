@@ -417,7 +417,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
 
     BATCH_SIZE = 40
-    MAX_RETRIES = 3
+    MAX_RETRIES = 5        # More retries for transient errors
+    MAX_RETRIES_429 = 5    # Dedicated retry count for rate limits
 
     def _fix_json_strings(s):
         """Fix literal newlines/tabs inside JSON string values."""
@@ -478,7 +479,7 @@ ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):
 For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields.
 {json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"""
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, MAX_RETRIES_429 + 1):
             try:
                 resp = requests.post(
                     f"{GEMINI_URL}?key={GEMINI_API_KEY}",
@@ -493,8 +494,9 @@ For each row, "original" is the English source text (may be empty), and "content
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    wait = 30 * attempt
-                    log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
+                    # Rate limit — use longer waits: 60/120/180/240/300s
+                    wait = 60 * attempt
+                    log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES_429}), retrying in {wait}s...")
                     time.sleep(wait)
                     continue
                 resp.raise_for_status()
@@ -560,7 +562,7 @@ For each row, "original" is the English source text (may be empty), and "content
             return None
         all_rephrased.extend(result)
         if i < total_batches:
-            time.sleep(3)  # Small pause between batches
+            time.sleep(20)  # Pause between batches to stay under Gemini RPM limit
 
     log(f"  Total rows from Gemini: {len(all_rephrased)}")
 
