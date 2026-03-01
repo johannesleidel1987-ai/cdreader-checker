@@ -489,68 +489,81 @@ def finish_chapter(token, chapter_id):
 # ─── Phase 0: Find already active chapter ────────────────────────────────────
 def find_active_chapter(token, books):
     """
-    Check AuthorChapterList for each book looking for a chapter with
-    a status indicating it is currently claimed/in-progress (not yet submitted).
+    Use receiveType=1 to find chapters already claimed/in-progress.
+    Falls back to receiveType=0 and receiveType=3.
     Returns (book, chapter_name, proc_id) or None.
     """
-    # Status values that indicate chapter is active/claimed but not finished
-    # Typically: status 1=claimed/in-progress, 2=submitted/done
-    # We log all status values found so we can tune this if needed
-    ACTIVE_STATUSES = {1, 3, 4, 5}  # will log what we find to calibrate
+    log("  Scanning for active chapter using Receive endpoint (receiveType=1)...")
 
     for book in books:
-        book_id_for_list = (
-            book.get("bookId") or book.get("objectBookId") or book.get("id")
-        )
+        book_id = book.get("id") or book.get("objectBookId") or book.get("bookId")
         book_name = (
             book.get("toBookName") or book.get("bookName") or
-            book.get("name") or f"Book #{book_id_for_list}"
+            book.get("name") or f"Book #{book_id}"
         )
 
-        page = 1
-        while True:
+        for receive_type in [1, 0, 3]:
             try:
-                resp = requests.post(
-                    f"{BASE_URL}/ObjectChapter/AuthorChapterList",
-                    headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
-                    json={"PageIndex": page, "PageSize": 100,
-                          "chapterType": "", "chapterName": "",
-                          "bookId": book_id_for_list,
-                          "contentCode": "", "translationType": None,
-                          "cnValue": "", "orderFile": ""},
+                resp = requests.get(
+                    f"{BASE_URL}/ObjectChapter/Receive?bookId={book_id}&receiveType={receive_type}",
+                    headers=auth_headers(token),
                     timeout=15,
                 )
                 resp.raise_for_status()
                 body = resp.json()
                 data = body.get("data", {})
-                chapters = (
-                    data.get("dtolist") or data.get("list") or
-                    data.get("items") or (data if isinstance(data, list) else [])
-                )
+                if isinstance(data, dict):
+                    chapters = data.get("dto") or data.get("list") or data.get("dtolist") or []
+                elif isinstance(data, list):
+                    chapters = data
+                else:
+                    chapters = []
 
-                for ch in chapters:
-                    status = ch.get("status") or ch.get("scheduleStatus") or ch.get("chapterStatus")
-                    ch_name = ch.get("chapterName") or ch.get("name") or ""
-                    proc_id = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
-
-                    # Log first chapter's fields and status for diagnostics
-                    if page == 1 and ch == chapters[0]:
-                        log(f"  [{book_name}] Chapter fields: {list(ch.keys())}")
-                        log(f"  [{book_name}] First chapter: '{ch_name}' status={status} id={proc_id}")
-
-                    if status in ACTIVE_STATUSES:
-                        log(f"  [{book_name}] Active chapter found: '{ch_name}' status={status}")
-                        return book, ch_name, proc_id
-
-                if not chapters or len(chapters) < 100:
-                    break
-                page += 1
+                if chapters:
+                    log(f"  [{book_name}] receiveType={receive_type}: {len(chapters)} chapter(s) found")
+                    log(f"  [{book_name}] Fields: {list(chapters[0].keys())}")
+                    for ch in chapters:
+                        ch_id   = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
+                        ch_name = ch.get("chapterName") or ch.get("name") or f"Chapter #{ch_id}"
+                        log(f"  [{book_name}] receiveType={receive_type}: '{ch_name}' id={ch_id}")
+                        proc_id = get_proc_id_from_chapter_info(token, ch_id)
+                        if proc_id:
+                            log(f"  [{book_name}] Active confirmed: '{ch_name}' proc_id={proc_id}")
+                            return book, ch_name, proc_id
+                        else:
+                            log(f"  [{book_name}] Using ch_id as proc_id: {ch_id}")
+                            return book, ch_name, ch_id
 
             except Exception as e:
-                log(f"  Error checking {book_name}: {e}")
-                break
+                log(f"  [{book_name}] receiveType={receive_type} error: {e}")
 
+    log("  No active chapter found via Receive endpoint.")
     return None
+
+
+def get_proc_id_from_chapter_info(token, chapter_id):
+    """Use ChapterInfo to verify chapter is active and get proc_id."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/ObjectCatChapter/ChapterInfo?flowType=3&chapterId={chapter_id}",
+            headers=auth_headers(token),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        data = body.get("data", {})
+        if data:
+            log(f"    ChapterInfo fields: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            if isinstance(data, dict):
+                proc_id = (
+                    data.get("id") or data.get("chapterId") or
+                    data.get("objectChapterId") or data.get("catChapterId")
+                )
+                return proc_id or chapter_id
+        return None
+    except Exception as e:
+        log(f"    ChapterInfo error: {e}")
+        return None
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
