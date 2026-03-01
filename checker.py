@@ -30,6 +30,13 @@ GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
 _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
 
+# Mistral fallback — used when all Gemini keys hit their daily quota (RPD)
+# Set MISTRAL_API_KEY in GitHub Actions secrets to enable.
+# Free "Experiment" plan: no credit card, ~1 RPS, full model access.
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
+MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_MODEL   = "mistral-small-latest"   # strong German, fast, free tier
+
 def _next_gemini_key():
     """Return the next non-exhausted Gemini API key, or None if all exhausted."""
     available = [k for k in GEMINI_KEYS if k not in _exhausted_keys and k not in _rpd_exhausted_keys]
@@ -511,6 +518,81 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
 
+    def _call_mistral(batch_data, batch_num, total_batches, next_batch_first=None):
+        """
+        Fallback to Mistral API when all Gemini keys are RPD-exhausted.
+        Uses mistral-small-latest on the free Experiment plan.
+        OpenAI-compatible format; does NOT use json_object mode (Mistral's JSON mode
+        forces object output, not array) — relies on prompt + _parse_llm_response instead.
+        """
+        if not MISTRAL_API_KEY:
+            log("  ⚠️ MISTRAL_API_KEY not set — Mistral fallback unavailable.")
+            return None
+
+        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    MISTRAL_URL,
+                    headers={
+                        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": MISTRAL_MODEL,
+                        "messages": [{"role": "user", "content": batch_prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 16384,
+                    },
+                    timeout=300,
+                )
+                if resp.status_code == 429:
+                    # Mistral free tier is RPS-limited, not RPD — always recovers quickly
+                    retry_after = 0
+                    try:
+                        retry_after = int(resp.headers.get("Retry-After", 0))
+                    except Exception:
+                        pass
+                    wait = retry_after if retry_after > 0 else 30
+                    log(f"  🔄 Mistral rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code in (500, 502, 503):
+                    log(f"  ⚠️ Mistral server error {resp.status_code} (attempt {attempt}/{MAX_RETRIES}), retrying in 15s...")
+                    time.sleep(15)
+                    continue
+                resp.raise_for_status()
+                body = resp.json()
+                text = body["choices"][0]["message"]["content"]
+                if not text:
+                    log(f"❌ Empty Mistral response on batch {batch_num}")
+                    return None
+                parsed = _parse_llm_response(text, batch_num)
+                # Mistral may occasionally wrap array in a {"rows": [...]} object — unwrap
+                if isinstance(parsed, dict):
+                    parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
+                    if parsed is None:
+                        log(f"❌ Mistral returned object but no array found: {text[:200]}")
+                        return None
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Mistral.")
+                return parsed
+            except json.JSONDecodeError as e:
+                log(f"❌ Mistral JSON parse error on batch {batch_num}: {e}")
+                if attempt < MAX_RETRIES:
+                    log("  Retrying in 15s...")
+                    time.sleep(15)
+                else:
+                    return None
+            except Exception as e:
+                log(f"❌ Mistral error on batch {batch_num}: {e}")
+                if attempt < MAX_RETRIES:
+                    log("  Retrying in 15s...")
+                    time.sleep(15)
+                else:
+                    return None
+        return None
+
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
@@ -626,21 +708,29 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 continue
         return None  # all rotations exhausted
 
-    # Split into batches and call Gemini for each
+    # Split into batches and call Gemini (with Mistral fallback) for each
     batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
     total_batches = len(batches)
     log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
+    mistral_batches = 0   # track how many batches fell back to Mistral
     log(f"  Using {key_count} Gemini key(s) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
         result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
-            log(f"❌ Batch {i} failed — all Gemini keys exhausted. Aborting.")
-            return None
+            # If all Gemini keys are RPD-dead, try Mistral before giving up
+            if _all_keys_rpd_dead() and MISTRAL_API_KEY:
+                log(f"  🔀 Gemini RPD-exhausted — falling back to Mistral for batch {i}...")
+                result = _call_mistral(batch, i, total_batches, next_batch_first=next_first)
+                if result is not None:
+                    mistral_batches += 1
+            if result is None:
+                log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
+                return None
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -651,7 +741,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if i < total_batches:
             time.sleep(5)
 
-    log(f"  Total rows from Gemini: {len(all_rephrased)}")
+    provider_note = f" (Mistral fallback used for {mistral_batches}/{total_batches} batch(es))" if mistral_batches else ""
+    log(f"  Total rows rephrased: {len(all_rephrased)}{provider_note}")
 
     # ── Post-process: strip spurious trailing commas after closing quotes ──────
     # Rule: a row ending with `",` or `",` is only correct if the NEXT row
@@ -1258,13 +1349,15 @@ def run():
 
 def run_test():
     """
-    TEST_MODE: exercises the full Gemini pipeline on synthetic rows.
+    TEST_MODE: exercises the full rephrase pipeline on synthetic rows.
     No CDReader login, no submit, no finish. Safe to run anytime.
-    Tests: key rotation, prompt quality, all post-processors, verification.
+    Tests: Gemini key rotation, prompt quality, all post-processors, verification.
+    If all Gemini keys are unavailable and MISTRAL_API_KEY is set, also tests Mistral.
     """
     log("=" * 60)
-    log("TEST MODE — full Gemini pipeline on synthetic data")
+    log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
+    log(f"Mistral fallback: {'✅ configured' if MISTRAL_API_KEY else '❌ not configured (set MISTRAL_API_KEY)'}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -1290,17 +1383,18 @@ def run_test():
 
     log(f"\nTest input: {len(TEST_ROWS)} synthetic rows")
 
-    # ── Test Gemini ────────────────────────────────────────────────────────────
-    log("\n[1/4] Testing Gemini API (real call, all keys)...")
+    # ── Test Gemini / Mistral ──────────────────────────────────────────────────
+    log("\n[1/4] Testing rephrase pipeline (Gemini primary, Mistral fallback if needed)...")
     result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
 
     if not result:
-        msg = "❌ <b>TEST FAILED</b>: Gemini returned no result. Check API keys."
+        no_mistral_hint = " (add MISTRAL_API_KEY for fallback)" if not MISTRAL_API_KEY else ""
+        msg = f"❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys{no_mistral_hint}."
         log(msg)
         send_telegram(msg)
         return
 
-    log(f"  ✅ Gemini returned {len(result)} rows")
+    log(f"  ✅ Pipeline returned {len(result)} rows")
 
     # ── Show before/after comparison ──────────────────────────────────────────
     log("\n[2/4] Before → After comparison:")
@@ -1345,6 +1439,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
+        f"🔀 Mistral fallback: {'configured' if MISTRAL_API_KEY else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
