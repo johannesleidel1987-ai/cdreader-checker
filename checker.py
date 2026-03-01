@@ -748,14 +748,10 @@ def run():
             send_telegram(msg)
             return
     else:
-        # Freshly claimed — try proc_id from claim response first
-        proc_id = claim_proc_id
+        # Freshly claimed — ch_id IS the proc_id (same objectChapterId used in ForeignReceive)
+        proc_id = claim_proc_id or ch_id
         if proc_id:
-            log(f"  proc_id from claim response: {proc_id}")
-        else:
-            # Fallback: AuthorChapterList (with correct book id)
-            log("  No proc_id in claim response, trying AuthorChapterList...")
-            proc_id, _ = find_chapter_processing_id(token, book, ch_name)
+            log(f"  proc_id resolved: {proc_id} (claim_response={claim_proc_id}, ch_id={ch_id})")
         if not proc_id:
             msg = (
                 f"⚠️ <b>CDReader:</b> Claimed <b>{ch_name}</b> from {book_name} "
