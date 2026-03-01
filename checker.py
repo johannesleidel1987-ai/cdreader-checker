@@ -784,6 +784,35 @@ def finish_chapter(token, chapter_id):
     return result
 
 
+def close_task(token, task_id):
+    """
+    Mark a Task Center task as verified/closed.
+    Equivalent to clicking 'Verify and Close' in the UI.
+    Endpoint confirmed from browser: GET TaskCenter/UpdateStatus?id={id}&status=1
+    """
+    if not task_id:
+        log("  ⚠️  No task_id — cannot close Task Center entry.")
+        return False
+    log(f"  Closing Task Center task {task_id}...")
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/TaskCenter/UpdateStatus?id={task_id}&status=1",
+            headers=auth_headers(token),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        log(f"  Task close response: {result}")
+        if result.get("status") is True or result.get("code") in (0, 200, 311, 315):
+            log(f"  ✅ Task {task_id} closed successfully.")
+            return True
+        log(f"  ⚠️  Task close returned unexpected response: {result}")
+        return False
+    except Exception as e:
+        log(f"  ⚠️  Task close failed: {e}")
+        return False
+
+
 # ─── Phase 0: Find already active chapter ────────────────────────────────────
 def find_active_chapter(token, books):
     """
@@ -861,7 +890,9 @@ def find_active_chapter(token, books):
                 }
 
             if proc_id:
-                return matched_book, ch_name, proc_id
+                task_id = task.get("id")  # Task Center task ID (separate from proc_id)
+                log(f"  Task Center task_id={task_id} proc_id={proc_id}")
+                return matched_book, ch_name, proc_id, task_id
 
     except Exception as e:
         log(f"  Task Center error: {e}")
@@ -892,9 +923,9 @@ def run():
     log("Checking for already active chapter across all books...")
     active = find_active_chapter(token, books)
     if active:
-        active_book, active_ch_name, active_proc_id = active
+        active_book, active_ch_name, active_proc_id, active_task_id = active
         log(f"Found active chapter: {active_ch_name} (proc_id={active_proc_id})")
-        claimed_chapters.append((active_book, active_ch_name, None, "already-claimed", None))
+        claimed_chapters.append((active_book, active_ch_name, None, "already-claimed", None, active_task_id))
     else:
         # ── Phase 1: Claim ──
         for book in books:
@@ -976,6 +1007,7 @@ def run():
     # ── Phase 2-6: Process each claimed chapter ──
     entry = claimed_chapters[0]
     book, ch_name, ch_id, status = entry[0], entry[1], entry[2], entry[3]
+    task_id = entry[5] if len(entry) > 5 else None  # Task Center task ID for closing
     claim_proc_id = entry[4] if len(entry) > 4 else None
     book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
     book_name = book.get("toBookName") or book.get("bookName") or book.get("name") or ""
@@ -991,8 +1023,8 @@ def run():
         # Re-run active chapter detection on this specific book to get proc_id
         active = find_active_chapter(token, [book])
         if active:
-            _, ch_name, proc_id = active
-            log(f"  Active chapter proc_id resolved: {proc_id}")
+            _, ch_name, proc_id, task_id = active
+            log(f"  Active chapter proc_id resolved: {proc_id}, task_id={task_id}")
         else:
             # Fallback: search by name
             proc_id, _ = find_chapter_processing_id(token, book, ch_name)
@@ -1204,6 +1236,10 @@ def run():
 
     # Finish
     finish_result = finish_chapter(token, proc_id)
+
+    # Close the Task Center task (equivalent to clicking "verify and close")
+    time.sleep(2)
+    close_task(token, task_id)
 
     # Notify success
     send_telegram(
