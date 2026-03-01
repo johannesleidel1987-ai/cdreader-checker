@@ -531,7 +531,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     if full_rotations >= MAX_RETRIES_429:
                         log(f"❌ All Gemini keys RPM-exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
                         return None
-                    wait = 60
+                    # Honour Retry-After header if present (more precise than flat 60s)
+                    retry_after = None
+                    try:
+                        retry_after = int(resp.headers.get("Retry-After", 0))
+                    except Exception:
+                        pass
+                    wait = retry_after if retry_after and retry_after > 0 else 60
                     rpm_exhausted_count = len([k for k in GEMINI_KEYS if k in _exhausted_keys and k not in _rpd_exhausted_keys])
                     log(f"  ⚠️ {rpm_exhausted_count} key(s) RPM-limited. Waiting {wait}s for reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
                     _exhausted_keys.clear()  # only clears RPM-exhausted, not RPD
@@ -554,10 +560,22 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     is_rpd = False
                     try:
                         err_body = resp.json()
-                        err_msg = str(err_body.get("error", {}).get("message", "")).lower()
-                        err_details = str(err_body.get("error", {}).get("details", "")).lower()
-                        is_rpd = any(kw in err_msg + err_details for kw in
-                                     ("per day", "daily", "1 day", "quota_exceeded", "per_day"))
+                        err_obj = err_body.get("error", {})
+                        err_msg = str(err_obj.get("message", "")).lower()
+                        err_status = str(err_obj.get("status", "")).upper()
+                        err_details = str(err_obj.get("details", "")).lower()
+                        combined = err_msg + err_details
+                        # RPD keywords: covers both "exceeded your current quota / billing"
+                        # messages AND classic "per day / daily" quota messages
+                        rpd_keywords = (
+                            "per day", "daily", "1 day", "per_day",
+                            "billing", "your current quota", "quota_exceeded",
+                            "check your plan",
+                        )
+                        is_rpd = (
+                            any(kw in combined for kw in rpd_keywords)
+                            or err_status == "RESOURCE_EXHAUSTED"
+                        )
                         limit_hint = f" [{err_msg[:80]}]" if err_msg else ""
                     except Exception:
                         limit_hint = ""
@@ -624,6 +642,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             log(f"❌ Batch {i} failed — all Gemini keys exhausted. Aborting.")
             return None
         all_rephrased.extend(result)
+        # Clear RPM-exhausted state after each successful batch — keys that were
+        # rate-limited mid-chapter have likely recovered by the time the next batch starts.
+        # RPD-exhausted keys are preserved in _rpd_exhausted_keys and not affected.
+        _exhausted_keys.difference_update(
+            [k for k in _exhausted_keys if k not in _rpd_exhausted_keys]
+        )
         if i < total_batches:
             time.sleep(5)
 
