@@ -789,12 +789,18 @@ def run():
         send_telegram(msg)
         return
 
-    # Guard: if modifChapterContent is already populated on the first row,
-    # this chapter was already processed by a previous run (Task Center finishTime lags).
-    first_row_modified = rows[0].get("modifChapterContent") or ""
-    if first_row_modified.strip():
-        log(f"  ⏭  Chapter already processed (modifChapterContent present) — skipping.")
-        return
+    # Guard: if modifChapterContent is already populated on real content rows,
+    # this chapter was already processed by a previous run.
+    # NOTE: row[0] is always the chapter title row (eContent='') — it always has
+    # modifChapterContent pre-filled, so we must skip it and check actual content rows.
+    content_rows = [r for r in rows if (r.get("eContent") or "").strip()]
+    if content_rows:
+        sample_row = content_rows[0]
+        if (sample_row.get("modifChapterContent") or "").strip():
+            log(f"  ⏭  Chapter already processed (modifChapterContent present on content row sort={sample_row.get('sort')}) — skipping.")
+            return
+    else:
+        log(f"  ⚠️  No content rows with eContent found — proceeding anyway.")
 
     # Fetch glossary
     glossary = get_glossary(token, book_id)
