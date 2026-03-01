@@ -489,81 +489,84 @@ def finish_chapter(token, chapter_id):
 # ─── Phase 0: Find already active chapter ────────────────────────────────────
 def find_active_chapter(token, books):
     """
-    Use receiveType=1 to find chapters already claimed/in-progress.
-    Falls back to receiveType=0 and receiveType=3.
+    Use TaskCenter/AuthorTaskCenterList to find currently active/claimed chapter.
     Returns (book, chapter_name, proc_id) or None.
     """
-    log("  Scanning for active chapter using Receive endpoint (receiveType=1)...")
+    log("  Checking Task Center for active chapter...")
 
-    for book in books:
-        book_id = book.get("id") or book.get("objectBookId") or book.get("bookId")
-        book_name = (
-            book.get("toBookName") or book.get("bookName") or
-            book.get("name") or f"Book #{book_id}"
-        )
-
-        for receive_type in [1, 0, 3]:
-            try:
-                resp = requests.get(
-                    f"{BASE_URL}/ObjectChapter/Receive?bookId={book_id}&receiveType={receive_type}",
-                    headers=auth_headers(token),
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                data = body.get("data", {})
-                if isinstance(data, dict):
-                    chapters = data.get("dto") or data.get("list") or data.get("dtolist") or []
-                elif isinstance(data, list):
-                    chapters = data
-                else:
-                    chapters = []
-
-                if chapters:
-                    log(f"  [{book_name}] receiveType={receive_type}: {len(chapters)} chapter(s) found")
-                    log(f"  [{book_name}] Fields: {list(chapters[0].keys())}")
-                    for ch in chapters:
-                        ch_id   = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
-                        ch_name = ch.get("chapterName") or ch.get("name") or f"Chapter #{ch_id}"
-                        log(f"  [{book_name}] receiveType={receive_type}: '{ch_name}' id={ch_id}")
-                        proc_id = get_proc_id_from_chapter_info(token, ch_id)
-                        if proc_id:
-                            log(f"  [{book_name}] Active confirmed: '{ch_name}' proc_id={proc_id}")
-                            return book, ch_name, proc_id
-                        else:
-                            log(f"  [{book_name}] Using ch_id as proc_id: {ch_id}")
-                            return book, ch_name, ch_id
-
-            except Exception as e:
-                log(f"  [{book_name}] receiveType={receive_type} error: {e}")
-
-    log("  No active chapter found via Receive endpoint.")
-    return None
-
-
-def get_proc_id_from_chapter_info(token, chapter_id):
-    """Use ChapterInfo to verify chapter is active and get proc_id."""
     try:
-        resp = requests.get(
-            f"{BASE_URL}/ObjectCatChapter/ChapterInfo?flowType=3&chapterId={chapter_id}",
-            headers=auth_headers(token),
+        resp = requests.post(
+            f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
+            headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
+            json={"PageIndex": 1, "PageSize": 10,
+                  "status": "", "optUsers": "",
+                  "taskType": [], "taskTitle": ""},
             timeout=15,
         )
         resp.raise_for_status()
         body = resp.json()
         data = body.get("data", {})
-        if data:
-            log(f"    ChapterInfo fields: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-            if isinstance(data, dict):
-                proc_id = (
-                    data.get("id") or data.get("chapterId") or
-                    data.get("objectChapterId") or data.get("catChapterId")
-                )
-                return proc_id or chapter_id
-        return None
+        tasks = (
+            data.get("dtolist") or data.get("list") or
+            data.get("items") or (data if isinstance(data, list) else [])
+        )
+
+        log(f"  Task Center: {len(tasks)} task(s) found")
+        if tasks:
+            log(f"  Task fields: {list(tasks[0].keys())}")
+            for t in tasks:
+                log(f"  Task: {t}")
+
+        for task in tasks:
+            # Extract chapter ID — this is the proc_id used by CatChapterList/Submit/Finish
+            proc_id = (
+                task.get("chapterId") or task.get("objectChapterId") or
+                task.get("id") or task.get("taskId")
+            )
+            ch_name = (
+                task.get("chapterName") or task.get("taskTitle") or
+                task.get("title") or f"Chapter #{proc_id}"
+            )
+            book_name = (
+                task.get("bookName") or task.get("toBookName") or
+                task.get("objectBookName") or ""
+            )
+            book_id = (
+                task.get("objectBookId") or task.get("bookId") or
+                task.get("objectBook", {}).get("id") if isinstance(task.get("objectBook"), dict) else None
+            )
+
+            log(f"  Active task: '{ch_name}' proc_id={proc_id} book='{book_name}'")
+
+            # Find the matching book object from our books list
+            matched_book = None
+            for b in books:
+                b_name = b.get("toBookName") or b.get("bookName") or b.get("name") or ""
+                b_id = b.get("id") or b.get("objectBookId") or b.get("bookId")
+                if (book_id and str(b_id) == str(book_id)) or (book_name and book_name.lower() in b_name.lower()):
+                    matched_book = b
+                    break
+
+            if not matched_book and books:
+                # Fallback: use first book if we can't match
+                log(f"  Could not match book '{book_name}' — using task data directly")
+                # Build a minimal book dict from task data
+                matched_book = {
+                    "id": book_id,
+                    "objectBookId": book_id,
+                    "bookId": book_id,
+                    "toBookName": book_name,
+                    "bookName": book_name,
+                }
+
+            if proc_id:
+                return matched_book, ch_name, proc_id
+
     except Exception as e:
-        log(f"    ChapterInfo error: {e}")
-        return None
+        log(f"  Task Center error: {e}")
+
+    log("  No active chapter found in Task Center.")
+    return None
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
