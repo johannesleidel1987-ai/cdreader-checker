@@ -357,104 +357,129 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         fields = ["chapterConetnt","eContent","eeContent","modifChapterContent","machineChapterContent","languageContent","peContent","referenceContent"]
         log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
 
-    prompt = f"""{BASE_PROMPT}
+    BATCH_SIZE = 40
+    MAX_RETRIES = 3
+
+    def _fix_json_strings(s):
+        """Fix literal newlines/tabs inside JSON string values."""
+        result = []
+        in_string = False
+        escape_next = False
+        for ch in s:
+            if escape_next:
+                result.append(ch)
+                escape_next = False
+            elif ch == '\\':
+                result.append(ch)
+                escape_next = True
+            elif ch == '"' and not escape_next:
+                in_string = not in_string
+                result.append(ch)
+            elif in_string and ch == '\n':
+                result.append('\\n')
+            elif in_string and ch == '\r':
+                result.append('\\r')
+            elif in_string and ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        return ''.join(result)
+
+    def _call_gemini(batch_data, batch_num, total_batches):
+        batch_prompt = f"""{BASE_PROMPT}
 
 BOOK-SPECIFIC GLOSSARY FOR "{book_name}" (apply these in addition to universal glossary above):
 {glossary_text}
 
-ROWS TO REPHRASE ({len(input_data)} rows):
-For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields. Use \" to escape any quotation marks inside string values.
-{json.dumps(input_data, ensure_ascii=False)}"""
+ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(batch_data)} rows):
+For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields.
+{json.dumps(batch_data, ensure_ascii=False)}"""
 
-    log(f"  Sending {len(rows)} rows to Gemini...")
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                    json={
+                        "contents": [{"parts": [{"text": batch_prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.3,
+                            "maxOutputTokens": 16384,
+                            "responseMimeType": "application/json",
+                        },
+                    },
+                    timeout=300,
+                )
+                if resp.status_code == 429:
+                    wait = 30 * attempt
+                    log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                body = resp.json()
 
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
-      try:
-        resp = requests.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.3,
-                    "maxOutputTokens": 32768,
-                    "responseMimeType": "application/json",
-                },
-            },
-            timeout=300,
-        )
-        if resp.status_code == 429:
-            wait = 30 * attempt
-            log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        body = resp.json()
+                # Log finish reason for diagnostics
+                finish_reason = (body.get("candidates", [{}])[0].get("finishReason", "?"))
+                if finish_reason not in ("STOP", ""):
+                    log(f"  ⚠️ Gemini finishReason={finish_reason} on batch {batch_num}")
 
-        # Extract text from Gemini response
-        text = (
-            body.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
+                text = (
+                    body.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                if not text:
+                    log(f"❌ Empty Gemini response on batch {batch_num}: {body}")
+                    return None
 
-        if not text:
-            log(f"❌ Empty Gemini response: {body}")
-            return None
+                text = text.strip()
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[-1]
+                    text = text.rsplit("```", 1)[0].strip()
 
-        # Strip any markdown code fences
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            text = text.rsplit("```", 1)[0].strip()
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    parsed = json.loads(_fix_json_strings(text))
 
-        # Fix unescaped newlines/tabs inside JSON string values (common Gemini issue)
-        import re as _re
-        def _fix_json_strings(s):
-            # Replace literal newlines/tabs inside JSON string values with escaped versions
-            result = []
-            in_string = False
-            escape_next = False
-            for ch in s:
-                if escape_next:
-                    result.append(ch)
-                    escape_next = False
-                elif ch == '\\':
-                    result.append(ch)
-                    escape_next = True
-                elif ch == '"' and not escape_next:
-                    in_string = not in_string
-                    result.append(ch)
-                elif in_string and ch == '\n':
-                    result.append('\\n')
-                elif in_string and ch == '\r':
-                    result.append('\\r')
-                elif in_string and ch == '\t':
-                    result.append('\\t')
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows returned.")
+                return parsed
+
+            except json.JSONDecodeError as e:
+                log(f"❌ Gemini JSON parse error on batch {batch_num}: {e}")
+                log(f"   Raw response (first 500 chars): {text[:500]}")
+                if attempt < MAX_RETRIES:
+                    log(f"  Retrying in 15s...")
+                    time.sleep(15)
                 else:
-                    result.append(ch)
-            return ''.join(result)
-
-        try:
-            rephrased = json.loads(text)
-        except json.JSONDecodeError:
-            rephrased = json.loads(_fix_json_strings(text))
-        log(f"  Gemini returned {len(rephrased)} rows.")
-        return rephrased
-
-      except json.JSONDecodeError as e:
-        log(f"❌ Gemini JSON parse error: {e}")
-        log(f"   Raw response (first 1000 chars): {text[:1000]}")
+                    return None
+            except Exception as e:
+                log(f"❌ Gemini error on batch {batch_num}: {e}")
+                if attempt < MAX_RETRIES:
+                    log(f"  Retrying in 15s...")
+                    time.sleep(15)
+                else:
+                    return None
         return None
-      except Exception as e:
-        log(f"❌ Gemini error: {e}")
-        if attempt < MAX_RETRIES:
-            log(f"  Retrying in 15s...")
-            time.sleep(15)
-        else:
+
+    # Split into batches and call Gemini for each
+    batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
+    total_batches = len(batches)
+    log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
+
+    all_rephrased = []
+    for i, batch in enumerate(batches, 1):
+        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows)...")
+        result = _call_gemini(batch, i, total_batches)
+        if result is None:
+            log(f"❌ Batch {i} failed — aborting.")
             return None
-    return None
+        all_rephrased.extend(result)
+        if i < total_batches:
+            time.sleep(3)  # Small pause between batches
+
+    log(f"  Total rows from Gemini: {len(all_rephrased)}")
+    return all_rephrased
 
 
 # ─── Phase 5: Verify ──────────────────────────────────────────────────────────
