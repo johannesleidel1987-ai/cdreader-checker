@@ -278,6 +278,9 @@ def get_chapter_rows(token, chapter_id):
     return rows
 
 def get_glossary(token, object_book_id):
+    if not object_book_id:
+        log("  No book_id available — skipping glossary fetch.")
+        return []
     log(f"  Fetching glossary for book {object_book_id}...")
     all_terms, page = [], 1
     while True:
@@ -518,39 +521,39 @@ def find_active_chapter(token, books):
                 log(f"  Task: {t}")
 
         for task in tasks:
-            # Extract chapter ID — this is the proc_id used by CatChapterList/Submit/Finish
-            proc_id = (
-                task.get("chapterId") or task.get("objectChapterId") or
-                task.get("id") or task.get("taskId")
-            )
-            ch_name = (
-                task.get("chapterName") or task.get("taskTitle") or
-                task.get("title") or f"Chapter #{proc_id}"
-            )
-            book_name = (
-                task.get("bookName") or task.get("toBookName") or
-                task.get("objectBookName") or ""
-            )
-            book_id = (
-                task.get("objectBookId") or task.get("bookId") or
-                task.get("objectBook", {}).get("id") if isinstance(task.get("objectBook"), dict) else None
-            )
+            # Only process active (not yet finished) tasks: status=0 means in-progress
+            if task.get("status", 1) != 0:
+                continue
 
-            log(f"  Active task: '{ch_name}' proc_id={proc_id} book='{book_name}'")
+            # Extract chapter ID — the proc_id
+            proc_id = task.get("chapterId") or task.get("objectChapterId")
+
+            # taskUrl format: "ProofreadingForeignersList|{chapterId}|{bookId}"
+            task_url = task.get("taskUrl", "")
+            url_parts = task_url.split("|")
+            book_id = int(url_parts[2]) if len(url_parts) >= 3 and url_parts[2].isdigit() else None
+
+            # taskContent format: "EnglishTitle|GermanTitle|ChapterName"
+            task_content = task.get("taskContent", "")
+            content_parts = task_content.split("|")
+            ch_name = content_parts[2].strip() if len(content_parts) >= 3 else f"Chapter #{proc_id}"
+            book_name = content_parts[1].strip() if len(content_parts) >= 2 else ""
+
+            log(f"  Active task: '{ch_name}' proc_id={proc_id} book_id={book_id} book='{book_name}'")
 
             # Find the matching book object from our books list
             matched_book = None
             for b in books:
-                b_name = b.get("toBookName") or b.get("bookName") or b.get("name") or ""
                 b_id = b.get("id") or b.get("objectBookId") or b.get("bookId")
-                if (book_id and str(b_id) == str(book_id)) or (book_name and book_name.lower() in b_name.lower()):
+                b_name = b.get("toBookName") or b.get("bookName") or b.get("name") or ""
+                if book_id and str(b_id) == str(book_id):
                     matched_book = b
+                    log(f"  Matched book by ID: '{b_name}' (id={b_id})")
                     break
 
-            if not matched_book and books:
-                # Fallback: use first book if we can't match
-                log(f"  Could not match book '{book_name}' — using task data directly")
-                # Build a minimal book dict from task data
+            if not matched_book:
+                # Build a minimal book dict from parsed task data
+                log(f"  Building book dict from task data: book_id={book_id} name='{book_name}'")
                 matched_book = {
                     "id": book_id,
                     "objectBookId": book_id,
