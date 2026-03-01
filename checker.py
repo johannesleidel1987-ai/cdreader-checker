@@ -636,7 +636,12 @@ def find_active_chapter(token, books):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def run():
-    token = login()
+    try:
+        token = login()
+    except Exception as e:
+        log(f"❌ Login failed (CDReader server unreachable?): {e}")
+        # Exit cleanly — next scheduled run will retry automatically
+        return
     books = get_books(token)
 
     if not books:
