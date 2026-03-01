@@ -12,7 +12,7 @@ from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
 
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
@@ -252,7 +252,11 @@ def start_chapter(token, chapter_id):
     )
     resp.raise_for_status()
     result = resp.json()
-    log(f"  Start response: {result}")
+    msg = result.get("message", "")
+    if result.get("status") or msg in ("SaveSuccess", "ErrMessage8"):
+        log(f"  Start OK (message={msg})")
+    else:
+        log(f"  Start response: {result}")
     return result
 
 def get_chapter_rows(token, chapter_id):
@@ -319,8 +323,8 @@ def format_glossary_for_prompt(glossary_terms):
         return "(No book-specific glossary terms)"
     lines = []
     for t in glossary_terms:
-        src = t.get("fromContent") or t.get("sourceWord") or t.get("word") or t.get("from") or ""
-        tgt = t.get("toContent") or t.get("targetWord") or t.get("translation") or t.get("to") or ""
+        src = t.get("dictionaryKey") or t.get("fromContent") or t.get("sourceWord") or t.get("word") or ""
+        tgt = t.get("dictionaryValue") or t.get("toContent") or t.get("targetWord") or t.get("translation") or ""
         if src and tgt:
             lines.append(f"{src} → {tgt}")
     return "\n".join(lines) if lines else "(No book-specific glossary terms)"
