@@ -342,11 +342,70 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # Build input data: sort + English original + German pre-translation to rephrase
     # Field names from API: eContent=English source, chapterConetnt=German pre-translation (note typo)
+
+    def _classify_quote_role(text):
+        """
+        Classify whether a text row is an opening, closing, middle, or standalone
+        dialogue line based on quote balance.
+        Returns one of: "open", "close", "middle", "both", "none"
+        """
+        import re as _re
+        # Strip whitespace
+        t = text.strip()
+        # Count unescaped opening (« „ ") and closing (" » ") quote chars
+        # We look at start/end of text for German/English dialogue markers
+        opens = t.startswith(('„', '"', '„', '“'))
+        closes = t.endswith(('"', '»', '”', '"'))
+        # Also handle cases like: text ends with '" ' or '",' or '".'
+        closes = closes or bool(_re.search(r'["”»]\s*[,!?.]?\s*$', t))
+        opens = opens or bool(_re.match(r'^[„"„“«]', t))
+
+        if opens and closes:
+            return "both"
+        elif opens and not closes:
+            return "open"
+        elif closes and not opens:
+            return "close"
+        elif not opens and not closes:
+            # Could be a middle dialogue line — check if it looks like speech
+            # Simple heuristic: if previous context is open dialogue, treat as middle
+            return "middle_or_none"
+        return "none"
+
+    raw_contents = [
+        r.get("chapterConetnt") or r.get("content") or r.get("modifChapterContent") or ""
+        for r in rows
+    ]
+
+    # Determine quote roles with context awareness
+    quote_roles = []
+    in_dialogue = False
+    for i, text in enumerate(raw_contents):
+        role = _classify_quote_role(text)
+        if role == "both":
+            in_dialogue = False
+            quote_roles.append("both")
+        elif role == "open":
+            in_dialogue = True
+            quote_roles.append("open")
+        elif role == "close":
+            in_dialogue = False
+            quote_roles.append("close")
+        elif role == "middle_or_none":
+            if in_dialogue:
+                quote_roles.append("middle")
+            else:
+                quote_roles.append("none")
+        else:
+            in_dialogue = False
+            quote_roles.append("none")
+
     input_data = [
         {
             "sort": r.get("sort", i),
             "original": r.get("eContent") or r.get("eeContent") or r.get("original") or "",
-            "content": r.get("chapterConetnt") or r.get("content") or r.get("modifChapterContent") or "",
+            "content": raw_contents[i],
+            "_quote_role": quote_roles[i],  # stripped before sending to Gemini
         }
         for i, r in enumerate(rows)
     ]
@@ -394,14 +453,30 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 LOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):
 The row immediately following this batch starts with: {json.dumps(next_batch_first.get("content", ""), ensure_ascii=False)}"""
 
+        # Strip internal _quote_role from data sent to Gemini; build quote hint instead
+        clean_batch = [{"sort": r["sort"], "original": r.get("original",""), "content": r["content"]} for r in batch_data]
+        quote_hints = []
+        for r in batch_data:
+            role = r.get("_quote_role", "both")
+            sort_n = r['sort']
+            if role == "open":
+                quote_hints.append(f"  sort {sort_n}: OPENS a multi-row dialogue — use „ to open, NO closing “ at end")
+            elif role == "close":
+                quote_hints.append(f"  sort {sort_n}: CLOSES a multi-row dialogue — NO opening „, but add closing “ at end")
+            elif role == "middle":
+                quote_hints.append(f"  sort {sort_n}: MIDDLE of a multi-row dialogue — NO opening or closing quotes")
+        quote_hint_block = ""
+        if quote_hints:
+            quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
+
         batch_prompt = f"""{BASE_PROMPT}
 
 BOOK-SPECIFIC GLOSSARY FOR "{book_name}" (apply these in addition to universal glossary above):
 {glossary_text}
 
-ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(batch_data)} rows):
+ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):
 For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields.
-{json.dumps(batch_data, ensure_ascii=False)}{lookahead_note}"""
+{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"""
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -488,6 +563,48 @@ For each row, "original" is the English source text (may be empty), and "content
             time.sleep(3)  # Small pause between batches
 
     log(f"  Total rows from Gemini: {len(all_rephrased)}")
+
+    # ── Post-process: strip spurious trailing commas after closing quotes ──────
+    # Rule: a row ending with `",` or `",` is only correct if the NEXT row
+    # is a Begleitsatz (speech attribution). Otherwise strip the comma.
+    import re as _re
+    BEGLEITSATZ_PATTERN = _re.compile(
+        r"""^(?:
+            # starts with lowercase speech/action verb directly
+            (?:sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|
+               bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|
+               brüllte|nickte|lächelte|seufzte|wisperte|knurrte|schnappte|
+               stöhnte|schluchzte|keuchte|grunzte|gluckste|ergänzte|meinte|
+               verkündete|wiederholte)
+            |
+            # starts with a name/pronoun followed by a speech verb
+            (?:[A-ZÄÖÜ][a-zäöüß]+\s+(?:sagte|flüsterte|antwortete|rief|fragte|
+               murmelte|erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|
+               stammelte|schrie|brüllte|wisperte|knurrte|ergänzte|meinte|
+               verkündete|wiederholte))
+            |
+            (?:(?:er|sie|es|ich|wir|ihr)\s+(?:sagte|flüsterte|antwortete|rief|
+               fragte|murmelte|erwiderte|bemerkte|fügte|entgegnete|zischte|
+               hauchte|stammelte|schrie|brüllte|wisperte|knurrte|ergänzte|
+               meinte|wiederholte))
+        )""",
+        _re.IGNORECASE | _re.VERBOSE
+    )
+
+    comma_fixes = 0
+    sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+    for idx, row in enumerate(sorted_rows):
+        c = row.get("content", "")
+        # Check if ends with closing German quote + comma: ," or ",
+        if c.endswith('",') or c.endswith('",'):
+            next_content = sorted_rows[idx + 1].get("content", "") if idx + 1 < len(sorted_rows) else ""
+            if not BEGLEITSATZ_PATTERN.match(next_content):
+                row["content"] = c[:-1]  # strip trailing comma
+                comma_fixes += 1
+
+    if comma_fixes:
+        log(f"  ✂️  Post-processing: removed {comma_fixes} spurious trailing comma(s) after closing quotes.")
+
     return all_rephrased
 
 
