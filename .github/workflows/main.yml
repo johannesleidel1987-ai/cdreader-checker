@@ -4,8 +4,6 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
-  repository_dispatch:
-    types: [trigger]
 
 jobs:
   check-chapters:
@@ -29,4 +27,5 @@ jobs:
           CDREADER_PASSWORD:  ${{ secrets.CDREADER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
         run: python checker.py
