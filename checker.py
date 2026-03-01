@@ -6,6 +6,7 @@ Claim → Fetch rows → Fetch glossary → Rephrase with Gemini → Verify → 
 import requests
 import os
 import json
+import re
 import sys
 import time
 from datetime import datetime
