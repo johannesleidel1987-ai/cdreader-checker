@@ -13,16 +13,13 @@ from datetime import datetime
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
 GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL  = "llama-3.3-70b-versatile"   # 14,400 RPD, 30 RPM, excellent German quality
-
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",     "")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",       "")
 DRY_RUN        = os.environ.get("DRY_RUN", "false").lower() == "true"
+TEST_MODE      = os.environ.get("TEST_MODE", "false").lower() == "true"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -1251,5 +1248,106 @@ def run():
     log("✅ Pipeline complete.")
 
 
+def run_test():
+    """
+    TEST_MODE: exercises the full Gemini pipeline on synthetic rows.
+    No CDReader login, no submit, no finish. Safe to run anytime.
+    Tests: key rotation, prompt quality, all post-processors, verification.
+    """
+    log("=" * 60)
+    log("TEST MODE — full Gemini pipeline on synthetic data")
+    log(f"Gemini keys available: {len(GEMINI_KEYS)}")
+    log("=" * 60)
+
+    # Synthetic test rows — realistic German pre-translation content
+    TEST_ROWS = [
+        {"sort": 0,  "content": "Kapitel 249 Wie Konnte Er Sie Nicht Wollen?"},
+        {"sort": 1,  "content": "Die Moss family war seit Generationen in der Stadt bekannt."},
+        {"sort": 2,  "content": '„Ich werde nicht gehen", sagte sie bestimmt.'},
+        {"sort": 3,  "content": "Er antwortete ihr nicht."},
+        {"sort": 4,  "content": '„Dann bleib", flüsterte er leise.'},
+        {"sort": 5,  "content": "Sie schaute ihn lange an, bevor sie sprach."},
+        {"sort": 6,  "content": '„Was hast du gesagt?" fragte sie ungläubig,'},
+        {"sort": 7,  "content": "sagte er mit ruhiger Stimme."},
+        {"sort": 8,  "content": "Die Williams family hatte immer zu ihr gehalten."},
+        {"sort": 9,  "content": "Er trat einen Schritt zurück und verschränkte die Arme."},
+        {"sort": 10, "content": '"You should leave now," he said coldly.'},
+        {"sort": 11, "content": "Sie nickte langsam und verließ das Zimmer ohne ein weiteres Wort."},
+    ]
+
+    SAMPLE_GLOSSARY = [
+        {"dictionaryKey": "Moss", "dictionaryValue": "Moss"},
+        {"dictionaryKey": "Williams", "dictionaryValue": "Williams"},
+    ]
+
+    log(f"\nTest input: {len(TEST_ROWS)} synthetic rows")
+
+    # ── Test Gemini ────────────────────────────────────────────────────────────
+    log("\n[1/4] Testing Gemini API (real call, all keys)...")
+    result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
+
+    if not result:
+        msg = "❌ <b>TEST FAILED</b>: Gemini returned no result. Check API keys."
+        log(msg)
+        send_telegram(msg)
+        return
+
+    log(f"  ✅ Gemini returned {len(result)} rows")
+
+    # ── Show before/after comparison ──────────────────────────────────────────
+    log("\n[2/4] Before → After comparison:")
+    orig_map = {r["sort"]: r["content"] for r in TEST_ROWS}
+    for r in result:
+        s = r.get("sort")
+        before = orig_map.get(s, "?")
+        after  = r.get("content", "")
+        changed = "✏️ " if after != before else "  ="
+        log(f"  {changed} [{s:02d}] {before[:60]}")
+        if after != before:
+            log(f"       → {after[:60]}")
+
+    # ── Test post-processors ───────────────────────────────────────────────────
+    log("\n[3/4] Post-processors:")
+
+    # Count family name fixes
+    import re as _re
+    _fam_en = _re.compile(r"(?:[Tt]he\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:\s[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})\s+[Ff]amily\b")
+    _fam_de = _re.compile(r"(?:[Dd]ie\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:[-\s][A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})[-\s]Familie\b")
+    fam_hits = sum(1 for r in result if _fam_en.search(r.get("content","")) or _fam_de.search(r.get("content","")))
+    log(f"  Family name pattern hits before fix: {fam_hits}")
+
+    english_quotes = sum(1 for r in result if '"' in r.get("content",""))
+    log(f"  English quote rows before fix: {english_quotes}")
+
+    # ── Test verification ──────────────────────────────────────────────────────
+    log("\n[4/4] Verification:")
+    issues = verify_output(TEST_ROWS, result)
+    hard = [i for i in issues if not i.startswith("Warning:")]
+    soft = [i for i in issues if i.startswith("Warning:")]
+    if hard:
+        log(f"  ❌ Hard issues: {hard}")
+    if soft:
+        log(f"  ⚠️  Soft warnings: {soft}")
+    if not issues:
+        log("  ✅ Verification passed cleanly")
+
+    # ── Summary telegram ───────────────────────────────────────────────────────
+    key_count = len(GEMINI_KEYS)
+    status_icon = "✅" if not hard else "❌"
+    msg = (
+        f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
+        f"🔑 Gemini keys active: {key_count}\n"
+        f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
+        f"⚠️  Soft warnings: {len(soft)}\n"
+        f"❌ Hard issues: {len(hard)}\n"
+        + (f"\nIssues: {'; '.join(hard)}" if hard else "\nAll systems nominal.")
+    )
+    send_telegram(msg)
+    log("\n✅ Test complete.")
+
+
 if __name__ == "__main__":
-    run()
+    if TEST_MODE:
+        run_test()
+    else:
+        run()
