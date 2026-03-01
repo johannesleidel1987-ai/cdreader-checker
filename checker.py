@@ -12,7 +12,7 @@ from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
@@ -417,8 +417,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
 
     BATCH_SIZE = 40
-    MAX_RETRIES = 5        # More retries for transient errors
-    MAX_RETRIES_429 = 5    # Dedicated retry count for rate limits
+    MAX_RETRIES = 3
+    MAX_RETRIES_429 = 3    # If 429 persists beyond 3 tries, RPD is likely exhausted — fail fast
 
     def _fix_json_strings(s):
         """Fix literal newlines/tabs inside JSON string values."""
@@ -494,8 +494,8 @@ For each row, "original" is the English source text (may be empty), and "content
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    # Rate limit — use longer waits: 60/120/180/240/300s
-                    wait = 60 * attempt
+                    # Rate limit — 30/60/90s; if still failing, RPD likely exhausted
+                    wait = 30 * attempt
                     log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES_429}), retrying in {wait}s...")
                     time.sleep(wait)
                     continue
@@ -562,7 +562,7 @@ For each row, "original" is the English source text (may be empty), and "content
             return None
         all_rephrased.extend(result)
         if i < total_batches:
-            time.sleep(20)  # Pause between batches to stay under Gemini RPM limit
+            time.sleep(5)   # Brief pause between batches (RPM headroom)
 
     log(f"  Total rows from Gemini: {len(all_rephrased)}")
 
