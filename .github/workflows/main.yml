@@ -1,31 +1,29 @@
 name: CDReader Chapter Checker
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
 
 jobs:
   check-chapters:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run chapter checker
+      - name: Run checker
         env:
-          CDREADER_EMAIL:     ${{ secrets.CDREADER_EMAIL }}
-          CDREADER_PASSWORD:  ${{ secrets.CDREADER_PASSWORD }}
+          CDREADER_EMAIL: ${{ secrets.CDREADER_EMAIL }}
+          CDREADER_PASSWORD: ${{ secrets.CDREADER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python checker.py
