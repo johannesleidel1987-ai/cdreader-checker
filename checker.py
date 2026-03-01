@@ -27,12 +27,17 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_4", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
-_exhausted_keys: set = set()
+_exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
+_rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
 
 def _next_gemini_key():
     """Return the next non-exhausted Gemini API key, or None if all exhausted."""
-    available = [k for k in GEMINI_KEYS if k not in _exhausted_keys]
+    available = [k for k in GEMINI_KEYS if k not in _exhausted_keys and k not in _rpd_exhausted_keys]
     return available[0] if available else None
+
+def _all_keys_rpd_dead():
+    """True if every configured key has hit its daily quota."""
+    return len(GEMINI_KEYS) > 0 and all(k in _rpd_exhausted_keys for k in GEMINI_KEYS)
 
 DRY_RUN   = os.environ.get("DRY_RUN",   "false").lower() == "true"
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
@@ -506,84 +511,30 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
 
-    def _call_groq(batch_data, batch_num, total_batches, next_batch_first=None):
-        """Call Groq API (primary). Returns parsed list or None on failure."""
-        if not GROQ_API_KEY:
-            return None
-        prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                resp = requests.post(
-                    GROQ_URL,
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3,
-                        "max_tokens": 16384,
-                        "response_format": {"type": "json_object"},
-                    },
-                    timeout=300,
-                )
-                if resp.status_code == 429:
-                    wait = 30 * attempt
-                    log(f"  ⚠️ Groq rate limit (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
-                    time.sleep(wait)
-                    continue
-                if resp.status_code in (503, 502, 500):
-                    log(f"  ⚠️ Groq server error {resp.status_code}, retrying in 15s...")
-                    time.sleep(15)
-                    continue
-                resp.raise_for_status()
-                body = resp.json()
-                text = body["choices"][0]["message"]["content"]
-                if not text:
-                    log(f"❌ Empty Groq response on batch {batch_num}")
-                    return None
-                # Groq json_object mode wraps array in object — unwrap if needed
-                parsed = _parse_llm_response(text, batch_num)
-                if isinstance(parsed, dict):
-                    # Extract the array value from the wrapper object
-                    parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
-                    if parsed is None:
-                        log(f"❌ Groq returned dict but no array found: {text[:200]}")
-                        return None
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Groq.")
-                return parsed
-            except json.JSONDecodeError as e:
-                log(f"❌ Groq JSON parse error on batch {batch_num}: {e}")
-                if attempt < MAX_RETRIES:
-                    log("  Retrying in 15s...")
-                    time.sleep(15)
-                else:
-                    return None
-            except Exception as e:
-                log(f"❌ Groq error on batch {batch_num}: {e}")
-                if attempt < MAX_RETRIES:
-                    log("  Retrying in 15s...")
-                    time.sleep(15)
-                else:
-                    return None
-        return None
-
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
-        # Retry loop: try each key once, then if all exhausted wait 60s for RPM reset.
-        # Max full rotations before giving up: MAX_RETRIES_429
+        # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
+        # RPD-exhausted keys (daily quota) are marked permanently and never retried.
+        # Max full RPM-reset rotations before giving up: MAX_RETRIES_429
         full_rotations = 0
         while full_rotations < MAX_RETRIES_429:
             try:
+                # Fail fast if every key has hit its daily quota
+                if _all_keys_rpd_dead():
+                    log(f"❌ All Gemini keys have hit their daily quota (RPD). No point retrying.")
+                    return None
                 api_key = _next_gemini_key()
                 if not api_key:
-                    # All keys exhausted — wait 60s for RPM reset then retry all
+                    # All remaining (non-RPD) keys are RPM-exhausted — wait for reset
                     full_rotations += 1
                     if full_rotations >= MAX_RETRIES_429:
-                        log(f"❌ All Gemini keys exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
+                        log(f"❌ All Gemini keys RPM-exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
                         return None
                     wait = 60
-                    log(f"  ⚠️ All {len(GEMINI_KEYS)} keys rate-limited. Waiting {wait}s for RPM reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
-                    _exhausted_keys.clear()
+                    rpm_exhausted_count = len([k for k in GEMINI_KEYS if k in _exhausted_keys and k not in _rpd_exhausted_keys])
+                    log(f"  ⚠️ {rpm_exhausted_count} key(s) RPM-limited. Waiting {wait}s for reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
+                    _exhausted_keys.clear()  # only clears RPM-exhausted, not RPD
                     time.sleep(wait)
                     continue
                 resp = requests.post(
@@ -599,10 +550,26 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    # Mark this key and immediately try the next one (no wait)
-                    _exhausted_keys.add(api_key)
-                    remaining = [k for k in GEMINI_KEYS if k not in _exhausted_keys]
-                    log(f"  🔄 Key rate-limited, {len(remaining)} key(s) remaining to try...")
+                    # Parse error body to distinguish RPD (daily) from RPM (per-minute)
+                    is_rpd = False
+                    try:
+                        err_body = resp.json()
+                        err_msg = str(err_body.get("error", {}).get("message", "")).lower()
+                        err_details = str(err_body.get("error", {}).get("details", "")).lower()
+                        is_rpd = any(kw in err_msg + err_details for kw in
+                                     ("per day", "daily", "1 day", "quota_exceeded", "per_day"))
+                        limit_hint = f" [{err_msg[:80]}]" if err_msg else ""
+                    except Exception:
+                        limit_hint = ""
+                    if is_rpd:
+                        _rpd_exhausted_keys.add(api_key)
+                        _exhausted_keys.add(api_key)
+                        remaining = len([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys])
+                        log(f"  📵 Key daily quota (RPD) exhausted{limit_hint}, {remaining} key(s) left...")
+                    else:
+                        _exhausted_keys.add(api_key)
+                        remaining = len([k for k in GEMINI_KEYS if k not in _exhausted_keys])
+                        log(f"  🔄 Key RPM-limited{limit_hint}, {remaining} key(s) remaining...")
                     continue
                 resp.raise_for_status()
                 body = resp.json()
