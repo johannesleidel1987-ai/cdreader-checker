@@ -363,7 +363,7 @@ BOOK-SPECIFIC GLOSSARY FOR "{book_name}" (apply these in addition to universal g
 {glossary_text}
 
 ROWS TO REPHRASE ({len(input_data)} rows):
-For each row, "original" is the English source and "content" is the German pre-translation to rephrase.
+For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields. Use \" to escape any quotation marks inside string values.
 {json.dumps(input_data, ensure_ascii=False)}"""
 
     log(f"  Sending {len(rows)} rows to Gemini...")
@@ -378,6 +378,7 @@ For each row, "original" is the English source and "content" is the German pre-t
                 "generationConfig": {
                     "temperature": 0.3,
                     "maxOutputTokens": 32768,
+                    "response_mime_type": "application/json",
                 },
             },
             timeout=300,
