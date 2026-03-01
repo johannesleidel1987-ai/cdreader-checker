@@ -34,37 +34,37 @@ WORD_CORRECTION_DEFAULT = json.dumps({"StatusCode": 0, "SpellErrors": [], "Gramm
 
 # ─── Rephrasing prompt (universal rules) ─────────────────────────────────────
 BASE_PROMPT = """ROLE
-You are an experienced German content writer and expert editor. Your task is to rephrase each row in the provided data into polished, natural, and professional German.
+You are an experienced German content writer and expert editor. Your task is to rephrase each row in the "content" field into polished, natural, and professional German.
 
 OUTPUT FORMAT (CRITICAL)
 Return ONLY a valid JSON array — no markdown, no preamble, no explanation.
 Each object must have exactly:
   "sort": original sort number (integer, unchanged)
   "content": rephrased German text
-
 Example: [{"sort": 0, "content": "rephrased line"}, {"sort": 1, "content": "..."}]
 
-CAPITALIZATION & FORMATTING
-- All-caps lines → rephrase in ALL CAPS
-- Lines starting with "Kapitel" → capitalize first letter of each word
-- Lines with only punctuation or single words → retain exactly as-is
-- Standard lines → standard German capitalization
+CAPITALIZATION & SOURCE FORMATTING
+- All-caps lines: rephrase in ALL CAPS (e.g. "GRAND KING" → "GROẞER KÖNIG")
+- Lines beginning with "Kapitel": capitalize first letter of each word (e.g. "Kapitel 168 Sie Überraschte Wilbur")
+- Lines containing only punctuation or single words (e.g. "!" or "Los!"): retain exactly as-is
+- Standard lines: standard German capitalization rules
 
 LINGUISTIC GUIDELINES
-- Preserve approximate word count per line — avoid excessive shortening
-- Natural, conversational German; use synonyms to avoid repetition
-- Maintain character action beats
-- Consider surrounding lines for narrative flow
-- Dashes (—): never translate literally; restructure using conjunctions or relative clauses
+- Word count: approximately maintain the original word count per line; avoid excessive shortening
+- Tone: natural, conversational German with everyday expressions; use synonyms to avoid repetition
+- Action beats: incorporate or maintain character actions where suitable
+- Contextual flow: consider surrounding rows for narrative continuity
+- Dashes (—): never translate literally as "-"; restructure using conjunctions, verbs, or relative clauses for natural German flow
+  Example: "...in the news—a softer version..." → "...in den Nachrichten, und wirkte wie eine sanftere Version..."
 
-PRONOUN PROTOCOL (CRITICAL)
-- "du": only for family, romantic partners, close long-term friends
-- "Sie": default for all other relationships (colleagues, strangers, boss/subordinate)
-- Never switch pronouns between the same two characters within a chapter
+THE PRONOUN PROTOCOL (CRITICAL)
+- "du": only for family (parents, children, siblings), romantic partners, demonstrably close long-term friends
+- "Sie": default for ALL other interactions — professional colleagues, new acquaintances, boss/subordinate, strangers, any relationship marked by respect or distance
+- Absolute consistency: never switch "du"/"Sie" between the same two people within a chapter
 
 DIALOGUE & HONORIFICS
-- German quotation marks only: „ to open, " to close
-- Add comma after closing " when followed by an accompanying sentence on the next line
+- German quotation marks ONLY: „ to open, " to close
+- Accompanying sentences (Begleitsatz): If a line of direct speech ends with a closing quotation mark and is immediately followed by an accompanying sentence (e.g. "sagte sie", "flüsterte er", "antwortete er leise"), you MUST add a comma after the closing quotation mark. If the next row is NOT a speech attribution but begins a new thought, describes an action, or starts a new speaker — do NOT add a comma after the closing ".
 - Never use English quotation marks (" or ')
 - "Mr." → "Herr", "Mrs."/"Miss"/"Ms." → "Frau"
 
@@ -77,12 +77,12 @@ Terms: Black Dragon Syndicate→Syndikat des Schwarzen Drachen; Black Hawk Allia
 Characters: Mr. Moss→Herr Moos; Ms. Braxton→Fräulein Braxton; Miss Briggs→Fräulein Briggs; Kiley→Lena; Jennie→Jenny; Steve→Stefan; Garry→Gerhard; Ethan→Elias; Monica→Monika; Gabby→Gabi; Claire→Klara
 Currency: Dollar→Euro
 
-FINAL SELF-CHECK (do before responding)
-1. Output has EXACTLY the same number of objects as input rows?
-2. German quotation marks used with mandatory comma rule?
-3. du/Sie consistent per relationship?
+FINAL SELF-CHECK (perform before responding)
+1. Output has EXACTLY the same number of JSON objects as input rows?
+2. Begleitsatz comma rule applied correctly — comma ONLY when next row is a speech attribution?
+3. du/Sie consistent per character relationship?
 4. All glossary terms applied?
-5. No literal dash translations?
+5. No literal dash (—) translations — restructured naturally?
 6. Response is pure JSON with zero extra text?"""
 
 
@@ -385,7 +385,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 result.append(ch)
         return ''.join(result)
 
-    def _call_gemini(batch_data, batch_num, total_batches):
+    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
+        # Build lookahead: first row of next batch (if any) for Begleitsatz context
+        lookahead_note = ""
+        if next_batch_first is not None:
+            lookahead_note = f"""
+
+LOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):
+The row immediately following this batch starts with: {json.dumps(next_batch_first.get("content", ""), ensure_ascii=False)}"""
+
         batch_prompt = f"""{BASE_PROMPT}
 
 BOOK-SPECIFIC GLOSSARY FOR "{book_name}" (apply these in addition to universal glossary above):
@@ -393,7 +401,7 @@ BOOK-SPECIFIC GLOSSARY FOR "{book_name}" (apply these in addition to universal g
 
 ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(batch_data)} rows):
 For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields.
-{json.dumps(batch_data, ensure_ascii=False)}"""
+{json.dumps(batch_data, ensure_ascii=False)}{lookahead_note}"""
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -470,7 +478,8 @@ For each row, "original" is the English source text (may be empty), and "content
     all_rephrased = []
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows)...")
-        result = _call_gemini(batch, i, total_batches)
+        next_first = batches[i][0] if i < total_batches else None
+        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
             log(f"❌ Batch {i} failed — aborting.")
             return None
