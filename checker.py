@@ -12,13 +12,16 @@ from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL  = "llama-3.3-70b-versatile"   # 14,400 RPD, 30 RPM, excellent German quality
 
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",     "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",       "")
 DRY_RUN        = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 HEADERS = {
@@ -334,8 +337,8 @@ def format_glossary_for_prompt(glossary_terms):
 
 # ─── Phase 4: Rephrase with Gemini ───────────────────────────────────────────
 def rephrase_with_gemini(rows, glossary_terms, book_name):
-    if not GEMINI_API_KEY:
-        log("❌ GEMINI_API_KEY not set.")
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        log("❌ Neither GROQ_API_KEY nor GEMINI_API_KEY is set.")
         return None
 
     glossary_text = format_glossary_for_prompt(glossary_terms)
@@ -445,16 +448,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 result.append(ch)
         return ''.join(result)
 
-    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
-        # Build lookahead: first row of next batch (if any) for Begleitsatz context
+    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None):
+        """Build the prompt string and clean batch data, shared by both providers."""
         lookahead_note = ""
         if next_batch_first is not None:
-            lookahead_note = f"""
-
-LOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):
-The row immediately following this batch starts with: {json.dumps(next_batch_first.get("content", ""), ensure_ascii=False)}"""
-
-        # Strip internal _quote_role from data sent to Gemini; build quote hint instead
+            lookahead_note = (
+                "\n\nLOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):\n"
+                f"The row immediately following this batch starts with: {json.dumps(next_batch_first.get('content', ''), ensure_ascii=False)}"
+            )
         clean_batch = [{"sort": r["sort"], "original": r.get("original",""), "content": r["content"]} for r in batch_data]
         quote_hints = []
         for r in batch_data:
@@ -470,14 +471,90 @@ The row immediately following this batch starts with: {json.dumps(next_batch_fir
         if quote_hints:
             quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
 
-        batch_prompt = f"""{BASE_PROMPT}
+        prompt = (
+            f"{BASE_PROMPT}\n\n"
+            f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
+            f"{glossary_text}\n\n"
+            f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
+            f"For each row, \"original\" is the English source text (may be empty), and \"content\" is the German pre-translation you must rephrase into fluent, natural German. "
+            f"Return ONLY a JSON array with the same number of objects, each containing \"sort\" and \"content\" fields.\n"
+            f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
+        )
+        return prompt, clean_batch
 
-BOOK-SPECIFIC GLOSSARY FOR "{book_name}" (apply these in addition to universal glossary above):
-{glossary_text}
+    def _parse_llm_response(text, batch_num):
+        """Parse JSON from LLM response text, with fallback fix."""
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            text = text.rsplit("```", 1)[0].strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return json.loads(_fix_json_strings(text))
 
-ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):
-For each row, "original" is the English source text (may be empty), and "content" is the German pre-translation you must rephrase into fluent, natural German. Return ONLY a JSON array with the same number of objects, each containing "sort" and "content" fields.
-{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"""
+    def _call_groq(batch_data, batch_num, total_batches, next_batch_first=None):
+        """Call Groq API (primary). Returns parsed list or None on failure."""
+        if not GROQ_API_KEY:
+            return None
+        prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 16384,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=300,
+                )
+                if resp.status_code == 429:
+                    wait = 30 * attempt
+                    log(f"  ⚠️ Groq rate limit (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code in (503, 502, 500):
+                    log(f"  ⚠️ Groq server error {resp.status_code}, retrying in 15s...")
+                    time.sleep(15)
+                    continue
+                resp.raise_for_status()
+                body = resp.json()
+                text = body["choices"][0]["message"]["content"]
+                if not text:
+                    log(f"❌ Empty Groq response on batch {batch_num}")
+                    return None
+                # Groq json_object mode wraps array in object — unwrap if needed
+                parsed = _parse_llm_response(text, batch_num)
+                if isinstance(parsed, dict):
+                    # Extract the array value from the wrapper object
+                    parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
+                    if parsed is None:
+                        log(f"❌ Groq returned dict but no array found: {text[:200]}")
+                        return None
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Groq.")
+                return parsed
+            except json.JSONDecodeError as e:
+                log(f"❌ Groq JSON parse error on batch {batch_num}: {e}")
+                if attempt < MAX_RETRIES:
+                    log("  Retrying in 15s...")
+                    time.sleep(15)
+                else:
+                    return None
+            except Exception as e:
+                log(f"❌ Groq error on batch {batch_num}: {e}")
+                if attempt < MAX_RETRIES:
+                    log("  Retrying in 15s...")
+                    time.sleep(15)
+                else:
+                    return None
+        return None
+
+    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
+        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
         for attempt in range(1, MAX_RETRIES_429 + 1):
             try:
@@ -517,17 +594,8 @@ For each row, "original" is the English source text (may be empty), and "content
                     log(f"❌ Empty Gemini response on batch {batch_num}: {body}")
                     return None
 
-                text = text.strip()
-                if text.startswith("```"):
-                    text = text.split("\n", 1)[-1]
-                    text = text.rsplit("```", 1)[0].strip()
-
-                try:
-                    parsed = json.loads(text)
-                except json.JSONDecodeError:
-                    parsed = json.loads(_fix_json_strings(text))
-
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows returned.")
+                parsed = _parse_llm_response(text, batch_num)
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Gemini.")
                 return parsed
 
             except json.JSONDecodeError as e:
@@ -553,16 +621,28 @@ For each row, "original" is the English source text (may be empty), and "content
     log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
+    provider_used = "Groq" if GROQ_API_KEY else "Gemini"
     for i, batch in enumerate(batches, 1):
-        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows)...")
+        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via {provider_used}...")
         next_first = batches[i][0] if i < total_batches else None
-        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
+
+        # Try Groq first (primary), fall back to Gemini on failure
+        result = None
+        if GROQ_API_KEY:
+            result = _call_groq(batch, i, total_batches, next_batch_first=next_first)
+            if result is None and GEMINI_API_KEY:
+                log(f"  ⚠️ Groq failed on batch {i} — falling back to Gemini...")
+                provider_used = "Gemini"
+                result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
+        else:
+            result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
+
         if result is None:
-            log(f"❌ Batch {i} failed — aborting.")
+            log(f"❌ Batch {i} failed on all providers — aborting.")
             return None
         all_rephrased.extend(result)
         if i < total_batches:
-            time.sleep(5)   # Brief pause between batches (RPM headroom)
+            time.sleep(5)   # Brief pause between batches
 
     log(f"  Total rows from Gemini: {len(all_rephrased)}")
 
