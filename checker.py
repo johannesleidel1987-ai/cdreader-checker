@@ -17,9 +17,25 @@ ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",     "")
-DRY_RUN        = os.environ.get("DRY_RUN", "false").lower() == "true"
-TEST_MODE      = os.environ.get("TEST_MODE", "false").lower() == "true"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",     "")  # kept for legacy reference
+
+# Multi-key Gemini rotation: keys tried in order, exhausted keys skipped for the run
+_GEMINI_KEYS_RAW = [
+    os.environ.get("GEMINI_API_KEY",   ""),
+    os.environ.get("GEMINI_API_KEY_2", ""),
+    os.environ.get("GEMINI_API_KEY_3", ""),
+    os.environ.get("GEMINI_API_KEY_4", ""),
+]
+GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
+_exhausted_keys: set = set()
+
+def _next_gemini_key():
+    """Return the next non-exhausted Gemini API key, or None if all exhausted."""
+    available = [k for k in GEMINI_KEYS if k not in _exhausted_keys]
+    return available[0] if available else None
+
+DRY_RUN   = os.environ.get("DRY_RUN",   "false").lower() == "true"
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
