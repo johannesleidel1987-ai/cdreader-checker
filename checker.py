@@ -277,6 +277,8 @@ def get_chapter_rows(token, chapter_id):
 
     if rows:
         log(f"  Row fields available: {list(rows[0].keys())}")
+        r0 = rows[0]
+        log(f"  First row sample: sort={r0.get('sort')} | eContent={repr(r0.get('eContent','')[:80])} | chapterConetnt={repr(r0.get('chapterConetnt','')[:80])}")
 
     log(f"  Fetched {len(rows)} rows.")
     return rows
@@ -338,11 +340,18 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     glossary_text = format_glossary_for_prompt(glossary_terms)
 
-    # Build input data: only sort + original (English) + content (German pre-translation)
+    # Build input data: sort + English original + German pre-translation to rephrase
+    # Field names from API: eContent=English source, chapterConetnt=German pre-translation (note typo)
     input_data = [
-        {"sort": r.get("sort", i), "original": r.get("original", ""), "content": r.get("content", "")}
+        {
+            "sort": r.get("sort", i),
+            "original": r.get("eContent") or r.get("eeContent") or r.get("original") or "",
+            "content": r.get("chapterConetnt") or r.get("content") or r.get("modifChapterContent") or "",
+        }
         for i, r in enumerate(rows)
     ]
+    non_empty = sum(1 for r in input_data if r["content"].strip())
+    log(f"  Input data: {len(input_data)} rows, {non_empty} with non-empty content")
 
     prompt = f"""{BASE_PROMPT}
 
@@ -472,14 +481,14 @@ def submit_chapter(token, chapter_id, rephrased_rows, original_rows):
     for r in rephrased_rows:
         sort = r.get("sort", 0)
         orig = orig_by_sort.get(sort, {})
-        content = r.get("content", "")
+        rephrased_content = r.get("content", "")
         payload.append({
             "sort": sort,
-            "original": orig.get("original", ""),
-            "content": content,
+            "original": orig.get("eContent") or orig.get("eeContent") or orig.get("original") or "",
+            "content": rephrased_content,
             "wordCorrection": WORD_CORRECTION_DEFAULT,
             "wordCorrectionData": "",
-            "contentShowData": content,   # platform may regenerate display version
+            "contentShowData": rephrased_content,
         })
 
     resp = requests.put(
