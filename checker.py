@@ -711,7 +711,19 @@ def run():
                     claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id))
                     break
                 elif no_chapter:
-                    log(f"  ⏭  Not claimable right now: {ch_name}")
+                    # Log full response — data may contain the currently active chapter ID
+                    log(f"  ⏭  Not claimable right now: {ch_name} | full response: {result}")
+                    # If data field contains the active chapter's ID, capture it as orphaned
+                    rdata = result.get("data")
+                    orphan_id = None
+                    if isinstance(rdata, dict):
+                        orphan_id = (rdata.get("chapterId") or rdata.get("objectChapterId") or rdata.get("id"))
+                    elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
+                        orphan_id = int(rdata)
+                    if orphan_id:
+                        log(f"  Found orphaned active chapter ID={orphan_id} in submithint response")
+                        claimed_chapters.append((book, ch_name, orphan_id, "claimed", orphan_id))
+                        break
                 else:
                     log(f"  ⚠️  Unexpected claim response: {result}")
 
