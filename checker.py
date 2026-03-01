@@ -197,7 +197,7 @@ def find_chapter_processing_id(token, book, claimed_chapter_name):
     Searches AuthorChapterList for the claimed chapter by name.
     """
     book_id_for_list = (
-        book.get("bookId") or book.get("objectBookId") or book.get("id")
+        book.get("id") or book.get("objectBookId") or book.get("bookId")
     )
     log(f"  Searching AuthorChapterList for '{claimed_chapter_name}' (bookId={book_id_for_list})...")
 
@@ -704,8 +704,17 @@ def run():
             send_telegram(msg)
             return
     else:
-        # Freshly claimed — find internal processing ID by name
-        proc_id, _ = find_chapter_processing_id(token, book, ch_name)
+        # Freshly claimed — use Task Center to get proc_id (most reliable)
+        log("  Waiting 3s for platform to register claim...")
+        time.sleep(3)
+        active_after = find_active_chapter(token, books)
+        if active_after:
+            _, _, proc_id = active_after
+            log(f"  proc_id from Task Center after claim: {proc_id}")
+        else:
+            # Fallback: try AuthorChapterList with correct book id
+            log("  Task Center found nothing yet, trying AuthorChapterList...")
+            proc_id, _ = find_chapter_processing_id(token, book, ch_name)
         if not proc_id:
             msg = (
                 f"⚠️ <b>CDReader:</b> Claimed <b>{ch_name}</b> from {book_name} "
