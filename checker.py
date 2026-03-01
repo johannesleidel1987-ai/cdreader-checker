@@ -12,7 +12,7 @@ from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
@@ -355,7 +355,9 @@ For each row, "original" is the English source and "content" is the German pre-t
 
     log(f"  Sending {len(rows)} rows to Gemini...")
 
-    try:
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+      try:
         resp = requests.post(
             f"{GEMINI_URL}?key={GEMINI_API_KEY}",
             json={
@@ -367,6 +369,11 @@ For each row, "original" is the English source and "content" is the German pre-t
             },
             timeout=300,
         )
+        if resp.status_code == 429:
+            wait = 30 * attempt
+            log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s...")
+            time.sleep(wait)
+            continue
         resp.raise_for_status()
         body = resp.json()
 
@@ -392,13 +399,18 @@ For each row, "original" is the English source and "content" is the German pre-t
         log(f"  Gemini returned {len(rephrased)} rows.")
         return rephrased
 
-    except json.JSONDecodeError as e:
+      except json.JSONDecodeError as e:
         log(f"❌ Gemini JSON parse error: {e}")
         log(f"   Raw response: {text[:500]}")
         return None
-    except Exception as e:
+      except Exception as e:
         log(f"❌ Gemini error: {e}")
-        return None
+        if attempt < MAX_RETRIES:
+            log(f"  Retrying in 15s...")
+            time.sleep(15)
+        else:
+            return None
+    return None
 
 
 # ─── Phase 5: Verify ──────────────────────────────────────────────────────────
