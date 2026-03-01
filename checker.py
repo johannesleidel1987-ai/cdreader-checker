@@ -278,7 +278,7 @@ def get_chapter_rows(token, chapter_id):
     if rows:
         log(f"  Row fields available: {list(rows[0].keys())}")
         r0 = rows[0]
-        log(f"  First row sample: sort={r0.get('sort')} | eContent={repr(r0.get('eContent','')[:80])} | chapterConetnt={repr(r0.get('chapterConetnt','')[:80])}")
+        log(f"  First row sample: sort={r0.get('sort')} | eContent={repr((r0.get('eContent') or '')[:80])} | chapterConetnt={repr((r0.get('chapterConetnt') or '')[:80])}")
 
     log(f"  Fetched {len(rows)} rows.")
     return rows
@@ -352,6 +352,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     ]
     non_empty = sum(1 for r in input_data if r["content"].strip())
     log(f"  Input data: {len(input_data)} rows, {non_empty} with non-empty content")
+    if rows:
+        r0 = rows[0]
+        fields = ["chapterConetnt","eContent","eeContent","modifChapterContent","machineChapterContent","languageContent","peContent","referenceContent"]
+        log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
 
     prompt = f"""{BASE_PROMPT}
 
