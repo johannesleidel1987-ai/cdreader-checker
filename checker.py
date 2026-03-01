@@ -579,6 +579,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 return parsed
             except json.JSONDecodeError as e:
                 log(f"❌ Mistral JSON parse error on batch {batch_num}: {e}")
+                log(f"   Raw Mistral response (first 800 chars): {text[:800]}")
                 if attempt < MAX_RETRIES:
                     log("  Retrying in 15s...")
                     time.sleep(15)
