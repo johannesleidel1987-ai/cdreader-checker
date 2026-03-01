@@ -518,18 +518,59 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
 
+    def _fix_german_dialogue_json(text):
+        """
+        Repair Mistral's habit of using German typographic opening quote „ (U+201E)
+        directly as a JSON value starter, without an enclosing ASCII quote pair.
+
+        Mistral free tier ignores response_format=json_object, so it still emits
+        markdown fences (stripped by _parse_llm_response) and German dialogue like:
+            "content": „Ich werde nicht gehen", sagte sie bestimmt."}  <- broken
+        should be:
+            "content": "„Ich werde nicht gehen\", sagte sie bestimmt."} <- valid
+
+        Three variants cover all observed patterns:
+          V1: „TEXT_A", TEXT_B."  — two quotes: escape mid-quote, add opening "
+          V2: „TEXT"              — one quote:  add opening " before „
+          V3: „TEXT               — no quotes:  wrap entirely with "..."
+
+        Only values starting with „ are touched; normal "..." values are untouched.
+        """
+        # V1: „SPEECH", rest." → insert opening ", escape the speech-close "
+        text = re.sub(
+            r'(": )(„[^"\n]*)"([^"}\n]*)"(\s*[,}\]])',
+            lambda m: f'{m.group(1)}"{m.group(2)}\\"{m.group(3)}"{m.group(4)}',
+            text
+        )
+        # V2: „SPEECH" → insert opening " (existing ASCII " becomes the JSON close)
+        text = re.sub(
+            r'(": )(„[^"\n]*)"(\s*[,}\]])',
+            lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}',
+            text
+        )
+        # V3: „SPEECH with no closing quote — add opening and closing "
+        text = re.sub(
+            r'(": )(„[^"}\n]*)(\s*[,}\]])',
+            lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}',
+            text
+        )
+        return text
+
     def _call_mistral(batch_data, batch_num, total_batches, next_batch_first=None):
         """
         Fallback to Mistral API when all Gemini keys are RPD-exhausted.
         Uses mistral-small-latest on the free Experiment plan.
-        OpenAI-compatible format; does NOT use json_object mode (Mistral's JSON mode
-        forces object output, not array) — relies on prompt + _parse_llm_response instead.
+
+        The free tier ignores response_format=json_object, so we rely on:
+          1. _parse_llm_response to strip ```json fences
+          2. _fix_german_dialogue_json (applied here before parsing) to repair
+             German typographic „ quotes used as bare JSON value starters
         """
         if not MISTRAL_API_KEY:
             log("  ⚠️ MISTRAL_API_KEY not set — Mistral fallback unavailable.")
             return None
 
-        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
+        mistral_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -541,14 +582,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     },
                     json={
                         "model": MISTRAL_MODEL,
-                        "messages": [{"role": "user", "content": batch_prompt}],
+                        "messages": [{"role": "user", "content": mistral_prompt}],
                         "temperature": 0.3,
-                        "max_tokens": 16384,
+                        "max_tokens": 32768,
                     },
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    # Mistral free tier is RPS-limited, not RPD — always recovers quickly
                     retry_after = 0
                     try:
                         retry_after = int(resp.headers.get("Retry-After", 0))
@@ -568,12 +608,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 if not text:
                     log(f"❌ Empty Mistral response on batch {batch_num}")
                     return None
+                # Pre-process: repair German dialogue typographic quote issues before parsing
+                text = _fix_german_dialogue_json(text)
                 parsed = _parse_llm_response(text, batch_num)
-                # Mistral may occasionally wrap array in a {"rows": [...]} object — unwrap
+                # Unwrap {"rows": [...]} if Mistral wraps the array in an object
                 if isinstance(parsed, dict):
                     parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
                     if parsed is None:
-                        log(f"❌ Mistral returned object but no array found: {text[:200]}")
+                        log(f"❌ Mistral returned object but no array found: {text[:300]}")
                         return None
                 log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Mistral.")
                 return parsed
@@ -593,7 +635,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 else:
                     return None
         return None
-
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
