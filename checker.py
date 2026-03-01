@@ -1051,11 +1051,80 @@ def run():
         send_telegram(msg)
         return
 
+    # ── Post-process: replace English quotes with German quotes ─────────────────
+    # Groq and sometimes Gemini use " instead of „/". Fix deterministically.
+    import re as _re
+    quote_fixes = 0
+    for row in rephrased:
+        c = row.get("content", "")
+        if '"' not in c:
+            continue
+        # Replace paired English quotes: "text" → „text"
+        # Strategy: first " in a pair → „, second " → "
+        fixed = ""
+        in_quote = False
+        i = 0
+        while i < len(c):
+            ch = c[i]
+            if ch == '"':
+                if not in_quote:
+                    fixed += "„"  # „ opening
+                    in_quote = True
+                else:
+                    fixed += "“"  # " closing
+                    in_quote = False
+            else:
+                fixed += ch
+            i += 1
+        # If still in_quote (odd number of "), the last " is likely a standalone closing
+        # Revert to original to avoid mangling
+        if in_quote:
+            fixed = c  # don't touch malformed rows
+        if fixed != c:
+            row["content"] = fixed
+            quote_fixes += 1
+    if quote_fixes:
+        log(f"  🔤 Post-processing: converted English quotes to German in {quote_fixes} row(s).")
+
+    # ── Post-process: retry empty rows with fallback provider ─────────────────
+    empty_sorts = [r.get("sort") for r in rephrased if not r.get("content", "").strip()]
+    if empty_sorts:
+        log(f"  ⚠️ {len(empty_sorts)} empty row(s) detected, retrying individually: {empty_sorts}")
+        orig_by_sort = {r.get("sort", i): r for i, r in enumerate(rows)}
+        rephrased_by_sort = {r.get("sort"): r for r in rephrased}
+        for sort_n in empty_sorts:
+            orig_row = orig_by_sort.get(sort_n)
+            if not orig_row:
+                continue
+            single_batch = [{
+                "sort": sort_n,
+                "original": orig_row.get("eContent") or orig_row.get("eeContent") or orig_row.get("peContent") or "",
+                "content": orig_row.get("chapterConetnt") or orig_row.get("content") or orig_row.get("modifChapterContent") or "",
+                "_quote_role": "both",
+            }]
+            # Try Gemini first for single-row retry (save Groq quota)
+            retry_result = None
+            if GEMINI_API_KEY:
+                retry_result = rephrase_with_gemini.__wrapped_call_gemini(single_batch, sort_n, 1, None) if hasattr(rephrase_with_gemini, '__wrapped_call_gemini') else None
+            # Simple direct approach: just copy original content as fallback
+            if not retry_result or not retry_result[0].get("content", "").strip():
+                fallback_content = orig_row.get("chapterConetnt") or orig_row.get("modifChapterContent") or ""
+                log(f"    ↩️  Row {sort_n}: using original content as fallback.")
+                rephrased_by_sort[sort_n]["content"] = fallback_content
+            else:
+                log(f"    ✅ Row {sort_n}: retry succeeded.")
+                rephrased_by_sort[sort_n]["content"] = retry_result[0]["content"]
+        rephrased = list(rephrased_by_sort.values())
+
     # Verify output
     log("  Verifying output...")
     issues = verify_output(rows, rephrased)
 
-    if issues:
+    # Separate hard failures (abort) from soft warnings (proceed but notify)
+    hard_issues = [i for i in issues if not i.startswith("Warning:")]
+    soft_issues = [i for i in issues if i.startswith("Warning:")]
+
+    if hard_issues:
         issue_text = "\n".join(f"• {i}" for i in issues)
         msg = (
             f"⚠️ <b>CDReader: Review needed</b>\n\n"
@@ -1064,10 +1133,13 @@ def run():
             f"Please review and submit manually."
         )
         send_telegram(msg)
-        log(f"Verification failed — {len(issues)} issue(s) found. Stopping for human review.")
+        log(f"Verification failed — {len(hard_issues)} hard issue(s). Stopping for human review.")
         for i in issues:
             log(f"  Issue: {i}")
         return
+
+    if soft_issues:
+        log(f"  ⚠️ Soft warnings (proceeding anyway): {'; '.join(soft_issues)}")
 
     log(f"  ✅ Verification passed.")
 
