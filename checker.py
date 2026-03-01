@@ -378,7 +378,7 @@ For each row, "original" is the English source text (may be empty), and "content
                 "generationConfig": {
                     "temperature": 0.3,
                     "maxOutputTokens": 32768,
-                    "response_mime_type": "application/json",
+                    "responseMimeType": "application/json",
                 },
             },
             timeout=300,
@@ -445,7 +445,7 @@ For each row, "original" is the English source text (may be empty), and "content
 
       except json.JSONDecodeError as e:
         log(f"❌ Gemini JSON parse error: {e}")
-        log(f"   Raw response: {text[:500]}")
+        log(f"   Raw response (first 1000 chars): {text[:1000]}")
         return None
       except Exception as e:
         log(f"❌ Gemini error: {e}")
