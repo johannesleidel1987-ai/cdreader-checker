@@ -569,12 +569,23 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
-        for attempt in range(1, MAX_RETRIES_429 + 1):
+        # Retry loop: try each key once, then if all exhausted wait 60s for RPM reset.
+        # Max full rotations before giving up: MAX_RETRIES_429
+        full_rotations = 0
+        while full_rotations < MAX_RETRIES_429:
             try:
                 api_key = _next_gemini_key()
                 if not api_key:
-                    log(f"❌ All Gemini API keys exhausted on batch {batch_num}.")
-                    return None
+                    # All keys exhausted — wait 60s for RPM reset then retry all
+                    full_rotations += 1
+                    if full_rotations >= MAX_RETRIES_429:
+                        log(f"❌ All Gemini keys exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
+                        return None
+                    wait = 60
+                    log(f"  ⚠️ All {len(GEMINI_KEYS)} keys rate-limited. Waiting {wait}s for RPM reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
+                    _exhausted_keys.clear()
+                    time.sleep(wait)
+                    continue
                 resp = requests.post(
                     f"{GEMINI_URL}?key={api_key}",
                     json={
@@ -588,18 +599,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    # Mark this key as exhausted and immediately try the next one
+                    # Mark this key and immediately try the next one (no wait)
                     _exhausted_keys.add(api_key)
-                    next_key = _next_gemini_key()
-                    if next_key:
-                        log(f"  🔄 Gemini key exhausted (attempt {attempt}), switching to next key...")
-                        time.sleep(2)
-                    else:
-                        wait = 30 * attempt
-                        log(f"  ⚠️ All Gemini keys exhausted (attempt {attempt}/{MAX_RETRIES_429}), waiting {wait}s...")
-                        # Re-allow all keys after waiting (RPM reset, not RPD)
-                        _exhausted_keys.clear()
-                        time.sleep(wait)
+                    remaining = [k for k in GEMINI_KEYS if k not in _exhausted_keys]
+                    log(f"  🔄 Key rate-limited, {len(remaining)} key(s) remaining to try...")
                     continue
                 resp.raise_for_status()
                 body = resp.json()
@@ -618,6 +621,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 if not text:
                     log(f"❌ Empty Gemini response on batch {batch_num}: {body}")
                     return None
+                # Success — exit retry loop
 
                 parsed = _parse_llm_response(text, batch_num)
                 log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Gemini.")
@@ -626,19 +630,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             except json.JSONDecodeError as e:
                 log(f"❌ Gemini JSON parse error on batch {batch_num}: {e}")
                 log(f"   Raw response (first 500 chars): {text[:500]}")
-                if attempt < MAX_RETRIES:
-                    log(f"  Retrying in 15s...")
-                    time.sleep(15)
-                else:
-                    return None
+                log(f"  Retrying in 15s...")
+                time.sleep(15)
+                continue
             except Exception as e:
                 log(f"❌ Gemini error on batch {batch_num}: {e}")
-                if attempt < MAX_RETRIES:
-                    log(f"  Retrying in 15s...")
-                    time.sleep(15)
-                else:
-                    return None
-        return None
+                log(f"  Retrying in 15s...")
+                time.sleep(15)
+                full_rotations += 1
+                continue
+        return None  # all rotations exhausted
 
     # Split into batches and call Gemini for each
     batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
