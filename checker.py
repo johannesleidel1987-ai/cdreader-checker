@@ -337,8 +337,8 @@ def format_glossary_for_prompt(glossary_terms):
 
 # ─── Phase 4: Rephrase with Gemini ───────────────────────────────────────────
 def rephrase_with_gemini(rows, glossary_terms, book_name):
-    if not GROQ_API_KEY and not GEMINI_API_KEY:
-        log("❌ Neither GROQ_API_KEY nor GEMINI_API_KEY is set.")
+    if not GEMINI_KEYS:
+        log("❌ No GEMINI_API_KEY configured.")
         return None
 
     glossary_text = format_glossary_for_prompt(glossary_terms)
@@ -558,8 +558,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
         for attempt in range(1, MAX_RETRIES_429 + 1):
             try:
+                api_key = _next_gemini_key()
+                if not api_key:
+                    log(f"❌ All Gemini API keys exhausted on batch {batch_num}.")
+                    return None
                 resp = requests.post(
-                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                    f"{GEMINI_URL}?key={api_key}",
                     json={
                         "contents": [{"parts": [{"text": batch_prompt}]}],
                         "generationConfig": {
@@ -571,10 +575,18 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    # Rate limit — 30/60/90s; if still failing, RPD likely exhausted
-                    wait = 30 * attempt
-                    log(f"  ⚠️ Gemini rate limit (attempt {attempt}/{MAX_RETRIES_429}), retrying in {wait}s...")
-                    time.sleep(wait)
+                    # Mark this key as exhausted and immediately try the next one
+                    _exhausted_keys.add(api_key)
+                    next_key = _next_gemini_key()
+                    if next_key:
+                        log(f"  🔄 Gemini key exhausted (attempt {attempt}), switching to next key...")
+                        time.sleep(2)
+                    else:
+                        wait = 30 * attempt
+                        log(f"  ⚠️ All Gemini keys exhausted (attempt {attempt}/{MAX_RETRIES_429}), waiting {wait}s...")
+                        # Re-allow all keys after waiting (RPM reset, not RPD)
+                        _exhausted_keys.clear()
+                        time.sleep(wait)
                     continue
                 resp.raise_for_status()
                 body = resp.json()
@@ -621,28 +633,18 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
-    provider_used = "Groq" if GROQ_API_KEY else "Gemini"
+    key_count = len(GEMINI_KEYS)
+    log(f"  Using {key_count} Gemini key(s) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
-        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via {provider_used}...")
+        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
-
-        # Try Groq first (primary), fall back to Gemini on failure
-        result = None
-        if GROQ_API_KEY:
-            result = _call_groq(batch, i, total_batches, next_batch_first=next_first)
-            if result is None and GEMINI_API_KEY:
-                log(f"  ⚠️ Groq failed on batch {i} — falling back to Gemini...")
-                provider_used = "Gemini"
-                result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
-        else:
-            result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
-
+        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
-            log(f"❌ Batch {i} failed on all providers — aborting.")
+            log(f"❌ Batch {i} failed — all Gemini keys exhausted. Aborting.")
             return None
         all_rephrased.extend(result)
         if i < total_batches:
-            time.sleep(5)   # Brief pause between batches
+            time.sleep(5)
 
     log(f"  Total rows from Gemini: {len(all_rephrased)}")
 
@@ -1027,14 +1029,21 @@ def run():
     # this chapter was already processed by a previous run.
     # NOTE: row[0] is always the chapter title row (eContent='') — it always has
     # modifChapterContent pre-filled, so we must skip it and check actual content rows.
-    content_rows = [r for r in rows if (r.get("eContent") or "").strip()]
+    # Use any non-title rows (sort > 0) to check if already processed.
+    # Cannot rely on eContent being populated — it's empty for many books.
+    content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
     if content_rows:
         sample_row = content_rows[0]
-        if (sample_row.get("modifChapterContent") or "").strip():
-            log(f"  ⏭  Chapter already processed (modifChapterContent present on content row sort={sample_row.get('sort')}) — skipping.")
+        modif = (sample_row.get("modifChapterContent") or "").strip()
+        orig  = (sample_row.get("chapterConetnt") or "").strip()
+        # Already processed: modifChapterContent is set AND differs from raw content
+        if modif and modif != orig:
+            log(f"  ⏭  Chapter already processed (modifChapterContent differs from source on sort={sample_row.get('sort')}) — skipping.")
             return
+        if not (sample_row.get("eContent") or "").strip():
+            log(f"  ⚠️  No eContent found on content rows — proceeding anyway.")
     else:
-        log(f"  ⚠️  No content rows with eContent found — proceeding anyway.")
+        log(f"  ⚠️  No content rows found at all — proceeding anyway.")
 
     # Fetch glossary
     glossary = get_glossary(token, book_id)
@@ -1085,6 +1094,33 @@ def run():
             quote_fixes += 1
     if quote_fixes:
         log(f"  🔤 Post-processing: converted English quotes to German in {quote_fixes} row(s).")
+
+    # ── Post-process: fix "X family" / "X-Familie" → "Familie X" ───────────────
+    import re as _re2
+    # Two separate patterns to avoid IGNORECASE corrupting the uppercase-name check:
+    # Pattern A: hyphenated "Surname-Familie" — safe, no article ambiguity
+    _fam_hyphen = _re2.compile(
+        r"\b([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:-[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)*)-Familie\b"
+    )
+    # Pattern B: space-separated single-word surname before "family" or " Familie"
+    _fam_space = _re2.compile(
+        r"\b([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)\s+[Ff]amil(?:y|ie)\b"
+    )
+    _FAM_SKIP = {"Die", "Der", "Das", "Den", "Dem", "Des", "The", "Eine", "Ein",
+                 "Ihre", "Ihr", "Sein", "Seine", "Unsere", "Unser"}
+    def _repl_fam(m):
+        name = m.group(1).strip().replace("-", " ")
+        return m.group(0) if name in _FAM_SKIP else f"Familie {name}"
+    family_fixes = 0
+    for row in rephrased:
+        c = row.get("content", "")
+        c2 = _fam_hyphen.sub(_repl_fam, c)
+        c2 = _fam_space.sub(_repl_fam, c2)
+        if c2 != c:
+            row["content"] = c2
+            family_fixes += 1
+    if family_fixes:
+        log(f"  👪 Post-processing: fixed family name format in {family_fixes} row(s).")
 
     # ── Post-process: retry empty rows with fallback provider ─────────────────
     empty_sorts = [r.get("sort") for r in rephrased if not r.get("content", "").strip()]
