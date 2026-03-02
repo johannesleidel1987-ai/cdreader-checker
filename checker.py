@@ -772,47 +772,76 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     provider_note = f" (Groq fallback used for {groq_batches}/{total_batches} batch(es))" if groq_batches else ""
     log(f"  Total rows rephrased: {len(all_rephrased)}{provider_note}")
 
-    # ── Post-process: strip spurious trailing commas after closing quotes ──────
-    # Rule: a row ending with `",` or `",` is only correct if the NEXT row
-    # is a Begleitsatz (speech attribution). Otherwise strip the comma.
+    # ── Post-process: German dialogue punctuation enforcement ─────────────────
     import re as _re
     BEGLEITSATZ_PATTERN = _re.compile(
         r"""^(?:
-            # starts with lowercase speech/action verb directly
             (?:sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|
                bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|
                brüllte|nickte|lächelte|seufzte|wisperte|knurrte|schnappte|
                stöhnte|schluchzte|keuchte|grunzte|gluckste|ergänzte|meinte|
-               verkündete|wiederholte)
+               verkündete|wiederholte)
             |
-            # starts with a name/pronoun followed by a speech verb
             (?:[A-ZÄÖÜ][a-zäöüß]+\s+(?:sagte|flüsterte|antwortete|rief|fragte|
                murmelte|erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|
                stammelte|schrie|brüllte|wisperte|knurrte|ergänzte|meinte|
-               verkündete|wiederholte))
+               verkündete|wiederholte))
             |
             (?:(?:er|sie|es|ich|wir|ihr)\s+(?:sagte|flüsterte|antwortete|rief|
                fragte|murmelte|erwiderte|bemerkte|fügte|entgegnete|zischte|
                hauchte|stammelte|schrie|brüllte|wisperte|knurrte|ergänzte|
-               meinte|wiederholte))
+               meinte|wiederholte))
         )""",
         _re.IGNORECASE | _re.VERBOSE
     )
 
     comma_fixes = 0
+    comma_adds = 0
+    dash_fixes = 0
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+
     for idx, row in enumerate(sorted_rows):
         c = row.get("content", "")
-        # Check if ends with closing German quote + comma: ," or ",
-        if c.endswith('",') or c.endswith('",'):
-            next_content = sorted_rows[idx + 1].get("content", "") if idx + 1 < len(sorted_rows) else ""
+        next_content = sorted_rows[idx + 1].get("content", "") if idx + 1 < len(sorted_rows) else ""
+
+        # Rule A: Remove comma after ?" or !" (intra-row and cross-row).
+        # German rule: ? and ! already end speech — no comma before attribution.
+        c_fixed = _re.sub(r'([?!]“)\s*,\s*', r'\1 ', c)
+        c_fixed = _re.sub(r'([?!"]),\s*', r'\1 ', c_fixed)
+        if c_fixed != c:
+            row["content"] = c_fixed
+            c = c_fixed
+            comma_fixes += 1
+
+        # Rule B: Remove cross-row comma when next row is NOT a Begleitsatz.
+        elif c.endswith('“,') or c.endswith('",'):
             if not BEGLEITSATZ_PATTERN.match(next_content):
-                row["content"] = c[:-1]  # strip trailing comma
+                row["content"] = c[:-1]
+                c = c[:-1]
                 comma_fixes += 1
 
-    if comma_fixes:
-        log(f"  ✂️  Post-processing: removed {comma_fixes} spurious trailing comma(s) after closing quotes.")
+        # Rule C: Add missing comma when plain closing quote is followed by Begleitsatz.
+        elif (c.endswith('“') or c.endswith('"')) \
+                and not c.endswith('?“') and not c.endswith('!"') \
+                and not c.endswith('?“') and not c.endswith('!“'):
+            if BEGLEITSATZ_PATTERN.match(next_content):
+                row["content"] = c + ","
+                c = c + ","
+                comma_adds += 1
 
+        # Rule D: Replace literal mid-sentence em-dashes with commas.
+        if '—' in c:
+            c_nodash = _re.sub(r'(?<=\w)\s*—\s*(?=\w)', ', ', c)
+            if c_nodash != c:
+                row["content"] = c_nodash
+                dash_fixes += 1
+
+    if comma_fixes:
+        log(f"  ✂️  Post-processing: fixed {comma_fixes} dialogue comma(s).")
+    if comma_adds:
+        log(f"  ✍️  Post-processing: added {comma_adds} missing comma(s) before Begleitsatz.")
+    if dash_fixes:
+        log(f"  ➖ Post-processing: replaced {dash_fixes} literal em-dash(es) with comma.")
     # ── Post-process: deterministic glossary enforcement ────────────────────
     # The LLM (especially Groq) sometimes ignores glossary entries in the prompt.
     # This step scans every row for untranslated English glossary source terms
