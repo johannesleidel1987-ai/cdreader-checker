@@ -774,23 +774,27 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # ── Post-process: German dialogue punctuation enforcement ─────────────────
     import re as _re
+    # Comprehensive list of German speech/attribution verbs (Begleitsatz verbs).
+    # Add new verbs here whenever the model introduces one not yet covered.
+    _SV = (
+        r"sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|bemerkte|"
+        r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|nickte|"
+        r"lächelte|seufzte|wisperte|knurrte|schnappte|stöhnte|schluchzte|"
+        r"keuchte|grunzte|gluckste|ergänzte|meinte|verkündete|wiederholte|"
+        r"flehte|bat|bettelte|jammerte|klagte|schimpfte|schoss|fuhr|setzte|"
+        r"warf|stieß|raunte|spuckte|platzte|brach|fiel|gab|presste|rang|"
+        r"drängte|keifte|ächzte|sprach|meldete|berichtete|erklärte|betonte|"
+        r"bestätigte|verneinte|gestand|bekannte|schwor|versprach|drohte|"
+        r"warnte|befahl|forderte|appellierte|protestierte|unterbrach|insistierte|"
+        r"konterte|zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück"
+    )
     BEGLEITSATZ_PATTERN = _re.compile(
-        r"""^(?:
-            (?:sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|
-               bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|
-               brüllte|nickte|lächelte|seufzte|wisperte|knurrte|schnappte|
-               stöhnte|schluchzte|keuchte|grunzte|gluckste|ergänzte|meinte|
-               verkündete|wiederholte)
+        rf"""^(?:
+            (?:{_SV})
             |
-            (?:[A-ZÄÖÜ][a-zäöüß]+\s+(?:sagte|flüsterte|antwortete|rief|fragte|
-               murmelte|erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|
-               stammelte|schrie|brüllte|wisperte|knurrte|ergänzte|meinte|
-               verkündete|wiederholte))
+            (?:[A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ]?[a-zäöüß\-]+)*\s+(?:{_SV}))
             |
-            (?:(?:er|sie|es|ich|wir|ihr)\s+(?:sagte|flüsterte|antwortete|rief|
-               fragte|murmelte|erwiderte|bemerkte|fügte|entgegnete|zischte|
-               hauchte|stammelte|schrie|brüllte|wisperte|knurrte|ergänzte|
-               meinte|wiederholte))
+            (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:{_SV}))
         )""",
         _re.IGNORECASE | _re.VERBOSE
     )
@@ -887,6 +891,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if titled != c:
                 row["content"] = titled
 
+        # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
+        # Pattern: „Speech!“, attribution verb.“  ← trailing “ is wrong.
+        # Happens when LLM copies source quote position onto a restructured German sentence.
+        c = row.get("content", "")
+        if (c.endswith('“') or c.endswith('"')) and _re.search(r'[“"]\s*,\s*\w', c):
+            stripped = c.rstrip('“"')
+            if stripped != c:
+                row["content"] = stripped
+
     # ── Rule H (outside loop): Restore missing quotes by comparing against original ──
     # If the original English row started/ended with a quote but the translated
     # output has no opening/closing German quote, add them back deterministically.
@@ -909,12 +922,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if orig_opens and not out_opens:
             fixed = '„' + fixed
         if orig_closes and not (fixed.endswith('“') or _re.search(r'“\s*[,!?.]?\s*$', fixed) or fixed.endswith('"')):
-            # In German: ? and ! belong INSIDE the closing quote → append " after them.
-            # Comma belongs OUTSIDE → insert " before trailing comma.
-            if fixed.endswith(','):
-                fixed = fixed[:-1] + '“,'
-            else:
-                fixed = fixed + '“'  # append after ? . ! or plain text
+            # Guard: if output already has a closing quote mid-sentence (e.g. inline
+            # restructuring like „Text!“, schoss sie zurück.), don't add another.
+            already_has_close = bool(_re.search(r'[“"][ ,!?.]', fixed))
+            if not already_has_close:
+                if fixed.endswith(','):
+                    fixed = fixed[:-1] + '“,'
+                else:
+                    fixed = fixed + '“'
         if fixed != c:
             row["content"] = fixed
             quote_restores += 1
