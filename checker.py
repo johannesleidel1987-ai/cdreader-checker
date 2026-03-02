@@ -1052,7 +1052,6 @@ def run():
 
     if not books:
         log("No books found.")
-        send_telegram("✅ CDReader check ran — no chapters available right now.")
         return
 
     claimed_chapters = []
@@ -1140,7 +1139,6 @@ def run():
 
     if not claimed_chapters:
         log("No chapters claimed this run.")
-        send_telegram("✅ CDReader check ran — no chapters available right now.")
         return
 
     # ── Phase 2-6: Process each claimed chapter ──
