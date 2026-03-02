@@ -836,6 +836,30 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 row["content"] = c_nodash
                 dash_fixes += 1
 
+        # Rule E: Move comma from BEFORE closing quote to AFTER it.
+        # German rule: comma always follows the closing ", never precedes it.
+        # Wrong:   „Text,"  sagte er.   or   „Text,\u201c sagte er.
+        # Correct: „Text",  sagte er.   or   „Text\u201c, sagte er.
+        # Applies both inline (same row) and cross-row (row ends with ,").
+        # Does NOT apply after ? or ! (those are already handled by Rule A).
+        if not _re.search(r'[?!],[\u201c"]', c):  # skip if ? or ! precedes comma
+            # Inline: ,\u201c or ," immediately followed by space+Begleitsatz
+            c_e = _re.sub(
+                r',(\u201c|")([ \t]+(?:sagte|flüsterte|antwortete|rief|fragte|murmelte|'
+                r'erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|'
+                r'brüllte|nickte|lächelte|seufzte|wisperte|knurrte|ergänzte|meinte|'
+                r'verkündete|wiederholte|murmelte))',
+                r'\1,\2', c
+            )
+            # Cross-row: row ends with ," or ,\u201c and next row is Begleitsatz
+            if c_e == c and (c.endswith(',\u201c') or c.endswith(',\"')):
+                if BEGLEITSATZ_PATTERN.match(next_content):
+                    # swap: strip trailing ," then add ", 
+                    c_e = c[:-2] + c[-1] + ','
+            if c_e != c:
+                row["content"] = c_e
+                comma_fixes += 1
+
     if comma_fixes:
         log(f"  ✂️  Post-processing: fixed {comma_fixes} dialogue comma(s).")
     if comma_adds:
