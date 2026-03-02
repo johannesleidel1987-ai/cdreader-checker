@@ -887,12 +887,46 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if titled != c:
                 row["content"] = titled
 
+    # ── Rule H (outside loop): Restore missing quotes by comparing against original ──
+    # If the original English row started/ended with a quote but the translated
+    # output has no opening/closing German quote, add them back deterministically.
+    # This catches cases where the model silently drops quotes despite the hint.
+    quote_restores = 0
+    # Build original lookup by sort key
+    orig_by_sort = {r.get("sort", i): (r.get("original") or r.get("content") or "") for i, r in enumerate(input_data)}
+    OPEN_QUOTES  = ('"', '„', '“', '«', '‘')
+    CLOSE_QUOTES = ('"', '“', '»', '’')
+    for row in all_rephrased:
+        c = row.get("content", "")
+        orig = orig_by_sort.get(row.get("sort"), "")
+        if not orig or not c:
+            continue
+        orig_opens  = orig.startswith(OPEN_QUOTES)
+        orig_closes = orig.endswith(CLOSE_QUOTES) or bool(_re.search(r'["“»’]\s*[,!?.]?\s*$', orig))
+        out_opens   = c.startswith(('„', '“', '"'))
+        out_closes  = c.endswith('“') or bool(_re.search(r'“\s*[,!?.]?\s*$', c)) or c.endswith('"')
+        fixed = c
+        if orig_opens and not out_opens:
+            fixed = '„' + fixed
+        if orig_closes and not (fixed.endswith('“') or _re.search(r'“\s*[,!?.]?\s*$', fixed) or fixed.endswith('"')):
+            # In German: ? and ! belong INSIDE the closing quote → append " after them.
+            # Comma belongs OUTSIDE → insert " before trailing comma.
+            if fixed.endswith(','):
+                fixed = fixed[:-1] + '“,'
+            else:
+                fixed = fixed + '“'  # append after ? . ! or plain text
+        if fixed != c:
+            row["content"] = fixed
+            quote_restores += 1
+
     if comma_fixes:
         log(f"  ✂️  Post-processing: fixed {comma_fixes} dialogue comma(s).")
     if comma_adds:
         log(f"  ✍️  Post-processing: added/fixed {comma_adds} comma(s) before Begleitsatz (incl. after !).")
     if dash_fixes:
         log(f"  ➖ Post-processing: replaced {dash_fixes} literal em-dash(es) with comma.")
+    if quote_restores:
+        log(f"  „“ Post-processing: restored missing quotes in {quote_restores} row(s).")
     # ── Post-process: deterministic glossary enforcement ────────────────────
     # The LLM (especially Groq) sometimes ignores glossary entries in the prompt.
     # This step scans every row for untranslated English glossary source terms
