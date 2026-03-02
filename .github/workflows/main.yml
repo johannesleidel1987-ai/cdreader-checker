@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       test_mode:
-        description: 'Run in TEST MODE (no CDReader login, no submit — tests Gemini keys and prompt only)'
+        description: 'Run in TEST MODE (no CDReader login, no submit — tests Gemini keys, OpenRouter fallback, and prompt only)'
         required: false
         default: 'false'
         type: choice
@@ -37,6 +37,6 @@ jobs:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
         run: python checker.py
