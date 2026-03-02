@@ -1157,35 +1157,14 @@ def run():
         send_telegram(msg)
         return
 
-    # Guard: skip only if task center confirms the task is already completed.
-    # If the task is still open (status=0, finishTime=None), the task center is ground truth —
-    # modifChapterContent may be pre-populated by CDReader (machine translation) or a prior
-    # partial run, but the task is genuinely unfinished and must be processed.
-    # Only apply the content-based guard when there is no open task (status=="already-claimed"
-    # fell through without a live task_id check), as a last-resort safeguard.
-    task_is_confirmed_open = (status == "already-claimed" and task_id is not None)
-    if not task_is_confirmed_open:
-        content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
-        if content_rows:
-            sample_row = content_rows[0]
-            modif = (sample_row.get("modifChapterContent") or "").strip()
-            orig  = (sample_row.get("chapterConetnt") or "").strip()
-            if modif and modif != orig:
-                msg = (f"⏭ <b>CDReader:</b> Skipped <b>{ch_name}</b> from {book_name} — "
-                       f"modifChapterContent already differs from source but no open task confirmed. "
-                       f"Manual check recommended.")
-                log(f"  ⏭  {msg}")
-                send_telegram(msg)
-                return
-    else:
-        log(f"  ℹ️  Task center confirms task is open (task_id={task_id}) — skipping content guard, processing regardless of modifChapterContent.")
-
+    # Note: modifChapterContent is pre-populated by CDReader with machine translations
+    # on ALL chapters — it cannot be used to detect whether WE already processed a chapter.
+    # The task center finishTime is the sole ground truth for completion status.
+    # Any chapter we reach here either (a) has an open task or (b) was just freshly claimed,
+    # so we always proceed to process it.
     content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
-    if content_rows:
-        if not (content_rows[0].get("eContent") or "").strip():
-            log(f"  ⚠️  No eContent found on content rows — proceeding anyway.")
-    else:
-        log(f"  ⚠️  No content rows found at all — proceeding anyway.")
+    if not content_rows:
+        log(f"  ⚠️  No content rows found — proceeding anyway.")
 
     # Fetch glossary
     glossary = get_glossary(token, book_id)
