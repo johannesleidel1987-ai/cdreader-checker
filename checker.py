@@ -510,27 +510,24 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             for r in batch_data
         )
         if glossary_terms:
-            relevant_terms = [
-                t for t in glossary_terms
-                if (t.get("dictionaryKey") or "").lower() in batch_text
-                or (t.get("enSurname") or "").lower() in batch_text
-            ]
-            # Always include character name / surname entries (enSurname field populated)
-            # even if not found by simple substring — they may appear in different cases.
-            # Keep all surname entries as they're short and critical for consistency.
-            surname_terms = [t for t in glossary_terms if t.get("enSurname")]
-            # Merge: relevant + all surname entries, deduplicated by id
-            seen_ids = set()
-            merged = []
-            for t in relevant_terms + surname_terms:
-                tid = t.get("id", id(t))
-                if tid not in seen_ids:
-                    seen_ids.add(tid)
-                    merged.append(t)
-            batch_glossary_text = format_glossary_for_prompt(merged) if merged else glossary_text_full
+            # Build a set of all English words present in the batch (lowercased)
+            # for efficient multi-word substring matching.
+            batch_text_lower = batch_text.lower()
+            def _term_in_batch(term):
+                key = (term.get("dictionaryKey") or "").strip().lower()
+                sur = (term.get("enSurname") or "").strip().lower()
+                return (key and key in batch_text_lower) or (sur and sur in batch_text_lower)
+
+            merged = [t for t in glossary_terms if _term_in_batch(t)]
+            # Fallback: if filter produces nothing (e.g. batch is all German already),
+            # send the full list so the model still has context.
+            if not merged:
+                merged = glossary_terms
+            batch_glossary_text = format_glossary_for_prompt(merged)
         else:
+            merged = []
             batch_glossary_text = glossary_text_full
-        log(f"  Glossary for batch {batch_num}: {len(merged) if glossary_terms else 0} relevant terms (of {len(glossary_terms or [])} total)")
+        log(f"  Glossary for batch {batch_num}: {len(merged)} relevant terms (of {len(glossary_terms or [])} total)")
 
         prompt = (
             f"{BASE_PROMPT}\n\n"
@@ -815,6 +812,44 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     if comma_fixes:
         log(f"  ✂️  Post-processing: removed {comma_fixes} spurious trailing comma(s) after closing quotes.")
+
+    # ── Post-process: deterministic glossary enforcement ────────────────────
+    # The LLM (especially Groq) sometimes ignores glossary entries in the prompt.
+    # This step scans every row for untranslated English glossary source terms
+    # and replaces them with the correct German target — bypassing model compliance.
+    # Only applies when we have a non-empty glossary.
+    if glossary_terms:
+        # Build replacement map: source (lowercased for matching) → target
+        # Longer terms first so "Black Reef Island" replaces before "Black" could.
+        replacement_pairs = []
+        for t in glossary_terms:
+            src = (t.get("dictionaryKey") or "").strip()
+            tgt = (t.get("dictionaryValue") or "").strip()
+            if src and tgt and src != tgt:  # skip no-ops (e.g. Moss→Moss)
+                replacement_pairs.append((src, tgt))
+        # Sort by length descending so multi-word terms match before subterms
+        replacement_pairs.sort(key=lambda x: len(x[0]), reverse=True)
+
+        import re as _re2
+        gloss_fixes = 0
+        for row in all_rephrased:
+            original_content = row.get("content", "")
+            new_content = original_content
+            for src, tgt in replacement_pairs:
+                # Word-boundary aware replacement, case-insensitive
+                try:
+                    pattern = _re2.compile(r'(?<![\w\-])' + _re2.escape(src) + r'(?![\w\-])', _re2.IGNORECASE)
+                    replaced = pattern.sub(tgt, new_content)
+                    if replaced != new_content:
+                        new_content = replaced
+                except _re2.error:
+                    pass  # skip malformed patterns
+            if new_content != original_content:
+                row["content"] = new_content
+                gloss_fixes += 1
+
+        if gloss_fixes:
+            log(f"  📖 Post-processing: enforced glossary terms in {gloss_fixes} row(s).")
 
     return all_rephrased
 
