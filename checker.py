@@ -33,12 +33,12 @@ _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for
 
 # Fallback chain — used when all Gemini keys hit their daily quota (RPD)
 #
-# Tier 1: Llama 3.3 70B via OpenRouter (free, 200 RPD, stable)
-#   Set OPENROUTER_API_KEY in GitHub Actions secrets to enable.
-#   Sign up at openrouter.ai — no credit card required for free tier.
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL   = "meta-llama/llama-3.3-70b-instruct:free"
+# Tier 1: Llama 3.3 70B via Groq (free, 14,400 RPD, CI-friendly)
+#   Set GROQ_API_KEY in GitHub Actions secrets to enable.
+#   Sign up at console.groq.com — no credit card required for free tier.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama-3.3-70b-versatile"
 
 
 
@@ -523,14 +523,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
 
-    def _call_openrouter(batch_data, batch_num, total_batches, next_batch_first=None):
+    def _call_groq(batch_data, batch_num, total_batches, next_batch_first=None):
         """
-        Tier-1 fallback: Llama 3.3 70B via OpenRouter free tier.
-        Stable, proven free model — 200 RPD, no credit card required.
+        Tier-1 fallback: Llama 3.3 70B via Groq free tier.
+        14,400 RPD / 100 RPM — CI-friendly, no credit card required.
         OpenAI-compatible endpoint.
         """
-        if not OPENROUTER_API_KEY:
-            log("  ⚠️ OPENROUTER_API_KEY not set — OpenRouter fallback unavailable.")
+        if not GROQ_API_KEY:
+            log("  ⚠️ GROQ_API_KEY not set — Groq fallback unavailable.")
             return None
 
         prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
@@ -538,15 +538,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = requests.post(
-                    OPENROUTER_URL,
+                    GROQ_URL,
                     headers={
-                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
                         "Content-Type": "application/json",
-                        "HTTP-Referer": "https://github.com/johannesleidel1987-ai/cdreader-checker",
-                        "X-Title": "CDReader Checker",
                     },
                     json={
-                        "model": OPENROUTER_MODEL,
+                        "model": GROQ_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.3,
                         "max_tokens": 32768,
@@ -554,33 +552,32 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 30) or 30)
-                    log(f"  🔄 OpenRouter rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {retry_after}s...")
+                    retry_after = int(resp.headers.get("Retry-After", 60) or 60)
+                    log(f"  🔄 Groq rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {retry_after}s... Body: {resp.text[:300]}")
                     time.sleep(retry_after)
                     continue
                 if resp.status_code >= 400:
-                    log(f"  ❌ OpenRouter HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}): {resp.text[:400]}")
+                    log(f"  ❌ Groq HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}): {resp.text[:400]}")
                     if resp.status_code in (500, 502, 503):
                         time.sleep(15)
                         continue
                     else:
                         return None  # 4xx other than 429 — don't retry
-                resp.raise_for_status()
                 body = resp.json()
                 text = body["choices"][0]["message"]["content"]
                 if not text:
-                    log(f"❌ Empty OpenRouter response on batch {batch_num}")
+                    log(f"❌ Empty Groq response on batch {batch_num}")
                     return None
                 parsed = _parse_llm_response(text, batch_num)
                 if isinstance(parsed, dict):
                     parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
                     if parsed is None:
-                        log(f"❌ OpenRouter returned object but no array found: {text[:300]}")
+                        log(f"❌ Groq returned object but no array found: {text[:300]}")
                         return None
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from OpenRouter (Llama 3.3 70B).")
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Groq (Llama 3.3 70B).")
                 return parsed
             except json.JSONDecodeError as e:
-                log(f"❌ OpenRouter JSON parse error on batch {batch_num}: {e}")
+                log(f"❌ Groq JSON parse error on batch {batch_num}: {e}")
                 log(f"   Raw response (first 800 chars): {text[:800]}")
                 if attempt < MAX_RETRIES:
                     log("  Retrying in 15s...")
@@ -588,7 +585,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 else:
                     return None
             except Exception as e:
-                log(f"❌ OpenRouter error on batch {batch_num}: {e}")
+                log(f"❌ Groq error on batch {batch_num}: {e}")
                 if attempt < MAX_RETRIES:
                     log("  Retrying in 15s...")
                     time.sleep(15)
@@ -712,25 +709,25 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 continue
         return None  # all rotations exhausted
 
-    # Split into batches and call Gemini (with OpenRouter fallback) for each
+    # Split into batches and call Gemini (with Groq fallback) for each
     batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
     total_batches = len(batches)
     log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    openrouter_batches = 0
+    groq_batches = 0
     log(f"  Using {key_count} Gemini key(s) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
         result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
-            if _all_keys_rpd_dead() and OPENROUTER_API_KEY:
-                log(f"  🔀 Gemini RPD-exhausted — falling back to OpenRouter (Llama 4 Maverick) for batch {i}...")
-                result = _call_openrouter(batch, i, total_batches, next_batch_first=next_first)
+            if _all_keys_rpd_dead() and GROQ_API_KEY:
+                log(f"  🔀 Gemini RPD-exhausted — falling back to Groq (Llama 3.3 70B) for batch {i}...")
+                result = _call_groq(batch, i, total_batches, next_batch_first=next_first)
                 if result is not None:
-                    openrouter_batches += 1
+                    groq_batches += 1
             if result is None:
                 log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
                 return None
@@ -744,7 +741,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if i < total_batches:
             time.sleep(5)
 
-    provider_note = f" (OpenRouter fallback used for {openrouter_batches}/{total_batches} batch(es))" if openrouter_batches else ""
+    provider_note = f" (Groq fallback used for {groq_batches}/{total_batches} batch(es))" if groq_batches else ""
     log(f"  Total rows rephrased: {len(all_rephrased)}{provider_note}")
 
     # ── Post-process: strip spurious trailing commas after closing quotes ──────
@@ -1353,13 +1350,13 @@ def run_test():
     TEST_MODE: exercises the full rephrase pipeline on synthetic rows.
     No CDReader login, no submit, no finish. Safe to run anytime.
     Tests: Gemini key rotation, prompt quality, all post-processors, verification.
-    Falls back to OpenRouter (Llama 4 Maverick) if Gemini RPD-exhausted.
+    Falls back to Groq (Llama 3.3 70B) if Gemini RPD-exhausted.
     """
     log("=" * 60)
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
-    or_status = "✅ configured" if OPENROUTER_API_KEY else "❌ not configured (set OPENROUTER_API_KEY)"
-    log(f"OpenRouter fallback (Llama 3.3 70B): {or_status}")
+    or_status = "✅ configured" if GROQ_API_KEY else "❌ not configured (set GROQ_API_KEY)"
+    log(f"Groq fallback (Llama 3.3 70B): {or_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -1386,11 +1383,11 @@ def run_test():
     log(f"\nTest input: {len(TEST_ROWS)} synthetic rows")
 
     # ── Test rephrase pipeline ─────────────────────────────────────────────────
-    log("\n[1/4] Testing rephrase pipeline (Gemini → OpenRouter)...")
+    log("\n[1/4] Testing rephrase pipeline (Gemini → Groq)...")
     result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
 
     if not result:
-        fallback_hint = " (add OPENROUTER_API_KEY for fallback)" if not OPENROUTER_API_KEY else ""
+        fallback_hint = " (add GROQ_API_KEY for fallback)" if not GROQ_API_KEY else ""
         msg = f"❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys{fallback_hint}."
         log(msg)
         send_telegram(msg)
@@ -1441,7 +1438,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔀 OpenRouter fallback: {'configured' if OPENROUTER_API_KEY else 'not set'}\n"
+        f"🔀 Groq fallback: {'configured' if GROQ_API_KEY else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
