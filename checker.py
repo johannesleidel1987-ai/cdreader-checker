@@ -1157,22 +1157,32 @@ def run():
         send_telegram(msg)
         return
 
-    # Guard: if modifChapterContent is already populated on real content rows,
-    # this chapter was already processed by a previous run.
-    # NOTE: row[0] is always the chapter title row (eContent='') — it always has
-    # modifChapterContent pre-filled, so we must skip it and check actual content rows.
-    # Use any non-title rows (sort > 0) to check if already processed.
-    # Cannot rely on eContent being populated — it's empty for many books.
+    # Guard: skip only if task center confirms the task is already completed.
+    # If the task is still open (status=0, finishTime=None), the task center is ground truth —
+    # modifChapterContent may be pre-populated by CDReader (machine translation) or a prior
+    # partial run, but the task is genuinely unfinished and must be processed.
+    # Only apply the content-based guard when there is no open task (status=="already-claimed"
+    # fell through without a live task_id check), as a last-resort safeguard.
+    task_is_confirmed_open = (status == "already-claimed" and task_id is not None)
+    if not task_is_confirmed_open:
+        content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
+        if content_rows:
+            sample_row = content_rows[0]
+            modif = (sample_row.get("modifChapterContent") or "").strip()
+            orig  = (sample_row.get("chapterConetnt") or "").strip()
+            if modif and modif != orig:
+                msg = (f"⏭ <b>CDReader:</b> Skipped <b>{ch_name}</b> from {book_name} — "
+                       f"modifChapterContent already differs from source but no open task confirmed. "
+                       f"Manual check recommended.")
+                log(f"  ⏭  {msg}")
+                send_telegram(msg)
+                return
+    else:
+        log(f"  ℹ️  Task center confirms task is open (task_id={task_id}) — skipping content guard, processing regardless of modifChapterContent.")
+
     content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
     if content_rows:
-        sample_row = content_rows[0]
-        modif = (sample_row.get("modifChapterContent") or "").strip()
-        orig  = (sample_row.get("chapterConetnt") or "").strip()
-        # Already processed: modifChapterContent is set AND differs from raw content
-        if modif and modif != orig:
-            log(f"  ⏭  Chapter already processed (modifChapterContent differs from source on sort={sample_row.get('sort')}) — skipping.")
-            return
-        if not (sample_row.get("eContent") or "").strip():
+        if not (content_rows[0].get("eContent") or "").strip():
             log(f"  ⚠️  No eContent found on content rows — proceeding anyway.")
     else:
         log(f"  ⚠️  No content rows found at all — proceeding anyway.")
