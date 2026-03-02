@@ -18,7 +18,7 @@ ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",     "")  # kept for legacy reference
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",     "")
 
 # Multi-key Gemini rotation: keys tried in order, exhausted keys skipped for the run
 _GEMINI_KEYS_RAW = [
@@ -31,12 +31,16 @@ GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
 _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
 
-# Mistral fallback — used when all Gemini keys hit their daily quota (RPD)
-# Set MISTRAL_API_KEY in GitHub Actions secrets to enable.
-# Free "Experiment" plan: no credit card, ~1 RPS, full model access.
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
-MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
-MISTRAL_MODEL   = "mistral-small-latest"   # strong German, fast, free tier
+# Fallback chain — used when all Gemini keys hit their daily quota (RPD)
+#
+# Tier 1: Llama 4 Maverick via OpenRouter (free, 200 RPD, German fine-tuned)
+#   Set OPENROUTER_API_KEY in GitHub Actions secrets to enable.
+#   Sign up at openrouter.ai — no credit card required for free tier.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL   = "meta-llama/llama-4-maverick:free"
+
+
 
 def _next_gemini_key():
     """Return the next non-exhausted Gemini API key, or None if all exhausted."""
@@ -519,123 +523,77 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
 
-    def _fix_german_dialogue_json(text):
+    def _call_openrouter(batch_data, batch_num, total_batches, next_batch_first=None):
         """
-        Repair Mistral's habit of using German typographic opening quote „ (U+201E)
-        directly as a JSON value starter, without an enclosing ASCII quote pair.
-
-        Mistral free tier ignores response_format=json_object, so it still emits
-        markdown fences (stripped by _parse_llm_response) and German dialogue like:
-            "content": „Ich werde nicht gehen", sagte sie bestimmt."}  <- broken
-        should be:
-            "content": "„Ich werde nicht gehen\", sagte sie bestimmt."} <- valid
-
-        Three variants cover all observed patterns:
-          V1: „TEXT_A", TEXT_B."  — two quotes: escape mid-quote, add opening "
-          V2: „TEXT"              — one quote:  add opening " before „
-          V3: „TEXT               — no quotes:  wrap entirely with "..."
-
-        Only values starting with „ are touched; normal "..." values are untouched.
+        Tier-1 fallback: Llama 4 Maverick via OpenRouter free tier.
+        German is a natively fine-tuned language — strong literary quality.
+        Free tier: 200 RPD, no credit card. OpenAI-compatible endpoint.
         """
-        # V1: „SPEECH", rest." → insert opening ", escape the speech-close "
-        text = re.sub(
-            r'(": )(„[^"\n]*)"([^"}\n]*)"(\s*[,}\]])',
-            lambda m: f'{m.group(1)}"{m.group(2)}\\"{m.group(3)}"{m.group(4)}',
-            text
-        )
-        # V2: „SPEECH" → insert opening " (existing ASCII " becomes the JSON close)
-        text = re.sub(
-            r'(": )(„[^"\n]*)"(\s*[,}\]])',
-            lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}',
-            text
-        )
-        # V3: „SPEECH with no closing quote — add opening and closing "
-        text = re.sub(
-            r'(": )(„[^"}\n]*)(\s*[,}\]])',
-            lambda m: f'{m.group(1)}"{m.group(2)}"{m.group(3)}',
-            text
-        )
-        return text
-
-    def _call_mistral(batch_data, batch_num, total_batches, next_batch_first=None):
-        """
-        Fallback to Mistral API when all Gemini keys are RPD-exhausted.
-        Uses mistral-small-latest on the free Experiment plan.
-
-        The free tier ignores response_format=json_object, so we rely on:
-          1. _parse_llm_response to strip ```json fences
-          2. _fix_german_dialogue_json (applied here before parsing) to repair
-             German typographic „ quotes used as bare JSON value starters
-        """
-        if not MISTRAL_API_KEY:
-            log("  ⚠️ MISTRAL_API_KEY not set — Mistral fallback unavailable.")
+        if not OPENROUTER_API_KEY:
+            log("  ⚠️ OPENROUTER_API_KEY not set — OpenRouter fallback unavailable.")
             return None
 
-        mistral_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
+        prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = requests.post(
-                    MISTRAL_URL,
+                    OPENROUTER_URL,
                     headers={
-                        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                         "Content-Type": "application/json",
+                        "HTTP-Referer": "https://github.com/johannesleidel1987-ai/cdreader-checker",
+                        "X-Title": "CDReader Checker",
                     },
                     json={
-                        "model": MISTRAL_MODEL,
-                        "messages": [{"role": "user", "content": mistral_prompt}],
+                        "model": OPENROUTER_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.3,
                         "max_tokens": 32768,
                     },
                     timeout=300,
                 )
                 if resp.status_code == 429:
-                    retry_after = 0
-                    try:
-                        retry_after = int(resp.headers.get("Retry-After", 0))
-                    except Exception:
-                        pass
-                    wait = retry_after if retry_after > 0 else 30
-                    log(f"  🔄 Mistral rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {wait}s...")
-                    time.sleep(wait)
+                    retry_after = int(resp.headers.get("Retry-After", 30) or 30)
+                    log(f"  🔄 OpenRouter rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {retry_after}s...")
+                    time.sleep(retry_after)
                     continue
                 if resp.status_code in (500, 502, 503):
-                    log(f"  ⚠️ Mistral server error {resp.status_code} (attempt {attempt}/{MAX_RETRIES}), retrying in 15s...")
+                    log(f"  ⚠️ OpenRouter server error {resp.status_code} (attempt {attempt}/{MAX_RETRIES}), retrying in 15s...")
                     time.sleep(15)
                     continue
                 resp.raise_for_status()
                 body = resp.json()
                 text = body["choices"][0]["message"]["content"]
                 if not text:
-                    log(f"❌ Empty Mistral response on batch {batch_num}")
+                    log(f"❌ Empty OpenRouter response on batch {batch_num}")
                     return None
-                # Pre-process: repair German dialogue typographic quote issues before parsing
-                text = _fix_german_dialogue_json(text)
                 parsed = _parse_llm_response(text, batch_num)
-                # Unwrap {"rows": [...]} if Mistral wraps the array in an object
                 if isinstance(parsed, dict):
                     parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
                     if parsed is None:
-                        log(f"❌ Mistral returned object but no array found: {text[:300]}")
+                        log(f"❌ OpenRouter returned object but no array found: {text[:300]}")
                         return None
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Mistral.")
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from OpenRouter (Llama 4 Maverick).")
                 return parsed
             except json.JSONDecodeError as e:
-                log(f"❌ Mistral JSON parse error on batch {batch_num}: {e}")
-                log(f"   Raw Mistral response (first 800 chars): {text[:800]}")
+                log(f"❌ OpenRouter JSON parse error on batch {batch_num}: {e}")
+                log(f"   Raw response (first 800 chars): {text[:800]}")
                 if attempt < MAX_RETRIES:
                     log("  Retrying in 15s...")
                     time.sleep(15)
                 else:
                     return None
             except Exception as e:
-                log(f"❌ Mistral error on batch {batch_num}: {e}")
+                log(f"❌ OpenRouter error on batch {batch_num}: {e}")
                 if attempt < MAX_RETRIES:
                     log("  Retrying in 15s...")
                     time.sleep(15)
                 else:
                     return None
         return None
+
+
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
 
@@ -751,26 +709,25 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 continue
         return None  # all rotations exhausted
 
-    # Split into batches and call Gemini (with Mistral fallback) for each
+    # Split into batches and call Gemini (with OpenRouter fallback) for each
     batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
     total_batches = len(batches)
     log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    mistral_batches = 0   # track how many batches fell back to Mistral
+    openrouter_batches = 0
     log(f"  Using {key_count} Gemini key(s) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
         result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
-            # If all Gemini keys are RPD-dead, try Mistral before giving up
-            if _all_keys_rpd_dead() and MISTRAL_API_KEY:
-                log(f"  🔀 Gemini RPD-exhausted — falling back to Mistral for batch {i}...")
-                result = _call_mistral(batch, i, total_batches, next_batch_first=next_first)
+            if _all_keys_rpd_dead() and OPENROUTER_API_KEY:
+                log(f"  🔀 Gemini RPD-exhausted — falling back to OpenRouter (Llama 4 Maverick) for batch {i}...")
+                result = _call_openrouter(batch, i, total_batches, next_batch_first=next_first)
                 if result is not None:
-                    mistral_batches += 1
+                    openrouter_batches += 1
             if result is None:
                 log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
                 return None
@@ -784,7 +741,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if i < total_batches:
             time.sleep(5)
 
-    provider_note = f" (Mistral fallback used for {mistral_batches}/{total_batches} batch(es))" if mistral_batches else ""
+    provider_note = f" (OpenRouter fallback used for {openrouter_batches}/{total_batches} batch(es))" if openrouter_batches else ""
     log(f"  Total rows rephrased: {len(all_rephrased)}{provider_note}")
 
     # ── Post-process: strip spurious trailing commas after closing quotes ──────
@@ -1393,12 +1350,13 @@ def run_test():
     TEST_MODE: exercises the full rephrase pipeline on synthetic rows.
     No CDReader login, no submit, no finish. Safe to run anytime.
     Tests: Gemini key rotation, prompt quality, all post-processors, verification.
-    If all Gemini keys are unavailable and MISTRAL_API_KEY is set, also tests Mistral.
+    Falls back to OpenRouter (Llama 4 Maverick) if Gemini RPD-exhausted.
     """
     log("=" * 60)
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
-    log(f"Mistral fallback: {'✅ configured' if MISTRAL_API_KEY else '❌ not configured (set MISTRAL_API_KEY)'}")
+    or_status = "✅ configured" if OPENROUTER_API_KEY else "❌ not configured (set OPENROUTER_API_KEY)"
+    log(f"OpenRouter fallback (Llama 4 Maverick): {or_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -1424,13 +1382,13 @@ def run_test():
 
     log(f"\nTest input: {len(TEST_ROWS)} synthetic rows")
 
-    # ── Test Gemini / Mistral ──────────────────────────────────────────────────
-    log("\n[1/4] Testing rephrase pipeline (Gemini primary, Mistral fallback if needed)...")
+    # ── Test rephrase pipeline ─────────────────────────────────────────────────
+    log("\n[1/4] Testing rephrase pipeline (Gemini → OpenRouter)...")
     result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
 
     if not result:
-        no_mistral_hint = " (add MISTRAL_API_KEY for fallback)" if not MISTRAL_API_KEY else ""
-        msg = f"❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys{no_mistral_hint}."
+        fallback_hint = " (add OPENROUTER_API_KEY for fallback)" if not OPENROUTER_API_KEY else ""
+        msg = f"❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys{fallback_hint}."
         log(msg)
         send_telegram(msg)
         return
@@ -1480,7 +1438,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔀 Mistral fallback: {'configured' if MISTRAL_API_KEY else 'not set'}\n"
+        f"🔀 OpenRouter fallback: {'configured' if OPENROUTER_API_KEY else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
