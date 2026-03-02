@@ -941,11 +941,17 @@ def find_active_chapter(token, books):
                 log(f"  Task: {t}")
 
         for task in tasks:
-            # Only process active (not yet finished) tasks: status=0 means in-progress
-            if task.get("status", 1) != 0:
+            t_status = task.get("status")
+            t_finish = task.get("finishTime")
+            log(f"  Evaluating task status={t_status} finishTime={t_finish}")
+            # Accept status=0 (in-progress) AND status=1 (to-be-edited / claimed-not-started).
+            # CDReader uses different codes: 0=in-progress, 1=to-be-edited, 2+=completed/closed.
+            # Only skip tasks that are explicitly finished.
+            if t_finish is not None:
+                log(f"  Skipping task — finishTime is set ({t_finish})")
                 continue
-            # Skip if already finished (finishTime set = completed, even if status not updated yet)
-            if task.get("finishTime") is not None:
+            if t_status in (2, 3, 4):
+                log(f"  Skipping task — status={t_status} indicates completed")
                 continue
 
             # Extract chapter ID — the proc_id
