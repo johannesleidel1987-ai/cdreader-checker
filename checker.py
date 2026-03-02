@@ -804,26 +804,27 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         c = row.get("content", "")
         next_content = sorted_rows[idx + 1].get("content", "") if idx + 1 < len(sorted_rows) else ""
 
-        # Rule A: Remove comma after ?" or !" (intra-row and cross-row).
-        # German rule: ? and ! already end speech — no comma before attribution.
-        c_fixed = _re.sub(r'([?!]“)\s*,\s*', r'\1 ', c)
-        c_fixed = _re.sub(r'([?!"]),\s*', r'\1 ', c_fixed)
+        # Rule A: Remove spurious comma after ?" only.
+        # German: ? already terminates speech — comma before Begleitsatz is wrong.
+        # Note: !" is different — comma IS required after !" (Rule F handles that).
+        c_fixed = _re.sub(r'(\?“)\s*,\s*', r'\1 ', c)   # German close
+        c_fixed = _re.sub(r'(\?")\s*,\s*', r'\1 ', c_fixed)   # ASCII close
         if c_fixed != c:
             row["content"] = c_fixed
             c = c_fixed
             comma_fixes += 1
 
         # Rule B: Remove cross-row comma when next row is NOT a Begleitsatz.
-        elif c.endswith('“,') or c.endswith('",'):
+        elif c.endswith('",') or c.endswith('“,'):
             if not BEGLEITSATZ_PATTERN.match(next_content):
                 row["content"] = c[:-1]
                 c = c[:-1]
                 comma_fixes += 1
 
         # Rule C: Add missing comma when plain closing quote is followed by Begleitsatz.
+        # Only for plain close (not ?/" or !/" — those have their own rules).
         elif (c.endswith('“') or c.endswith('"')) \
-                and not c.endswith('?“') and not c.endswith('!"') \
-                and not c.endswith('?“') and not c.endswith('!“'):
+                and not _re.search(r'[?!][“"]$', c):
             if BEGLEITSATZ_PATTERN.match(next_content):
                 row["content"] = c + ","
                 c = c + ","
@@ -837,33 +838,59 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 dash_fixes += 1
 
         # Rule E: Move comma from BEFORE closing quote to AFTER it.
-        # German rule: comma always follows the closing ", never precedes it.
-        # Wrong:   „Text,"  sagte er.   or   „Text,\u201c sagte er.
-        # Correct: „Text",  sagte er.   or   „Text\u201c, sagte er.
-        # Applies both inline (same row) and cross-row (row ends with ,").
-        # Does NOT apply after ? or ! (those are already handled by Rule A).
-        if not _re.search(r'[?!],[\u201c"]', c):  # skip if ? or ! precedes comma
-            # Inline: ,\u201c or ," immediately followed by space+Begleitsatz
+        # Wrong: „Text,“ sagte / „Text," sagte
+        # Right: „Text“, sagte / „Text", sagte
+        if not _re.search(r'[?!],[“"]', c):
             c_e = _re.sub(
                 r',(\u201c|")([ \t]+(?:sagte|flüsterte|antwortete|rief|fragte|murmelte|'
                 r'erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|'
                 r'brüllte|nickte|lächelte|seufzte|wisperte|knurrte|ergänzte|meinte|'
-                r'verkündete|wiederholte|murmelte))',
+                r'verkündete|wiederholte))',
                 r'\1,\2', c
             )
-            # Cross-row: row ends with ," or ,\u201c and next row is Begleitsatz
-            if c_e == c and (c.endswith(',\u201c') or c.endswith(',\"')):
+            if c_e == c and (c.endswith(',“') or c.endswith(',"')):
                 if BEGLEITSATZ_PATTERN.match(next_content):
-                    # swap: strip trailing ," then add ", 
                     c_e = c[:-2] + c[-1] + ','
             if c_e != c:
                 row["content"] = c_e
                 comma_fixes += 1
 
+        # Rule F: Add missing comma after !" before Begleitsatz.
+        # German: ! ends speech with exclamation, but comma is still needed
+        # before the attribution verb.
+        # Inline:    „Text!" rief er.   →  „Text!", rief er.
+        # Cross-row: row ends with !"   and next row is Begleitsatz → add ","
+        if _re.search(r'[!“"]$', c) or _re.search(r'!"[^,]', c):
+            # Inline: !" followed by space+Begleitsatz without comma
+            c_f = _re.sub(
+                r'(![“"])(?!,)([ \t]+(?:sagte|flüsterte|antwortete|rief|fragte|murmelte|'
+                r'erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|'
+                r'brüllte|nickte|lächelte|seufzte|wisperte|knurrte|ergänzte|meinte|'
+                r'verkündete|wiederholte))',
+                r'\1,\2', c
+            )
+            # Cross-row: row ends with !" and next row is Begleitsatz
+            if c_f == c and _re.search(r'![“"]$', c):
+                if BEGLEITSATZ_PATTERN.match(next_content):
+                    c_f = c + ','
+            if c_f != c:
+                row["content"] = c_f
+                comma_adds += 1
+
+        # Rule G: Title-case Kapitel header rows.
+        # Every word in a "Kapitel NNN ..." row must start with a capital letter.
+        if _re.match(r'^Kapitel\s+\d+', c):
+            titled = ' '.join(
+                w[0].upper() + w[1:] if w else w
+                for w in c.split(' ')
+            )
+            if titled != c:
+                row["content"] = titled
+
     if comma_fixes:
         log(f"  ✂️  Post-processing: fixed {comma_fixes} dialogue comma(s).")
     if comma_adds:
-        log(f"  ✍️  Post-processing: added {comma_adds} missing comma(s) before Begleitsatz.")
+        log(f"  ✍️  Post-processing: added/fixed {comma_adds} comma(s) before Begleitsatz (incl. after !).")
     if dash_fixes:
         log(f"  ➖ Post-processing: replaced {dash_fixes} literal em-dash(es) with comma.")
     # ── Post-process: deterministic glossary enforcement ────────────────────
