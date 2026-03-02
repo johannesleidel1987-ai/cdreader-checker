@@ -371,7 +371,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         log("❌ No GEMINI_API_KEY configured.")
         return None
 
-    glossary_text = format_glossary_for_prompt(glossary_terms)
+    # Keep raw terms for per-batch filtering; also pre-format full list as fallback
+    glossary_text_full = format_glossary_for_prompt(glossary_terms)
 
     # Build input data: sort + English original + German pre-translation to rephrase
     # Field names from API: eContent=English source, chapterConetnt=German pre-translation (note typo)
@@ -501,10 +502,40 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if quote_hints:
             quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
 
+        # Filter glossary to only terms present in this batch's text — reduces prompt
+        # size dramatically (especially important for Groq's 12k TPM limit) and keeps
+        # the model focused on only the relevant terms rather than all 200+ entries.
+        batch_text = " ".join(
+            (r.get("original", "") + " " + r.get("content", "")).lower()
+            for r in batch_data
+        )
+        if glossary_terms:
+            relevant_terms = [
+                t for t in glossary_terms
+                if (t.get("dictionaryKey") or "").lower() in batch_text
+                or (t.get("enSurname") or "").lower() in batch_text
+            ]
+            # Always include character name / surname entries (enSurname field populated)
+            # even if not found by simple substring — they may appear in different cases.
+            # Keep all surname entries as they're short and critical for consistency.
+            surname_terms = [t for t in glossary_terms if t.get("enSurname")]
+            # Merge: relevant + all surname entries, deduplicated by id
+            seen_ids = set()
+            merged = []
+            for t in relevant_terms + surname_terms:
+                tid = t.get("id", id(t))
+                if tid not in seen_ids:
+                    seen_ids.add(tid)
+                    merged.append(t)
+            batch_glossary_text = format_glossary_for_prompt(merged) if merged else glossary_text_full
+        else:
+            batch_glossary_text = glossary_text_full
+        log(f"  Glossary for batch {batch_num}: {len(merged) if glossary_terms else 0} relevant terms (of {len(glossary_terms or [])} total)")
+
         prompt = (
             f"{BASE_PROMPT}\n\n"
             f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
-            f"{glossary_text}\n\n"
+            f"{batch_glossary_text}\n\n"
             f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
             f"For each row, \"original\" is the English source text (may be empty), and \"content\" is the German pre-translation you must rephrase into fluent, natural German. "
             f"Return ONLY a JSON array with the same number of objects, each containing \"sort\" and \"content\" fields.\n"
