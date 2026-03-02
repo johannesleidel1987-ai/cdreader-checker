@@ -33,12 +33,12 @@ _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for
 
 # Fallback chain — used when all Gemini keys hit their daily quota (RPD)
 #
-# Tier 1: Llama 4 Maverick via OpenRouter (free, 200 RPD, German fine-tuned)
+# Tier 1: Llama 3.3 70B via OpenRouter (free, 200 RPD, stable)
 #   Set OPENROUTER_API_KEY in GitHub Actions secrets to enable.
 #   Sign up at openrouter.ai — no credit card required for free tier.
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL   = "meta-llama/llama-4-maverick:free"
+OPENROUTER_MODEL   = "meta-llama/llama-3.3-70b-instruct:free"
 
 
 
@@ -525,9 +525,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     def _call_openrouter(batch_data, batch_num, total_batches, next_batch_first=None):
         """
-        Tier-1 fallback: Llama 4 Maverick via OpenRouter free tier.
-        German is a natively fine-tuned language — strong literary quality.
-        Free tier: 200 RPD, no credit card. OpenAI-compatible endpoint.
+        Tier-1 fallback: Llama 3.3 70B via OpenRouter free tier.
+        Stable, proven free model — 200 RPD, no credit card required.
+        OpenAI-compatible endpoint.
         """
         if not OPENROUTER_API_KEY:
             log("  ⚠️ OPENROUTER_API_KEY not set — OpenRouter fallback unavailable.")
@@ -558,10 +558,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     log(f"  🔄 OpenRouter rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {retry_after}s...")
                     time.sleep(retry_after)
                     continue
-                if resp.status_code in (500, 502, 503):
-                    log(f"  ⚠️ OpenRouter server error {resp.status_code} (attempt {attempt}/{MAX_RETRIES}), retrying in 15s...")
-                    time.sleep(15)
-                    continue
+                if resp.status_code >= 400:
+                    log(f"  ❌ OpenRouter HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}): {resp.text[:400]}")
+                    if resp.status_code in (500, 502, 503):
+                        time.sleep(15)
+                        continue
+                    else:
+                        return None  # 4xx other than 429 — don't retry
                 resp.raise_for_status()
                 body = resp.json()
                 text = body["choices"][0]["message"]["content"]
@@ -574,7 +577,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     if parsed is None:
                         log(f"❌ OpenRouter returned object but no array found: {text[:300]}")
                         return None
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from OpenRouter (Llama 4 Maverick).")
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from OpenRouter (Llama 3.3 70B).")
                 return parsed
             except json.JSONDecodeError as e:
                 log(f"❌ OpenRouter JSON parse error on batch {batch_num}: {e}")
@@ -1356,7 +1359,7 @@ def run_test():
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
     or_status = "✅ configured" if OPENROUTER_API_KEY else "❌ not configured (set OPENROUTER_API_KEY)"
-    log(f"OpenRouter fallback (Llama 4 Maverick): {or_status}")
+    log(f"OpenRouter fallback (Llama 3.3 70B): {or_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
