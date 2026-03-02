@@ -13,7 +13,7 @@ from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
-GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
