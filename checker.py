@@ -26,6 +26,7 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_2", ""),
     os.environ.get("GEMINI_API_KEY_3", ""),
     os.environ.get("GEMINI_API_KEY_4", ""),
+    os.environ.get("GEMINI_API_KEY_5", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
