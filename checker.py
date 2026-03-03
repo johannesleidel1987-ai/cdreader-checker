@@ -882,15 +882,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 comma_adds += 1
 
         # Rule G: Title-case Kapitel header rows.
-        # Every word in a "Kapitel NNN ..." row must start with a capital letter.
+        # Strip any colon after the chapter number (model sometimes adds 'Kapitel 210: Title')
+        # then capitalise first letter of every word.
         if _re.match(r'^Kapitel\s+\d+', c):
-            titled = ' '.join(
-                w[0].upper() + w[1:] if w else w
-                for w in c.split(' ')
-            )
+            c_g = _re.sub(r'^(Kapitel\s+\d+)\s*:\s*', r'\1 ', c).strip()
+            titled = ' '.join(w[0].upper() + w[1:] if w else w for w in c_g.split(' '))
             if titled != c:
-                row["content"] = titled
-
+                row['content'] = titled
         # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
         # Pattern: „Speech!“, attribution verb.“  ← trailing “ is wrong.
         # Happens when LLM copies source quote position onto a restructured German sentence.
