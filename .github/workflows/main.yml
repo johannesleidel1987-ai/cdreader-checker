@@ -12,7 +12,7 @@ on:
           - 'false'
           - 'true'
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/8 * * * *'
 
 jobs:
   check-chapters:
@@ -37,6 +37,7 @@ jobs:
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
         run: python checker.py
