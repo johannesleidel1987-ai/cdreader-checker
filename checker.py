@@ -907,29 +907,56 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     quote_restores = 0
     # Build original lookup by sort key
     orig_by_sort = {r.get("sort", i): (r.get("original") or r.get("content") or "") for i, r in enumerate(input_data)}
+    # Any character that counts as a closing quote (U+201C German, U+201D English right-quote, ASCII)
+    ALL_CLOSE = ('“', '”', '"')
+    ALL_CLOSE_RE = r'[“”"]'
     OPEN_QUOTES  = ('"', '„', '“', '«', '‘')
-    CLOSE_QUOTES = ('"', '“', '»', '’')
+
     for row in all_rephrased:
         c = row.get("content", "")
         orig = orig_by_sort.get(row.get("sort"), "")
         if not orig or not c:
             continue
         orig_opens  = orig.startswith(OPEN_QUOTES)
-        orig_closes = orig.endswith(CLOSE_QUOTES) or bool(_re.search(r'["“»’]\s*[,!?.]?\s*$', orig))
-        out_opens   = c.startswith(('„', '“', '"'))
-        out_closes  = c.endswith('“') or bool(_re.search(r'“\s*[,!?.]?\s*$', c)) or c.endswith('"')
+        orig_closes = orig.endswith(ALL_CLOSE) or bool(_re.search(ALL_CLOSE_RE + r'\s*[,!?.]?\s*$', orig))
+        out_opens   = c.startswith(('„', '“', '”', '"'))
         fixed = c
+
+        # Fix 1a: Deduplicate consecutive closing quotes produced when model
+        # outputs U+201D and Rule H then appends U+201C on top („...?”“).
+        # Normalise all closing-quote variants to “, then collapse runs.
+        deduped = _re.sub(ALL_CLOSE_RE + r'{2,}', '“', fixed)
+        deduped = deduped.replace('”', '“')
+        if deduped != fixed:
+            fixed = deduped
+            row["content"] = fixed
+            quote_restores += 1
+            c = fixed  # keep c in sync for checks below
+
+        # Restore missing opening „
         if orig_opens and not out_opens:
             fixed = '„' + fixed
-        if orig_closes and not (fixed.endswith('“') or _re.search(r'“\s*[,!?.]?\s*$', fixed) or fixed.endswith('"')):
-            # Guard: if output already has a closing quote mid-sentence (e.g. inline
-            # restructuring like „Text!“, schoss sie zurück.), don't add another.
-            already_has_close = bool(_re.search(r'[“"][ ,!?.]', fixed))
-            if not already_has_close:
+
+        # Restore missing closing " (only when original English had one)
+        already_closed = bool(_re.search(ALL_CLOSE_RE + r'\s*[,!?.]?\s*$', fixed))
+        if orig_closes and not already_closed:
+            # Guard: don't add if a close quote already appears mid-sentence
+            # (restructured sentence like „Text!“, schoss sie zurück.)
+            already_has_mid = bool(_re.search(ALL_CLOSE_RE + r'[ ,!?.]', fixed))
+            if not already_has_mid:
                 if fixed.endswith(','):
                     fixed = fixed[:-1] + '“,'
                 else:
                     fixed = fixed + '“'
+
+        # Fix 1b: Insert missing close before inline attribution verb.
+        # Pattern: row starts with „ but has NO closing quote anywhere, yet contains
+        # „Speech text, stellte Gabriela... → „Speech text“, stellte Gabriela...
+        if fixed.startswith('„') and not _re.search(ALL_CLOSE_RE, fixed[1:]):
+            m_attr = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
+            if m_attr:
+                fixed = fixed[:m_attr.start()] + '“' + fixed[m_attr.start():]
+
         if fixed != c:
             row["content"] = fixed
             quote_restores += 1
