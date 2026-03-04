@@ -775,30 +775,40 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # ── Post-process: German dialogue punctuation enforcement ─────────────────
     import re as _re
-    # Comprehensive list of German speech/attribution verbs (Begleitsatz verbs).
-    # Add new verbs here whenever the model introduces one not yet covered.
-    _SV = (
+    # _SV_CORE: Pure speech/communication verbs used for CROSS-ROW comma decisions
+    # (Rules B and C). Must be conservative — these verbs almost exclusively signal
+    # speech attribution and rarely appear as pure narrative action starters.
+    # Deliberately excludes dual-use action verbs like nickte, lächelte, seufzte,
+    # versprach, zögerte etc. which cause false positives when they start narrative rows.
+    _SV_CORE = (
         r"sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|bemerkte|"
-        r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|nickte|"
-        r"lächelte|seufzte|wisperte|knurrte|schnappte|stöhnte|schluchzte|"
-        r"keuchte|grunzte|gluckste|ergänzte|meinte|verkündete|wiederholte|"
-        r"flehte|bat|bettelte|jammerte|klagte|schimpfte|schoss|fuhr|setzte|"
-        r"warf|stieß|raunte|spuckte|platzte|brach|fiel|gab|presste|rang|"
-        r"drängte|keifte|ächzte|sprach|meldete|berichtete|erklärte|betonte|"
-        r"bestätigte|verneinte|gestand|bekannte|schwor|versprach|drohte|"
-        r"warnte|befahl|forderte|appellierte|protestierte|unterbrach|insistierte|"
-        r"konterte|zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück"
+        r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
+        r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
+        r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
+        r"protestierte|unterbrach|insistierte|meldete|berichtete"
+    )
+    # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
+    # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
+    _SV = (
+        _SV_CORE + r"|"
+        r"nickte|lächelte|seufzte|wisperte|schnappte|stöhnte|schluchzte|"
+        r"keuchte|grunzte|gluckste|bettelte|jammerte|klagte|schimpfte|fuhr|setzte|"
+        r"warf|stieß|spuckte|platzte|brach|fiel|gab|presste|rang|"
+        r"drängte|keifte|ächzte|sprach|gestand|bekannte|schwor|versprach|"
+        r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
+        r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück"
     )
     BEGLEITSATZ_PATTERN = _re.compile(
         rf"""^(?:
-            (?:{_SV})
+            (?:{_SV_CORE})
             |
-            (?:[A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ]?[a-zäöüß\-]+)*\s+(?:{_SV}))
+            (?:[A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ]?[a-zäöüß\-]+)*\s+(?:{_SV_CORE}))
             |
-            (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:{_SV}))
+            (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:{_SV_CORE}))
         )""",
         _re.IGNORECASE | _re.VERBOSE
     )
+
 
     comma_fixes = 0
     comma_adds = 0
