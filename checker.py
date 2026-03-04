@@ -809,31 +809,40 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         c = row.get("content", "")
         next_content = sorted_rows[idx + 1].get("content", "") if idx + 1 < len(sorted_rows) else ""
 
-        # Rule A: Remove spurious comma after ?" only.
-        # German: ? already terminates speech — comma before Begleitsatz is wrong.
-        # Note: !" is different — comma IS required after !" (Rule F handles that).
-        c_fixed = _re.sub(r'(\?“)\s*,\s*', r'\1 ', c)   # German close
-        c_fixed = _re.sub(r'(\?")\s*,\s*', r'\1 ', c_fixed)   # ASCII close
-        if c_fixed != c:
-            row["content"] = c_fixed
-            c = c_fixed
-            comma_fixes += 1
+        # Rule A removed: comma after ?" IS required in German before Begleitsatz.
+        # Rule F (below) handles !" the same way.
 
         # Rule B: Remove cross-row comma when next row is NOT a Begleitsatz.
-        elif c.endswith('",') or c.endswith('“,'):
+        if c.endswith('",') or c.endswith('“,') or c.endswith('”,'):
             if not BEGLEITSATZ_PATTERN.match(next_content):
                 row["content"] = c[:-1]
                 c = c[:-1]
                 comma_fixes += 1
 
-        # Rule C: Add missing comma when plain closing quote is followed by Begleitsatz.
-        # Only for plain close (not ?/" or !/" — those have their own rules).
-        elif (c.endswith('“') or c.endswith('"')) \
-                and not _re.search(r'[?!][“"]$', c):
+        # Rule C: Add missing comma when closing quote is followed by Begleitsatz.
+        # Applies to ALL closing quote variants including ?" and !" (same need for comma).
+        # Cross-row: row ends with " (any variant, no comma yet) and next IS Begleitsatz.
+        elif (c.endswith('“') or c.endswith('”') or c.endswith('"'))                 and not c.endswith(','):
             if BEGLEITSATZ_PATTERN.match(next_content):
                 row["content"] = c + ","
                 c = c + ","
                 comma_adds += 1
+
+        # Rule C2: Add missing comma after ?" / !" inline (same row as attribution).
+        # e.g. „Seit wann trägst du Schmuck?“ fragte Karl → „Seit wann trägst du Schmuck?“, fragte Karl
+        if _re.search(r'[?!][“”"](?!,)', c):
+            c_c2 = _re.sub(
+                r'([?!][“”"])(?!,)([ \t]+(?:sagte|flüsterte|antwortete|rief|fragte|murmelte|'
+                r'erwiderte|bemerkte|fügte|entgegnete|zischte|hauchte|stammelte|schrie|'
+                r'brüllte|nickte|lächelte|seufzte|wisperte|knurrte|ergänzte|meinte|'
+                r'verkündete|wiederholte|flehte|bat|schoss|fuhr|konterte|stellte|erklärte))',
+                r'\1,\2', c
+            )
+            if c_c2 != c:
+                row["content"] = c_c2
+                c = c_c2
+                comma_adds += 1
+
 
         # Rule D: Replace literal mid-sentence em-dashes with commas.
         if '—' in c:
@@ -949,12 +958,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     fixed = fixed + '“'
 
         # Fix 1b: Insert missing close before inline attribution verb.
-        # Pattern: row starts with „ but has NO closing quote anywhere, yet contains
-        # „Speech text, stellte Gabriela... → „Speech text“, stellte Gabriela...
+        # Handles two sub-cases:
+        #   a) „Speech text, stellte Gabriela... → „Speech text“, stellte Gabriela...
+        #   b) „Speech text sagte er leise.     → „Speech text“, sagte er leise.
+        #      (model omits BOTH comma and closing quote — insert both)
         if fixed.startswith('„') and not _re.search(ALL_CLOSE_RE, fixed[1:]):
+            # Sub-case a: comma already present before attribution verb
             m_attr = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
             if m_attr:
                 fixed = fixed[:m_attr.start()] + '“' + fixed[m_attr.start():]
+            else:
+                # Sub-case b: no comma — verb appears with only a space before it
+                m_attr2 = _re.search(r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
+                if m_attr2:
+                    # Insert closing quote + comma before the attribution
+                    fixed = fixed[:m_attr2.start()] + '“,' + fixed[m_attr2.start():]
 
         if fixed != c:
             row["content"] = fixed
