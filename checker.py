@@ -1277,7 +1277,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         no, nr = _norm(output), _norm(ref)
         return max(_jaccard(no, nr), _trigram(no, nr))
 
-    SIM_THRESHOLD = 0.55   # flag rows at or above this combined similarity
+    SIM_THRESHOLD = 0.90   # flag rows at or above this combined similarity
+    # 0.90 chosen because Jaccard word-overlap scores well-rephrased sentences at 50-75%;
+    # only genuinely unchanged or near-identical rows score above 90%.
 
     # chapterConetnt is ENGLISH \u2014 only compare against machineChapterContent (German).
     # Read machineChapterContent directly from raw API rows.
@@ -1323,7 +1325,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     else:
         log(f"  [SIM DIAG] no rows with machineChapterContent \u2014 no_ref={_rows_no_ref} (guard blind!)")
 
-    similar_rows = [(sn, out, mt, sim) for sn, out, mt, sim in _sim_scores if sim >= SIM_THRESHOLD]
+    # Exclude short rows (< 4 words) from similarity retry --
+    # single-word exclamations like "Emma!" cannot be rephrased and score 100%.
+    similar_rows = [
+        (sn, out, mt, sim) for sn, out, mt, sim in _sim_scores
+        if sim >= SIM_THRESHOLD and len(out.split()) >= 4
+    ]
 
     if similar_rows:
         log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
@@ -1385,6 +1392,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 rephrased_by_sort[sort_n]["content"] = retry_result
             else:
                 log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged or failed, keeping original")
+            time.sleep(1)  # avoid RPM burnout across multiple similarity retries
 
         all_rephrased = sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
     else:
