@@ -447,7 +447,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             "sort": r.get("sort", i),
             "original": r.get("eContent") or r.get("eeContent") or r.get("original") or "",
             "content": raw_contents[i],
-            "_quote_role": quote_roles[i],  # stripped before sending to Gemini
+            "machine_translation": r.get("machineChapterContent") or r.get("modifChapterContent") or "",
+            "_quote_role": quote_roles[i],
         }
         for i, r in enumerate(rows)
     ]
@@ -495,7 +496,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 "\n\nLOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):\n"
                 f"The row immediately following this batch starts with: {json.dumps(next_batch_first.get('content', ''), ensure_ascii=False)}"
             )
-        clean_batch = [{"sort": r["sort"], "original": r.get("original",""), "content": r["content"]} for r in batch_data]
+        clean_batch = [
+            {
+                "sort": r["sort"],
+                "original": r.get("original", ""),
+                "machine_translation": r.get("machine_translation", ""),
+                "content": r["content"],
+            }
+            for r in batch_data
+        ]
         quote_hints = []
         for r in batch_data:
             role = r.get("_quote_role", "both")
@@ -542,8 +551,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
             f"{batch_glossary_text}\n\n"
             f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
-            f"For each row, \"original\" is the English source text (may be empty), and \"content\" is the German pre-translation you must rephrase into fluent, natural German. "
-            f"Return ONLY a JSON array with the same number of objects, each containing \"sort\" and \"content\" fields.\n"
+            f"For each row:\n"
+            f"  - \"original\": English source (may be empty, for context only).\n"
+            f"  - \"machine_translation\": CDReader's existing machine translation. Where non-empty, "
+            f"your output MUST differ from it in phrasing and/or sentence structure — CDReader will "
+            f"reject output that is too similar.\n"
+            f"  - \"content\": German pre-translation — use as primary input for rephrasing.\n"
+            f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
             f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
         )
         return prompt, clean_batch
@@ -1041,7 +1055,102 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if gloss_fixes:
             log(f"  📖 Post-processing: enforced glossary terms in {gloss_fixes} row(s).")
 
-    return all_rephrased
+    # ── Similarity guard: retry rows too similar to machineChapterContent ─────
+    # CDReader triggers ErrMessage10 when submitted text is too similar to its
+    # stored machine translation (machineChapterContent). We measure word-level
+    # Jaccard overlap between each output row and the machine translation, then
+    # re-request any flagged row with an explicit diversification instruction.
+    def _word_sim(a, b):
+        import re as _re2
+        wa = set(_re2.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a.lower()))
+        wb = set(_re2.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b.lower()))
+        if not wa or not wb:
+            return 0.0
+        return len(wa & wb) / len(wa | wb)
+
+    SIM_THRESHOLD = 0.72   # flag rows at or above this word-overlap ratio
+    SIM_MIN_WORDS = 4      # skip very short rows (titles, exclamations)
+
+    mt_by_sort = {r.get("sort", i): r.get("machine_translation", "")
+                  for i, r in enumerate(rows)}
+
+    similar_rows = []
+    for row in all_rephrased:
+        sort_n = row.get("sort")
+        mt = mt_by_sort.get(sort_n, "")
+        out = row.get("content", "")
+        if not mt or not out or len(out.split()) < SIM_MIN_WORDS:
+            continue
+        sim = _word_sim(out, mt)
+        if sim >= SIM_THRESHOLD:
+            similar_rows.append((sort_n, out, mt, sim))
+
+    if similar_rows:
+        log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} threshold \u2014 re-requesting...")
+        rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
+
+        for sort_n, current_out, mt, sim in similar_rows:
+            log(f"    sort={sort_n} sim={sim:.0%}: {current_out[:70]!r}")
+
+            retry_row = [{"sort": sort_n, "machine_translation": mt, "content": current_out}]
+            retry_prompt = (
+                BASE_PROMPT + "\n\n"
+                "SIMILARITY RE-REQUEST \u2014 ONE ROW ONLY\n"
+                "The row below was flagged: its current rephrasing is too similar to "
+                "the machine translation (" + f"{sim:.0%}" + " word overlap). "
+                "CDReader will reject it. Rewrite it with clearly different vocabulary "
+                "and/or sentence structure while preserving the exact same meaning. "
+                "Natural, idiomatic German is still the priority \u2014 do not produce "
+                "stilted language just to differ.\n\n"
+                "  - \"machine_translation\": the reference text to diverge from\n"
+                "  - \"content\": the current phrasing to improve upon\n\n"
+                "Return ONLY a JSON array with one object: "
+                "{\"sort\": <number>, \"content\": \"<rewritten text>\"}\n"
+                + json.dumps(retry_row, ensure_ascii=False)
+            )
+
+            retry_result = None
+            try:
+                keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS
+                for api_key in keys_to_try:
+                    try:
+                        r_resp = requests.post(
+                            f"https://generativelanguage.googleapis.com/v1beta/models/"
+                            f"{GEMINI_MODEL}:generateContent?key={api_key}",
+                            json={
+                                "contents": [{"parts": [{"text": retry_prompt}]}],
+                                "generationConfig": {"temperature": 0.9, "maxOutputTokens": 512},
+                            },
+                            timeout=45,
+                        )
+                        if r_resp.status_code == 429:
+                            continue
+                        r_resp.raise_for_status()
+                        r_body = r_resp.json()
+                        r_text = r_body["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if r_text.startswith("```"):
+                            r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                        parsed = json.loads(r_text)
+                        if isinstance(parsed, list) and parsed:
+                            retry_result = parsed[0].get("content", "").strip()
+                        break
+                    except Exception:
+                        continue
+            except Exception as exc:
+                log(f"    \u26a0\ufe0f  Similarity retry exception: {exc}")
+
+            if retry_result and retry_result != current_out:
+                new_sim = _word_sim(retry_result, mt)
+                log(f"    \u2705 sort={sort_n} new sim={new_sim:.0%}: {retry_result[:70]!r}")
+                rephrased_by_sort[sort_n]["content"] = retry_result
+            else:
+                log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged or failed, keeping original")
+
+        all_rephrased = sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
+    else:
+        log(f"  \u2705 Similarity guard: all rows within threshold.")
+
+        return all_rephrased
 
 
 # ─── Phase 5: Verify ──────────────────────────────────────────────────────────
