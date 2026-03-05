@@ -829,7 +829,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
-        r"protestierte|unterbrach|insistierte|meldete|berichtete"
+        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -859,7 +859,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _re.IGNORECASE | _re.VERBOSE
     )
 
-    def _is_begleitsatz(text, _max_words=15):
+    def _is_begleitsatz(text, _max_words=30):
         """True only if text is a genuine attribution clause after dialogue.
         Guards against false positives:
           - Rows ending with ':' introduce NEW dialogue (not attributing previous speech)
@@ -886,6 +886,27 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     comma_adds = 0
     dash_fixes = 0
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+
+    # ── Pass 0: Strip spurious closing quotes from multi-row dialogue openers ───────────
+    # Gemini frequently ignores the quote_role="open" hint and adds a closing “ to
+    # rows that are the opening line of a multi-row dialogue (e.g. „Ricky!“ instead
+    # of the correct „Ricky!). We detect these by comparing the original input role
+    # and strip any trailing closing quote from the rephrased output.
+    _role_by_sort = {r.get("sort", i): r.get("_quote_role", "both") for i, r in enumerate(input_data)}
+    _open_role_fixes = 0
+    _ALL_CLOSE_CHARS = ('“', '”', '"')  # U+201C, U+201D, ASCII
+    for row in sorted_rows:
+        if _role_by_sort.get(row.get("sort")) == "open":
+            c = row.get("content", "")
+            # Strip trailing closing quote (with optional punctuation after it)
+            # e.g. „Ricky!“  →  „Ricky!    or    „Ricky!“,  →  „Ricky!
+            stripped = _re.sub(r'[“”"](\s*[,.])?\s*$', '', c).rstrip()
+            if stripped != c and stripped.startswith(('„', '“', '"')):  # must still open
+                row["content"] = stripped
+                _open_role_fixes += 1
+    if _open_role_fixes:
+        log(f"  🔓 Post-processing: stripped spurious closing quote(s) from {_open_role_fixes} multi-row opener(s).")
+
 
     # ── Fix: remove duplicate content between adjacent rows ───────────────────
     # Type A: Row N ends with  „...“, begleitsatz  AND row N+1 = begleitsatz
