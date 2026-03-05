@@ -320,6 +320,15 @@ def get_chapter_rows(token, chapter_id):
         log(f"  Row fields available: {list(rows[0].keys())}")
         r0 = rows[0]
         log(f"  First row sample: sort={r0.get('sort')} | eContent={repr((r0.get('eContent') or '')[:80])} | chapterConetnt={repr((r0.get('chapterConetnt') or '')[:80])}")
+        # Diagnostic: show all key content fields for first 3 non-title rows
+        content_rows = [r for r in rows if r.get("sort", 0) > 0][:3]
+        for r in content_rows:
+            log(f"  [DIAG] sort={r.get('sort')} "
+                f"| chapterConetnt={repr((r.get('chapterConetnt') or '')[:60])} "
+                f"| machineChapterContent={repr((r.get('machineChapterContent') or '')[:60])} "
+                f"| modifChapterContent={repr((r.get('modifChapterContent') or '')[:60])} "
+                f"| languageContent={repr((r.get('languageContent') or '')[:60])} "
+                f"| peContent={repr((r.get('peContent') or '')[:60])}")
 
     log(f"  Fetched {len(rows)} rows.")
     return rows
@@ -445,9 +454,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     input_data = [
         {
             "sort": r.get("sort", i),
-            "original": r.get("eContent") or r.get("eeContent") or r.get("original") or "",
+            "original": english_originals[i],
             "content": raw_contents[i],
             "machine_translation": r.get("machineChapterContent") or r.get("modifChapterContent") or "",
+            "source_content": raw_contents[i],
             "_quote_role": quote_roles[i],
         }
         for i, r in enumerate(rows)
@@ -1090,6 +1100,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                    for i, r in enumerate(rows)}
 
     similar_rows = []
+    # Diagnostic: show what the guard actually measures for first 3 rows
+    _diag_count = 0
     for row in all_rephrased:
         sort_n = row.get("sort")
         out    = row.get("content", "")
@@ -1101,6 +1113,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         sim_mt  = _row_sim(out, mt)  if mt  else 0.0
         sim     = max(sim_src, sim_mt)
         ref_used = src if sim_src >= sim_mt else mt
+        # Log first 3 rows so we can see what the guard is actually comparing
+        if _diag_count < 3:
+            log(f"  [DIAG sim] sort={sort_n} out={out[:40]!r} | "
+                f"src={src[:40]!r} sim_src={sim_src:.0%} | "
+                f"mt={mt[:40]!r} sim_mt={sim_mt:.0%} | final={sim:.0%}")
+            _diag_count += 1
         if sim >= SIM_THRESHOLD:
             similar_rows.append((sort_n, out, ref_used, sim))
 
