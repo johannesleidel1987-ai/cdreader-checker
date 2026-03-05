@@ -1066,12 +1066,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # ── Similarity guard: retry rows too similar to CDReader's reference texts ──
     # CDReader triggers ErrMessage10 when submitted text is too similar to its
-    # stored translation. Root causes of previous false-passes:
-    #   1. Old guard compared against machineChapterContent only — but CDReader
-    #      most likely compares the submission against chapterConetnt (the text
-    #      we fed to Gemini as input). Now we check BOTH and take the max.
-    #   2. Jaccard word-set similarity misses word-order-only changes and minor
-    #      substitutions. Now we combine Jaccard with character trigram similarity.
+    # stored machine translation. We log a full distribution to diagnose failures.
     import re as _re_sim
 
     def _row_sim(output, ref):
@@ -1089,24 +1084,51 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         no, nr = _norm(output), _norm(ref)
         return max(_jaccard(no, nr), _trigram(no, nr))
 
-    SIM_THRESHOLD = 0.60   # flag rows at or above this combined similarity
-    SIM_MIN_WORDS = 4      # skip very short rows (titles, exclamations)
+    SIM_THRESHOLD = 0.55   # flag rows at or above this combined similarity
 
-    # chapterConetnt is ENGLISH (confirmed by DIAG logs) — comparing German output
-    # against it is meaningless. Only compare against machineChapterContent (German).
+    # chapterConetnt is ENGLISH \u2014 only compare against machineChapterContent (German).
     mt_by_sort = {r.get("sort", i): r.get("machine_translation", "")
                   for i, r in enumerate(rows)}
 
-    similar_rows = []
+    # \u2500\u2500 Diagnostic: log full similarity distribution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    _sim_scores = []
+    _rows_no_ref = 0
+    _rows_identical = 0
     for row in all_rephrased:
         sort_n = row.get("sort")
         out    = row.get("content", "")
         mt     = mt_by_sort.get(sort_n, "")
-        if not out or not mt or len(out.split()) < SIM_MIN_WORDS:
+        if not out:
+            continue
+        if not mt:
+            _rows_no_ref += 1
             continue
         sim = _row_sim(out, mt)
-        if sim >= SIM_THRESHOLD:
-            similar_rows.append((sort_n, out, mt, sim))
+        _sim_scores.append((sort_n, out, mt, sim))
+        if sim >= 0.99:
+            _rows_identical += 1
+
+    _total_checked = len(_sim_scores)
+    if _total_checked:
+        bands = {"0-25%": 0, "25-50%": 0, "50-75%": 0, "75-90%": 0, "90-100%": 0}
+        for _, _, _, s in _sim_scores:
+            if s < 0.25:   bands["0-25%"] += 1
+            elif s < 0.50: bands["25-50%"] += 1
+            elif s < 0.75: bands["50-75%"] += 1
+            elif s < 0.90: bands["75-90%"] += 1
+            else:          bands["90-100%"] += 1
+        avg_sim = sum(s for _, _, _, s in _sim_scores) / _total_checked
+        above_thresh = sum(1 for _, _, _, s in _sim_scores if s >= SIM_THRESHOLD)
+        log(f"  [SIM DIAG] rows_with_ref={_total_checked} no_ref={_rows_no_ref} "
+            f"identical={_rows_identical} avg={avg_sim:.0%} above_{SIM_THRESHOLD:.0%}={above_thresh}")
+        log(f"  [SIM DIAG] bands: " + " | ".join(f"{k}:{v}" for k, v in bands.items()))
+        top5 = sorted(_sim_scores, key=lambda x: x[3], reverse=True)[:5]
+        for sn, out_s, mt_s, sim_s in top5:
+            log(f"  [SIM DIAG] sort={sn} sim={sim_s:.0%}: out={out_s[:45]!r} ref={mt_s[:45]!r}")
+    else:
+        log(f"  [SIM DIAG] no rows with machineChapterContent \u2014 no_ref={_rows_no_ref} (guard blind!)")
+
+    similar_rows = [(sn, out, mt, sim) for sn, out, mt, sim in _sim_scores if sim >= SIM_THRESHOLD]
 
     if similar_rows:
         log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
