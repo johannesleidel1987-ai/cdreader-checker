@@ -858,12 +858,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _re.IGNORECASE | _re.VERBOSE
     )
 
-    def _is_begleitsatz(text, _max_words=8):
+    def _is_begleitsatz(text, _max_words=15):
         """True only if text is a genuine attribution clause after dialogue.
         Guards against false positives:
-          - Long narrative sentences (> max_words) that happen to contain a speech verb
+          - Rows ending with ':' introduce NEW dialogue (not attributing previous speech)
+          - Very long rows (> max_words) that aren't attribution
           - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
         """
+        if text.rstrip().endswith(':'):
+            return False  # ends with ':' → introduces new speech, doesn't attribute old
         if len(text.split()) > _max_words:
             return False
         if _NEGATION_AFTER_SV.search(text):
@@ -882,6 +885,35 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     comma_adds = 0
     dash_fixes = 0
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+
+    # ── Fix: remove duplicate Begleitsatz rows ────────────────────────────────
+    # Gemini sometimes merges the attribution inline into row N AND leaves it as row N+1.
+    # e.g. Row N:   „...?", erkundigte sich Ricky.
+    #      Row N+1: erkundigte sich Ricky.   ← duplicate, should be kept as original machine
+    _orig_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
+    _dup_fixes = 0
+    for idx in range(len(sorted_rows) - 1):
+        row_n   = sorted_rows[idx]
+        row_n1  = sorted_rows[idx + 1]
+        cn      = row_n.get("content", "")
+        cn1     = row_n1.get("content", "").strip()
+        # Check if row N ends with „...", <begleitsatz> and row N+1 IS that begleitsatz
+        m_inline = _re.search(r'["""”]\s*,\s*(.+)$', cn)
+        if m_inline:
+            inline_bgs = m_inline.group(1).strip()
+            if inline_bgs and cn1 and (
+                inline_bgs.lower() == cn1.lower() or
+                inline_bgs.lower().rstrip('.') == cn1.lower().rstrip('.')
+            ):
+                # Row N+1 is a duplicate — restore its original machine translation content
+                orig_n1 = _orig_by_sort.get(row_n1.get("sort"), "")
+                if orig_n1 and orig_n1.strip() != cn1:
+                    row_n1["content"] = orig_n1
+                    _dup_fixes += 1
+                    # Also strip the duplicate attribution from row N (keep quote only)
+                    row_n["content"] = _re.sub(r'\s*,\s*' + _re.escape(inline_bgs) + r'\s*$', '', cn).rstrip(',').rstrip()
+    if _dup_fixes:
+        log(f"  🔁 Post-processing: fixed {_dup_fixes} duplicate Begleitsatz row(s).")
 
     for idx, row in enumerate(sorted_rows):
         c = row.get("content", "")
@@ -977,6 +1009,22 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             titled = ' '.join(w[0].upper() + w[1:] if w else w for w in c_g.split(' '))
             if titled != c:
                 row['content'] = titled
+        # Rule H2: Insert missing closing “ after ?/! when dialogue is followed by
+        # a new sentence in the same row (opening „ present, closing “ absent).
+        # e.g. „Wo bist du? Emmas Sorge vertiefte sich.“ → „Wo bist du?“ Emmas ...
+        c_h2 = row.get("content", "")
+        _OPEN_Q = ('„', '“', '"')
+        if c_h2.startswith(_OPEN_Q) and not _re.search(r'[“”"]', c_h2[1:]):
+            _cq = '“'  # German closing quotation mark
+            fixed_h2 = _re.sub(
+                r'([?!])(\s+[A-Z\u00c4\u00d6\u00dc])',
+                lambda m: m.group(1) + _cq + m.group(2),
+                c_h2, count=1
+            )
+            if fixed_h2 != c_h2:
+                row["content"] = fixed_h2
+                comma_adds += 1
+
         # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
         # Pattern: „Speech!“, attribution verb.“  ← trailing “ is wrong.
         # Happens when LLM copies source quote position onto a restructured German sentence.
