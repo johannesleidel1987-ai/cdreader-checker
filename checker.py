@@ -28,6 +28,7 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_3", ""),
     os.environ.get("GEMINI_API_KEY_4", ""),
     os.environ.get("GEMINI_API_KEY_5", ""),
+    os.environ.get("GEMINI_API_KEY_6", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -38,9 +39,7 @@ _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for
 # Tier 1: Llama 3.3 70B via Groq (free, 14,400 RPD, CI-friendly)
 #   Set GROQ_API_KEY in GitHub Actions secrets to enable.
 #   Sign up at console.groq.com — no credit card required for free tier.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama-3.3-70b-versatile"
+# Fallback uses GEMINI_API_KEY_6 (6th key in rotation pool above).
 
 
 
@@ -541,7 +540,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
 
         # Filter glossary to only terms present in this batch's text — reduces prompt
-        # size dramatically (especially important for Groq's 12k TPM limit) and keeps
+        # size dramatically and keeps
         # the model focused on only the relevant terms rather than all 200+ entries.
         batch_text = " ".join(
             (r.get("original", "") + " " + r.get("content", "")).lower()
@@ -595,77 +594,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             return json.loads(text)
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
-
-    def _call_groq(batch_data, batch_num, total_batches, next_batch_first=None):
-        """
-        Tier-1 fallback: Llama 3.3 70B via Groq free tier.
-        14,400 RPD / 100 RPM — CI-friendly, no credit card required.
-        OpenAI-compatible endpoint.
-        """
-        if not GROQ_API_KEY:
-            log("  ⚠️ GROQ_API_KEY not set — Groq fallback unavailable.")
-            return None
-
-        prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                resp = requests.post(
-                    GROQ_URL,
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3,
-                        "max_tokens": 32768,
-                    },
-                    timeout=300,
-                )
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 60) or 60)
-                    log(f"  🔄 Groq rate-limited (attempt {attempt}/{MAX_RETRIES}), waiting {retry_after}s... Body: {resp.text[:300]}")
-                    time.sleep(retry_after)
-                    continue
-                if resp.status_code >= 400:
-                    log(f"  ❌ Groq HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}): {resp.text[:400]}")
-                    if resp.status_code in (500, 502, 503):
-                        time.sleep(15)
-                        continue
-                    else:
-                        return None  # 4xx other than 429 — don't retry
-                body = resp.json()
-                text = body["choices"][0]["message"]["content"]
-                if not text:
-                    log(f"❌ Empty Groq response on batch {batch_num}")
-                    return None
-                parsed = _parse_llm_response(text, batch_num)
-                if isinstance(parsed, dict):
-                    parsed = next((v for v in parsed.values() if isinstance(v, list)), None)
-                    if parsed is None:
-                        log(f"❌ Groq returned object but no array found: {text[:300]}")
-                        return None
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Groq (Llama 3.3 70B).")
-                return parsed
-            except json.JSONDecodeError as e:
-                log(f"❌ Groq JSON parse error on batch {batch_num}: {e}")
-                log(f"   Raw response (first 800 chars): {text[:800]}")
-                if attempt < MAX_RETRIES:
-                    log("  Retrying in 15s...")
-                    time.sleep(15)
-                else:
-                    return None
-            except Exception as e:
-                log(f"❌ Groq error on batch {batch_num}: {e}")
-                if attempt < MAX_RETRIES:
-                    log("  Retrying in 15s...")
-                    time.sleep(15)
-                else:
-                    return None
-        return None
-
 
     def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
         batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
@@ -782,25 +710,20 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 continue
         return None  # all rotations exhausted
 
-    # Split into batches and call Gemini (with Groq fallback) for each
+    # Split into batches and call Gemini for each
     batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
     total_batches = len(batches)
     log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    groq_batches = 0
-    log(f"  Using {key_count} Gemini key(s) with automatic rotation on 429.")
+    log(f"  Using {key_count} Gemini key(s) (keys 1-6) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
         result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
-            if _all_keys_rpd_dead() and GROQ_API_KEY:
-                log(f"  🔀 Gemini RPD-exhausted — falling back to Groq (Llama 3.3 70B) for batch {i}...")
-                result = _call_groq(batch, i, total_batches, next_batch_first=next_first)
-                if result is not None:
-                    groq_batches += 1
+            # All Gemini keys RPD-exhausted — no further fallback available.
             if result is None:
                 log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
                 return None
@@ -814,8 +737,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if i < total_batches:
             time.sleep(5)
 
-    provider_note = f" (Groq fallback used for {groq_batches}/{total_batches} batch(es))" if groq_batches else ""
-    log(f"  Total rows rephrased: {len(all_rephrased)}{provider_note}")
+    log(f"  Total rows rephrased: {len(all_rephrased)}")
 
     # ── Post-process: German dialogue punctuation enforcement ─────────────────
     import re as _re
@@ -1213,7 +1135,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     if quote_restores:
         log(f"  „“ Post-processing: restored missing quotes in {quote_restores} row(s).")
     # ── Post-process: deterministic glossary enforcement ────────────────────
-    # The LLM (especially Groq) sometimes ignores glossary entries in the prompt.
+    # The LLM sometimes ignores glossary entries in the prompt.
     # This step scans every row for untranslated English glossary source terms
     # and replaces them with the correct German target — bypassing model compliance.
     # Only applies when we have a non-empty glossary.
@@ -1918,7 +1840,7 @@ def run():
                 "content": orig_row.get("chapterConetnt") or orig_row.get("content") or orig_row.get("modifChapterContent") or "",
                 "_quote_role": "both",
             }]
-            # Try Gemini first for single-row retry (save Groq quota)
+            # Single-row retry via Gemini
             retry_result = None
             retry_key = next((k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys), None)
             if retry_key:
@@ -2056,13 +1978,13 @@ def run_test():
     TEST_MODE: exercises the full rephrase pipeline on synthetic rows.
     No CDReader login, no submit, no finish. Safe to run anytime.
     Tests: Gemini key rotation, prompt quality, all post-processors, verification.
-    Falls back to Groq (Llama 3.3 70B) if Gemini RPD-exhausted.
+    Uses up to 6 Gemini API keys with automatic rotation.
     """
     log("=" * 60)
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
-    or_status = "✅ configured" if GROQ_API_KEY else "❌ not configured (set GROQ_API_KEY)"
-    log(f"Groq fallback (Llama 3.3 70B): {or_status}")
+    k6_status = "✅ configured" if GEMINI_API_KEY_6 else "⚠️  not configured (optional 6th key)"
+    log(f"Gemini key 6 (fallback): {k6_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2089,12 +2011,11 @@ def run_test():
     log(f"\nTest input: {len(TEST_ROWS)} synthetic rows")
 
     # ── Test rephrase pipeline ─────────────────────────────────────────────────
-    log("\n[1/4] Testing rephrase pipeline (Gemini → Groq)...")
+    log("\n[1/4] Testing rephrase pipeline (Gemini keys 1-6)...")
     result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
 
     if not result:
-        fallback_hint = " (add GROQ_API_KEY for fallback)" if not GROQ_API_KEY else ""
-        msg = f"❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys{fallback_hint}."
+        msg = "❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys (GEMINI_API_KEY through GEMINI_API_KEY_6)."
         log(msg)
         send_telegram(msg)
         return
@@ -2144,7 +2065,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔀 Groq fallback: {'configured' if GROQ_API_KEY else 'not set'}\n"
+        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
