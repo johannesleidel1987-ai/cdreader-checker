@@ -841,7 +841,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
         r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück"
     )
-    BEGLEITSATZ_PATTERN = _re.compile(
+    # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
+    _NEGATION_AFTER_SV = _re.compile(
+        rf"(?:{_SV_CORE})\s+(?:nicht|kein|keine|keinen|keinem|keiner|nie|niemals|nichts)",
+        _re.IGNORECASE
+    )
+
+    _BEGLEITSATZ_BASE = _re.compile(
         rf"""^(?:
             (?:{_SV_CORE})
             |
@@ -851,6 +857,25 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         )""",
         _re.IGNORECASE | _re.VERBOSE
     )
+
+    def _is_begleitsatz(text, _max_words=8):
+        """True only if text is a genuine attribution clause after dialogue.
+        Guards against false positives:
+          - Long narrative sentences (> max_words) that happen to contain a speech verb
+          - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
+        """
+        if len(text.split()) > _max_words:
+            return False
+        if _NEGATION_AFTER_SV.search(text):
+            return False
+        return bool(_BEGLEITSATZ_BASE.match(text))
+
+    # Alias for the rest of post-processing — replaces direct .match() calls
+    class _BGS:
+        @staticmethod
+        def match(text):
+            return _is_begleitsatz(text)
+    BEGLEITSATZ_PATTERN = _BGS()
 
 
     comma_fixes = 0
