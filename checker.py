@@ -859,13 +859,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         role = _qe_role_by_sort.get(sort_n, "none")
         eng  = _qe_eng_by_sort.get(sort_n, "")
 
-        # Upgrade rows when English source clearly has BOTH opening and closing quotes.
-        # "none"  → "both": MT had no quotes at all; English shows it is dialogue.
-        # "open"  → "both": MT has opening „ but no closing " — the most common MT
-        #   error. English confirms the row is a complete, self-contained speech line.
-        #   This is the root cause of all "missing closing quote" errors.
-        # We never downgrade "close" or "both" — MT classification wins for those.
-        if role in ("none", "open") and eng:
+        # Upgrade "none" rows when English source has BOTH opening and closing quotes.
+        # Since the state machine now runs on English source, role="open" genuinely
+        # means English has only an opening quote (real multi-row opener) — no upgrade
+        # needed for that case. Only "none" rows need the upgrade when English confirms
+        # the row is dialogue that the state machine did not catch.
+        if role == "none" and eng:
             if _QE_ENG_OPEN_RE.match(eng.strip()) and _QE_ENG_CLOSE_RE.search(eng):
                 role = "both"
 
