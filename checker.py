@@ -886,34 +886,51 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     dash_fixes = 0
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
 
-    # ── Fix: remove duplicate Begleitsatz rows ────────────────────────────────
-    # Gemini sometimes merges the attribution inline into row N AND leaves it as row N+1.
-    # e.g. Row N:   „...?", erkundigte sich Ricky.
-    #      Row N+1: erkundigte sich Ricky.   ← duplicate, should be kept as original machine
+    # ── Fix: remove duplicate content between adjacent rows ───────────────────
+    # Type A: Row N ends with  „...“, begleitsatz  AND row N+1 = begleitsatz
+    #         (Gemini merged attribution inline AND left it stranded in N+1)
+    # Type B: Row N = „...?“                      AND row N+1 = „...?“ begleitsatz
+    #         (Gemini prepended full dialogue text from row N into the attribution row)
     _orig_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
     _dup_fixes = 0
+
+    def _qnorm(s):
+        return _re.sub(r'[„“”"]', '"', s)
+
     for idx in range(len(sorted_rows) - 1):
         row_n   = sorted_rows[idx]
         row_n1  = sorted_rows[idx + 1]
         cn      = row_n.get("content", "")
         cn1     = row_n1.get("content", "").strip()
-        # Check if row N ends with „...", <begleitsatz> and row N+1 IS that begleitsatz
-        m_inline = _re.search(r'["""”]\s*,\s*(.+)$', cn)
+
+        # ── Type A: inline attribution also left stranded in next row ──
+        m_inline = _re.search(r'[“”"]+\s*,\s*(.+)$', cn)
         if m_inline:
             inline_bgs = m_inline.group(1).strip()
             if inline_bgs and cn1 and (
                 inline_bgs.lower() == cn1.lower() or
-                inline_bgs.lower().rstrip('.') == cn1.lower().rstrip('.')
+                inline_bgs.lower().rstrip(".") == cn1.lower().rstrip(".")
             ):
-                # Row N+1 is a duplicate — restore its original machine translation content
                 orig_n1 = _orig_by_sort.get(row_n1.get("sort"), "")
                 if orig_n1 and orig_n1.strip() != cn1:
                     row_n1["content"] = orig_n1
                     _dup_fixes += 1
-                    # Also strip the duplicate attribution from row N (keep quote only)
-                    row_n["content"] = _re.sub(r'\s*,\s*' + _re.escape(inline_bgs) + r'\s*$', '', cn).rstrip(',').rstrip()
+                    row_n["content"] = _re.sub(
+                        r"\s*,\s*" + _re.escape(inline_bgs) + r"\s*$", "", cn
+                    ).rstrip(",").rstrip()
+                    continue  # pair handled
+
+        # ── Type B: row N+1 starts with full content of row N ──
+        cn_norm  = _qnorm(cn.strip())
+        cn1_norm = _qnorm(cn1)
+        if len(cn_norm) >= 10 and cn1_norm.startswith(cn_norm):
+            remainder = cn1[len(cn.strip()):].lstrip(' “”",').strip()
+            if remainder:
+                row_n1["content"] = remainder
+                _dup_fixes += 1
+
     if _dup_fixes:
-        log(f"  🔁 Post-processing: fixed {_dup_fixes} duplicate Begleitsatz row(s).")
+        log(f"  🔁 Post-processing: fixed {_dup_fixes} duplicate content row(s).")
 
     for idx, row in enumerate(sorted_rows):
         c = row.get("content", "")
@@ -1025,7 +1042,20 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 row["content"] = fixed_h2
                 comma_adds += 1
 
-        # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
+        # Rule J: Insert missing opening „ after colon when direct speech follows without one.
+        # e.g. „erwiderte sie: Du hast...“  →  „erwiderte sie: „Du hast...“
+        c_j = row.get("content", "")
+        if _re.search(r':\s+[A-ZÄÖÜ]', c_j) and not _re.search(r':\s*[„“"]', c_j):
+            fixed_j = _re.sub(
+                r'(:\s+)([A-ZÄÖÜ])',
+                lambda m: m.group(1) + '„' + m.group(2),
+                c_j, count=1
+            )
+            if fixed_j != c_j:
+                row["content"] = fixed_j
+                comma_adds += 1
+
+                # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
         # Pattern: „Speech!“, attribution verb.“  ← trailing “ is wrong.
         # Happens when LLM copies source quote position onto a restructured German sentence.
         c = row.get("content", "")
