@@ -815,34 +815,115 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     dash_fixes = 0
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
 
-    # ── Pass 0: Strip spurious closing quotes from multi-row dialogue openers ───────────
-    # Gemini frequently ignores the quote_role="open" hint and adds a closing “ to
-    # rows that open a multi-row dialogue (e.g. „Ricky!“ instead of correct „Ricky!).
-    # Guard: only strip when the NEXT row is NOT a Begleitsatz. A genuine multi-row
-    # opener is always followed by more dialogue content, never by an attribution clause.
-    # If the next row IS a Begleitsatz, the input machine translation was simply missing
-    # its closing quote (Gemini correctly added it) and we must keep it so Rules C/F
-    # can add the required comma.
-    _role_by_sort = {r.get("sort", i): r.get("_quote_role", "both") for i, r in enumerate(input_data)}
-    _open_role_fixes = 0
-    for _p0_idx, row in enumerate(sorted_rows):
-        if _role_by_sort.get(row.get("sort")) != "open":
-            continue
-        c = row.get("content", "")
-        # Check next row: if it is a Begleitsatz, this row really closes a speech
-        # turn — the closing quote is correct and needed for Rule C to add a comma.
-        next_content = sorted_rows[_p0_idx + 1].get("content", "") if _p0_idx + 1 < len(sorted_rows) else ""
-        if _is_begleitsatz(next_content):
-            continue  # preserve the closing quote; Rule C will handle the comma
-        # Strip trailing closing quote (with optional trailing punctuation)
-        # e.g. „Ricky!“  →  „Ricky!    or    „Ricky!“,  →  „Ricky!
-        stripped = _re.sub(r'[“”"](\s*[,.])?\s*$', '', c).rstrip()
-        if stripped != c and stripped.startswith(('„', '“', '"')):  # must still open
-            row["content"] = stripped
-            _open_role_fixes += 1
-    if _open_role_fixes:
-        log(f"  🔓 Post-processing: stripped spurious closing quote(s) from {_open_role_fixes} multi-row opener(s).")
+    # ── Pass QE: Deterministic quote structure enforcement ────────────────────
+    # Replaces the fragile Pass 0 + Rule H approach.
+    # Root cause of all recurring quote errors: quote_role was computed on the
+    # German machine translation (unreliable), then used to HINT Gemini (ignored),
+    # then repaired after-the-fact with guards that conflicted with each other.
+    #
+    # New approach:
+    #   1. Determine required_role from German MT classification (in_dialogue tracking).
+    #   2. Upgrade "none" rows to "both" when the English source has dialogue quotes
+    #      (English quote placement is reliable, but cannot determine open/close split).
+    #   3. After getting Gemini output, ENFORCE the correct structure unconditionally.
+    #      No inferences, no next-row guards, no out_opens_now guards.
+    #
+    # Roles:
+    #   "open"   → ensure starts with „, strip any spurious trailing “
+    #   "close"  → ensure ends with “ (add if absent), do not add opening „
+    #   "both"   → ensure starts with „ AND has a closing “ somewhere
+    #   "none"   → only run Fix 1a (dedup double-quotes), no structural changes
+    #
+    # German quote chars: „ = U+201E (opening), “ = U+201C (closing)
 
+    _QE_OPEN   = '„'  # „ U+201E
+    _QE_CLOSE  = '“'  # " U+201C
+    _QE_ANY_CLOSE_RE  = _re.compile(r'[“”"]')
+    _QE_CLOSE_AT_END  = _re.compile(r'[“”"]\s*[,!?.]?\s*$')
+    _QE_STARTS_OPEN   = _re.compile(r'^[„“”"]')
+
+    _qe_role_by_sort  = {r.get("sort", i): r.get("_quote_role", "none")
+                         for i, r in enumerate(input_data)}
+    _qe_eng_by_sort   = {r.get("sort", i): r.get("original", "")
+                         for i, r in enumerate(input_data)}
+    _QE_ENG_OPEN_RE   = _re.compile(r'^[„“”‘\"«]')
+    _QE_ENG_CLOSE_RE  = _re.compile(r'[“”\"]\s*[,!?.]?\s*$')
+
+    qe_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        c = row.get("content", "")
+        if not c:
+            continue
+
+        role = _qe_role_by_sort.get(sort_n, "none")
+        eng  = _qe_eng_by_sort.get(sort_n, "")
+
+        # Upgrade "none" rows when English source clearly has dialogue quotes.
+        # English is self-contained so it never tells us "open" vs "close" —
+        # only "both". The open/close split must come from the MT classification.
+        if role == "none" and eng:
+            if _QE_ENG_OPEN_RE.match(eng.strip()) and _QE_ENG_CLOSE_RE.search(eng):
+                role = "both"
+
+        fixed = c
+
+        # Fix 1a (all roles): collapse accidental double closing-quotes.
+        deduped = _re.sub(r'[“”"]{2,}', _QE_CLOSE, fixed)
+        if deduped != fixed:
+            fixed = deduped
+
+        if role == "open":
+            # Ensure opening „ is present.
+            if not _QE_STARTS_OPEN.match(fixed):
+                fixed = _QE_OPEN + fixed
+            # Strip any spurious trailing closing quote.
+            # e.g. „Ricky!“ → „Ricky!   (Gemini ignored the open hint)
+            stripped = _re.sub(r'[“”"]([,!?.])?\s*$',
+                                lambda m: (m.group(1) or ''),
+                                fixed).rstrip()
+            if _QE_STARTS_OPEN.match(stripped):  # must still start with a quote
+                fixed = stripped
+
+        elif role == "close":
+            # Ensure a closing " is present.
+            # Don't add an opening „ — Gemini may have correctly omitted it (it's the
+            # continuation of a multi-row dialogue that opened in a previous row).
+            if not _QE_ANY_CLOSE_RE.search(fixed):
+                fixed = fixed + _QE_CLOSE
+
+        elif role == "both":
+            # Ensure opening „.
+            if not _QE_STARTS_OPEN.match(fixed):
+                fixed = _QE_OPEN + fixed
+            # Check for any closing quote (inline or at end).
+            has_close = bool(_QE_ANY_CLOSE_RE.search(fixed[1:]))
+            if not has_close:
+                # Fix 1b-a: comma already before attribution verb — insert “ before comma.
+                m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
+                if m_sv_a:
+                    fixed = fixed[:m_sv_a.start()] + _QE_CLOSE + fixed[m_sv_a.start():]
+                else:
+                    # Fix 1b-b: no comma yet — insert “, before attribution verb.
+                    m_sv_b = _re.search(
+                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')\b',
+                        fixed, _re.IGNORECASE
+                    )
+                    if m_sv_b:
+                        fixed = fixed[:m_sv_b.start()] + _QE_CLOSE + ',' + fixed[m_sv_b.start():]
+                    else:
+                        # No attribution verb — append closing quote at end.
+                        if fixed.endswith(','):
+                            fixed = fixed[:-1] + _QE_CLOSE + ','
+                        else:
+                            fixed = fixed + _QE_CLOSE
+
+        if fixed != c:
+            row["content"] = fixed
+            qe_fixes += 1
+
+    if qe_fixes:
+        log(f"  \U0001f4ac Post-processing: enforced quote structure in {qe_fixes} row(s) (Pass QE).")
 
     # ── Fix: remove duplicate content between adjacent rows ───────────────────
     # Type A: Row N ends with  „...“, begleitsatz  AND row N+1 = begleitsatz
@@ -1053,87 +1134,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if stripped != c:
                 row["content"] = stripped
 
-    # ── Rule H (outside loop): Restore missing quotes by comparing against original ──
-    # If the original English row started/ended with a quote but the translated
-    # output has no opening/closing German quote, add them back deterministically.
-    # This catches cases where the model silently drops quotes despite the hint.
-    quote_restores = 0
-    # Build original lookup by sort key
-    orig_by_sort = {r.get("sort", i): (r.get("original") or r.get("content") or "") for i, r in enumerate(input_data)}
-    # Any character that counts as a closing quote (U+201C German, U+201D English right-quote, ASCII)
-    ALL_CLOSE = ('“', '”', '"')
-    ALL_CLOSE_RE = r'[“”"]'
-    OPEN_QUOTES  = ('"', '„', '“', '«', '‘')
+    # Rule H removed: quote enforcement is now handled entirely by Pass QE above.
+    # Pass QE enforces opening/closing quote structure deterministically from
+    # the required_role computed at input time, eliminating guard conflicts.
 
-    for row in all_rephrased:
-        c = row.get("content", "")
-        orig = orig_by_sort.get(row.get("sort"), "")
-        if not orig or not c:
-            continue
-        orig_opens  = orig.startswith(OPEN_QUOTES)
-        orig_closes = orig.endswith(ALL_CLOSE) or bool(_re.search(ALL_CLOSE_RE + r'\s*[,!?.]?\s*$', orig))
-        out_opens   = c.startswith(('„', '“', '”', '"'))
-        fixed = c
-
-        # Fix 1a: Deduplicate consecutive closing quotes produced when model
-        # outputs U+201D and Rule H then appends U+201C on top („...?”“).
-        # Normalise all closing-quote variants to “, then collapse runs.
-        deduped = _re.sub(ALL_CLOSE_RE + r'{2,}', '“', fixed)
-        deduped = deduped.replace('”', '“')
-        if deduped != fixed:
-            fixed = deduped
-            row["content"] = fixed
-            quote_restores += 1
-            c = fixed  # keep c in sync for checks below
-
-        # Restore missing opening „
-        if orig_opens and not out_opens:
-            fixed = '„' + fixed
-
-        # Restore missing closing " (only when original English had one)
-        already_closed = bool(_re.search(ALL_CLOSE_RE + r'\s*[,!?.]?\s*$', fixed))
-        # Guard: only restore closing " when the row itself opens with „.
-        # Narrative rows (Michael schmunzelte.) must never get a lone closing ".
-        out_opens_now = fixed.startswith(('„', '“', '”', '"'  ))
-        if orig_closes and not already_closed and out_opens_now:
-            # Guard: don't add if a close quote already appears mid-sentence
-            # (restructured sentence like „Text!“, schoss sie zurück.)
-            already_has_mid = bool(_re.search(ALL_CLOSE_RE + r'[ ,!?.]', fixed))
-            if not already_has_mid:
-                if fixed.endswith(','):
-                    fixed = fixed[:-1] + '“,'
-                else:
-                    fixed = fixed + '“'
-
-        # Fix 1b: Insert missing close before inline attribution verb.
-        # Handles two sub-cases:
-        #   a) „Speech text, stellte Gabriela... → „Speech text“, stellte Gabriela...
-        #   b) „Speech text sagte er leise.     → „Speech text“, sagte er leise.
-        #      (model omits BOTH comma and closing quote — insert both)
-        if fixed.startswith('„') and not _re.search(ALL_CLOSE_RE, fixed[1:]):
-            # Sub-case a: comma already present before attribution verb
-            m_attr = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
-            if m_attr:
-                fixed = fixed[:m_attr.start()] + '“' + fixed[m_attr.start():]
-            else:
-                # Sub-case b: no comma — verb appears with only a space before it
-                m_attr2 = _re.search(r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
-                if m_attr2:
-                    # Insert closing quote + comma before the attribution
-                    fixed = fixed[:m_attr2.start()] + '“,' + fixed[m_attr2.start():]
-
-        if fixed != c:
-            row["content"] = fixed
-            quote_restores += 1
-
-    if comma_fixes:
-        log(f"  ✂️  Post-processing: fixed {comma_fixes} dialogue comma(s).")
-    if comma_adds:
-        log(f"  ✍️  Post-processing: added/fixed {comma_adds} comma(s) before Begleitsatz (incl. after !).")
-    if dash_fixes:
-        log(f"  ➖ Post-processing: replaced {dash_fixes} literal em-dash(es) with comma.")
-    if quote_restores:
-        log(f"  „“ Post-processing: restored missing quotes in {quote_restores} row(s).")
     # ── Post-process: deterministic glossary enforcement ────────────────────
     # The LLM sometimes ignores glossary entries in the prompt.
     # This step scans every row for untranslated English glossary source terms
@@ -1364,6 +1368,71 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         all_rephrased = sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
     else:
         log(f"  \u2705 Similarity guard: all rows within threshold.")
+
+    # ── Truncation guard: re-request rows with severely shortened output ──────────
+    # Catches cases where Gemini truncated long rows (e.g. „Sie…" from a 25-word input).
+    # Threshold: output < 35% of input words, with input >= 6 words.
+    # Re-requests using same single-row Gemini pattern as mandatory change pass.
+    _trunc_input_by_sort = {r.get("sort", i): r.get("content", "")
+                             for i, r in enumerate(input_data)}
+    _trunc_candidates = []
+    for _tr_row in all_rephrased:
+        _tr_sort = _tr_row.get("sort")
+        _tr_out  = _tr_row.get("content", "")
+        _tr_inp  = _trunc_input_by_sort.get(_tr_sort, "")
+        if not _tr_inp or not _tr_out:
+            continue
+        _tr_inp_w = len(_tr_inp.split())
+        _tr_out_w = len(_tr_out.split())
+        if _tr_inp_w >= 6 and _tr_out_w < 0.35 * _tr_inp_w:
+            _trunc_candidates.append((_tr_sort, _tr_out, _tr_inp))
+            log(f"  \u26a0\ufe0f  Truncation detected sort={_tr_sort}: "
+                f"{_tr_inp_w} input words \u2192 {_tr_out_w} output words: {_tr_out[:60]!r}")
+
+    if _trunc_candidates:
+        log(f"  \U0001f504 Truncation re-request: {len(_trunc_candidates)} row(s)...")
+        _trunc_by_sort = {r.get("sort"): r for r in all_rephrased}
+        for _tr_sort, _tr_current, _tr_orig in _trunc_candidates:
+            _trunc_prompt = (
+                "Du bist ein erfahrener deutscher Lektor. "
+                "Die folgende Zeile wurde zu stark gek\u00fcrzt und ist unvollst\u00e4ndig. "
+                "Formuliere den VOLLST\u00c4NDIGEN deutschen Text um "
+                "\u2014 bewahre alle Inhalte und Bedeutungen. K\u00fcrze NICHT.\n"
+                "Antworte NUR mit: "
+                "[{\"sort\": " + str(_tr_sort) + ", \"content\": \"<vollst\u00e4ndig umformuliert>\"}]\n"
+                + json.dumps([{"sort": _tr_sort, "content": _tr_orig}], ensure_ascii=False)
+            )
+            for _api_key in ([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS):
+                try:
+                    _tr_resp = requests.post(
+                        f"{GEMINI_URL}?key={_api_key}",
+                        json={"contents": [{"parts": [{"text": _trunc_prompt}]}],
+                              "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}},
+                        timeout=45,
+                    )
+                    if _tr_resp.status_code == 429:
+                        continue
+                    _tr_resp.raise_for_status()
+                    _tr_text = _tr_resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if _tr_text.startswith("```"):
+                        _tr_text = _tr_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                    _tr_parsed = json.loads(_tr_text)
+                    if isinstance(_tr_parsed, list) and _tr_parsed:
+                        _tr_result = _tr_parsed[0].get("content", "").strip()
+                        _tr_result_w = len(_tr_result.split())
+                        if _tr_result and _tr_result_w >= 0.55 * len(_tr_orig.split()):
+                            log(f"    \u2705 sort={_tr_sort}: truncation fixed ({_tr_result_w} words): {_tr_result[:60]!r}")
+                            _trunc_by_sort[_tr_sort]["content"] = _tr_result
+                        elif _tr_result:
+                            log(f"    \u26a0\ufe0f  sort={_tr_sort}: still short ({_tr_result_w} words), using best result")
+                            _trunc_by_sort[_tr_sort]["content"] = _tr_result
+                    break
+                except Exception as _tr_exc:
+                    log(f"    \u26a0\ufe0f  sort={_tr_sort} truncation retry error: {_tr_exc}")
+                    continue
+        all_rephrased = sorted(_trunc_by_sort.values(), key=lambda r: r.get("sort", 0))
+    else:
+        log(f"  \u2705 Truncation guard: no truncated rows detected.")
 
     return all_rephrased
 
