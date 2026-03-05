@@ -14,6 +14,10 @@ on:
   schedule:
     - cron: '*/8 * * * *'
 
+concurrency:
+  group: cdreader-checker
+  cancel-in-progress: false
+
 jobs:
   check-chapters:
     runs-on: ubuntu-24.04
@@ -39,5 +43,6 @@ jobs:
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           GEMINI_API_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
+          GEMINI_API_KEY_7: ${{ secrets.GEMINI_API_KEY_7 }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
         run: python checker.py
