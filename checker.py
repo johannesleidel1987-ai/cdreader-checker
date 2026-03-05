@@ -829,7 +829,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
-        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand"
+        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -866,6 +866,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
           - Very long rows (> max_words) that aren't attribution
           - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
         """
+        # Inline speech: attribution verb followed by colon + uppercase = introduces
+        # direct speech in the same row („Antwortete sie entschlossen: Nein.“) —
+        # this is NOT a pure Begleitsatz following previous speech.
+        import re as _re_bgs
+        if _re_bgs.search(r':\s+[A-ZÄÖÜ]', text):
+            return False
         if text.rstrip().endswith(':'):
             return False  # ends with ':' → introduces new speech, doesn't attribute old
         if len(text.split()) > _max_words:
@@ -1099,10 +1105,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # avoids false positives on narrative colons ("Er hatte drei Ziele: Stärke..."),
         # Kapitel headers, and time expressions ("18:30 Uhr").
         c_j = row.get("content", "")
-        _J_SV_BEFORE_COLON = _re.compile(
-            rf'(?:{_SV_CORE})\s*:\s+[A-ZÄÖÜ]', _re.IGNORECASE
+        # Check: is there a speech verb anywhere BEFORE the colon?
+        # Handles "fragte er mit leiser Stimme: Hat..." where verb is not adjacent to colon.
+        _j_colon_m = _re.search(r':\s+[A-ZÄÖÜ]', c_j)
+        _j_has_sv_before_colon = (
+            _j_colon_m and
+            bool(_re.search(rf'(?:{_SV_CORE})', c_j[:_j_colon_m.start()], _re.IGNORECASE))
         )
-        if _J_SV_BEFORE_COLON.search(c_j) and not _re.search(r':\s*[„“"]', c_j):
+        if _j_has_sv_before_colon and not _re.search(r':\s*[„“"]', c_j):
             fixed_j = _re.sub(
                 r'(:\s+)([A-ZÄÖÜ])',
                 lambda m: m.group(1) + '„' + m.group(2),
