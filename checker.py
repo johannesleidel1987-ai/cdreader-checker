@@ -921,12 +921,19 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     continue  # pair handled
 
         # ── Type B: row N+1 starts with full content of row N ──
+        # Gemini puts dialogue+attribution in row N+1, while row N has only the dialogue.
+        # Correct fix: move the attribution suffix into row N; restore row N+1 from original.
         cn_norm  = _qnorm(cn.strip())
         cn1_norm = _qnorm(cn1)
         if len(cn_norm) >= 10 and cn1_norm.startswith(cn_norm):
             remainder = cn1[len(cn.strip()):].lstrip(' “”",').strip()
-            if remainder:
-                row_n1["content"] = remainder
+            orig_n1 = _orig_by_sort.get(row_n1.get("sort"), "")
+            if remainder and orig_n1:
+                # Move attribution into row N (strip trailing punctuation, add ", attribution")
+                cn_base = cn.rstrip().rstrip(".,")
+                row_n["content"] = cn_base + ", " + remainder
+                # Restore row N+1 from its original machine translation
+                row_n1["content"] = orig_n1
                 _dup_fixes += 1
 
     if _dup_fixes:
@@ -938,6 +945,20 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
         # Rule A removed: comma after ?" IS required in German before Begleitsatz.
         # Rule F (below) handles !" the same way.
+
+        # Rule B-pre: Clean up closing_quote + comma + period (",.") at row end.
+        # Gemini outputs e.g. „Nachmittag",. — period AND comma, which is wrong either way.
+        # - If next row IS a Begleitsatz: keep comma (needed), move period inside quote → „Nachmittag.",
+        # - If next row is NOT a Begleitsatz: drop comma, move period inside quote → „Nachmittag."
+        if _re.search(r'[“”"],[.]$', c):
+            c_base = c[:-3]           # everything before closing_quote
+            c_quote = c[-3]           # the closing quote character
+            if BEGLEITSATZ_PATTERN.match(next_content):
+                c = c_base + "." + c_quote + ","   # „....",  (period inside, comma kept)
+            else:
+                c = c_base + "." + c_quote          # „...."   (period inside, comma dropped)
+            row["content"] = c
+            comma_fixes += 1
 
         # Rule B: Remove cross-row comma when next row is NOT a Begleitsatz.
         if c.endswith('",') or c.endswith('“,') or c.endswith('”,'):
