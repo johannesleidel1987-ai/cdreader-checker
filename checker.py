@@ -29,6 +29,7 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_4", ""),
     os.environ.get("GEMINI_API_KEY_5", ""),
     os.environ.get("GEMINI_API_KEY_6", ""),
+    os.environ.get("GEMINI_API_KEY_7", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -39,7 +40,7 @@ _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for
 # Tier 1: Llama 3.3 70B via Groq (free, 14,400 RPD, CI-friendly)
 #   Set GROQ_API_KEY in GitHub Actions secrets to enable.
 #   Sign up at console.groq.com — no credit card required for free tier.
-# Fallback uses GEMINI_API_KEY_6 (6th key in rotation pool above).
+# Fallback uses GEMINI_API_KEY_6 and GEMINI_API_KEY_7 (keys 6-7 in rotation pool above).
 
 
 
@@ -2054,8 +2055,9 @@ def run_test():
     log("=" * 60)
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
-    k6_status = "✅ configured" if GEMINI_API_KEY_6 else "⚠️  not configured (optional 6th key)"
-    log(f"Gemini key 6 (fallback): {k6_status}")
+    k6_status = "✅ configured" if GEMINI_API_KEY_6 else "⚠️  not set"
+    k7_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_7") else "⚠️  not set"
+    log(f"Gemini key 6: {k6_status} | key 7: {k7_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2086,7 +2088,7 @@ def run_test():
     result = rephrase_with_gemini(TEST_ROWS, SAMPLE_GLOSSARY, "TEST BOOK")
 
     if not result:
-        msg = "❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys (GEMINI_API_KEY through GEMINI_API_KEY_6)."
+        msg = "❌ <b>TEST FAILED</b>: No result returned. Check Gemini API keys (GEMINI_API_KEY through GEMINI_API_KEY_7)."
         log(msg)
         send_telegram(msg)
         return
@@ -2136,7 +2138,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'}\n"
+        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
