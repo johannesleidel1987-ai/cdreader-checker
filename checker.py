@@ -68,7 +68,9 @@ WORD_CORRECTION_DEFAULT = json.dumps({"StatusCode": 0, "SpellErrors": [], "Gramm
 
 # ─── Rephrasing prompt (universal rules) ─────────────────────────────────────
 BASE_PROMPT = """ROLE
-You are an experienced German content writer and expert editor. Your task is to rephrase each row in the "content" field into polished, natural, and professional German.
+You are an experienced German creative writer and senior editor. Your task is to rephrase each row in the "content" field into natural, engaging, and idiomatic German — the way a native German author would write it, not a translator.
+
+⚠️ IMPORTANT: The input is a machine translation that often sounds flat and unnatural. Your output must read noticeably better than the input. This does not mean forcing dramatic rewrites where the input is already natural — it means eliminating awkward phrasing, stiff word order, and literal translations wherever they occur. The goal is authentic German prose, not maximum change.
 
 OUTPUT FORMAT (CRITICAL)
 Return ONLY a valid JSON array — no markdown, no preamble, no explanation.
@@ -84,11 +86,16 @@ CAPITALIZATION & SOURCE FORMATTING
 - Standard lines: standard German capitalization rules
 
 LINGUISTIC GUIDELINES
+- Tone: natural, conversational German with everyday expressions; the text should feel effortless to read
+- Idiomatic phrasing: replace literal translations with idiomatic German equivalents where the input sounds unnatural
+  Example: "Sie hatte keine Wahl, als zu gehen." → "Ihr blieb keine andere Wahl."
+- Vocabulary: choose words appropriate to the context and emotional tone; only replace a word if a better-fitting alternative exists — do not substitute words that are already natural and precise
+  Example: "flüsterte sie" is already correct in an intimate scene; "sagte sie leise" would be a downgrade
+- Sentence variety: where the input has several consecutive sentences of the same length and structure, vary them for better flow
 - Word count: approximately maintain the original word count per line; avoid excessive shortening
-- Tone: natural, conversational German with everyday expressions; use synonyms to avoid repetition
-- Action beats: incorporate or maintain character actions where suitable
-- Contextual flow: consider surrounding rows for narrative continuity
-- Dashes (—): never translate literally as "-"; restructure using conjunctions, verbs, or relative clauses for natural German flow
+- Action beats: preserve or enrich character actions and physical reactions
+- Contextual flow: consider surrounding rows for narrative continuity and emotional arc
+- Dashes (—): never translate literally; restructure using conjunctions, verbs, or relative clauses
   Example: "...in the news—a softer version..." → "...in den Nachrichten, und wirkte wie eine sanftere Version..."
 
 THE PRONOUN PROTOCOL (CRITICAL)
@@ -1574,6 +1581,36 @@ def run():
 
     # Finish
     finish_result = finish_chapter(token, proc_id)
+
+    # Check for ErrMessage10 — CDReader rejects finish when it detects
+    # the submitted content is too similar to the original machine translation.
+    finish_ok = (
+        finish_result.get("status") is True
+        or finish_result.get("message") in ("SaveSuccess", "OperSuccess", "UpdateSuccess")
+        or finish_result.get("code") in ("311", "315", "200", 0)
+    )
+    if not finish_ok:
+        err_msg = finish_result.get("message", "unknown")
+        if "ErrMessage10" in str(err_msg) or "10" in str(finish_result.get("code", "")):
+            msg = (
+                f"⚠️ <b>CDReader: Finish rejected (ErrMessage10)</b>\n\n"
+                f"📖 {book_name}\n"
+                f"📄 {ch_name}\n\n"
+                f"CDReader detected insufficient rephrasing — the output was too similar "
+                f"to the machine translation. Please open the chapter manually, make "
+                f"meaningful edits, and finish it from the CDReader interface."
+            )
+        else:
+            msg = (
+                f"⚠️ <b>CDReader: Finish failed</b>\n\n"
+                f"📖 {book_name}\n"
+                f"📄 {ch_name}\n"
+                f"Response: {finish_result}\n\n"
+                f"Please finish manually."
+            )
+        send_telegram(msg)
+        log(f"  ⚠️  Finish failed: {finish_result}")
+        return
 
     # Close the Task Center task (equivalent to clicking "verify and close")
     time.sleep(2)
