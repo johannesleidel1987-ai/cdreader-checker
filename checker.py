@@ -440,11 +440,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         for r in rows
     ]
 
-    # Determine quote roles with context awareness
+    # Determine quote roles using the ENGLISH source, not the German MT.
+    # German MT frequently has „ without closing ", which causes the state machine
+    # to get stuck in in_dialogue=True and misclassify all subsequent no-quote rows
+    # as "middle" when they are independent dialogue lines or narrative.
+    # English quote placement is self-consistent and reliable for open/close tracking.
     quote_roles = []
     in_dialogue = False
-    for i, text in enumerate(raw_contents):
-        role = _classify_quote_role(text)
+    for i, eng_text in enumerate(english_originals):
+        role = _classify_quote_role(eng_text)
         if role == "both":
             in_dialogue = False
             quote_roles.append("both")
@@ -771,11 +775,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _re.IGNORECASE
     )
 
+    # _BEGLEITSATZ_BASE: a genuine Begleitsatz starts DIRECTLY with the speech verb
+    # or with a lowercase pronoun + verb. The [Name]+[SV] arm is intentionally absent:
+    # "Jenifer murmelte leise vor sich hin." starts with a proper name, not the verb
+    # so the comma rule must not fire for those rows.
     _BEGLEITSATZ_BASE = _re.compile(
         rf"""^(?:
             (?:{_SV_CORE})
-            |
-            (?:[A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ]?[a-zäöüß\-]+)*\s+(?:{_SV_CORE}))
             |
             (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:{_SV_CORE}))
         )""",
@@ -880,46 +886,64 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             # Ensure opening „ is present.
             if not _QE_STARTS_OPEN.match(fixed):
                 fixed = _QE_OPEN + fixed
-            # Strip any spurious trailing closing quote.
-            # e.g. „Ricky!“ → „Ricky!   (Gemini ignored the open hint)
-            stripped = _re.sub(r'[“”"]([,!?.])?\s*$',
-                                lambda m: (m.group(1) or ''),
-                                fixed).rstrip()
-            if _QE_STARTS_OPEN.match(stripped):  # must still start with a quote
-                fixed = stripped
+            if not _QE_ANY_CLOSE_RE.search(fixed[1:]):
+                # No closing quote anywhere: check for inline attribution verb.
+                # INLINE_BGS: English "Speech," she said. ends with . after attr verb
+                # so _classify returns "open" (no closing " at end of English).
+                # German needs " inserted before the attribution verb.
+                # „Speech, neckte sie ihn. → „Speech“, neckte sie ihn.
+                _m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
+                if _m_sv_a:
+                    fixed = fixed[:_m_sv_a.start()] + _QE_CLOSE + fixed[_m_sv_a.start():]
+                else:
+                    _m_sv_b = _re.search(
+                        r'(?<=[a-z\u00e4\u00f6\u00fc\u00df!?. ])\s+('+ _SV + r')\b',
+                        fixed, _re.IGNORECASE
+                    )
+                    if _m_sv_b:
+                        fixed = fixed[:_m_sv_b.start()] + _QE_CLOSE + fixed[_m_sv_b.start():]
+                    # else: genuine multi-row opener, leave without closing "
+            else:
+                # Has a closing quote: only strip if spuriously at the very end.
+                # e.g. „Ricky!“ → „Ricky!   (Gemini added close to a genuine opener)
+                stripped = _re.sub(r'[\u201c\u201d"]([,!?.])?\s*$',
+                                    lambda m: (m.group(1) or ''),
+                                    fixed).rstrip()
+                if _QE_STARTS_OPEN.match(stripped):
+                    fixed = stripped
 
         elif role == "close":
             # Ensure a closing " is present.
-            # Don't add an opening „ — Gemini may have correctly omitted it (it's the
-            # continuation of a multi-row dialogue that opened in a previous row).
             if not _QE_ANY_CLOSE_RE.search(fixed):
                 fixed = fixed + _QE_CLOSE
 
         elif role == "both":
-            # Ensure opening „.
             if not _QE_STARTS_OPEN.match(fixed):
                 fixed = _QE_OPEN + fixed
-            # Check for any closing quote (inline or at end).
             has_close = bool(_QE_ANY_CLOSE_RE.search(fixed[1:]))
             if not has_close:
-                # Fix 1b-a: comma already before attribution verb — insert “ before comma.
+                # Fix 1b-a: comma already before attribution verb.
                 m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
                 if m_sv_a:
                     fixed = fixed[:m_sv_a.start()] + _QE_CLOSE + fixed[m_sv_a.start():]
                 else:
                     # Fix 1b-b: no comma yet — insert “, before attribution verb.
                     m_sv_b = _re.search(
-                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')\b',
+                        r'(?<=[a-z\u00e4\u00f6\u00fc\u00df!?.])\s+(' + _SV + r')\b',
                         fixed, _re.IGNORECASE
                     )
                     if m_sv_b:
                         fixed = fixed[:m_sv_b.start()] + _QE_CLOSE + ',' + fixed[m_sv_b.start():]
                     else:
-                        # No attribution verb — append closing quote at end.
                         if fixed.endswith(','):
                             fixed = fixed[:-1] + _QE_CLOSE + ','
                         else:
                             fixed = fixed + _QE_CLOSE
+            # Orphan check: if the last „ has no closing " after it, append ".
+            # Handles INLINE_SPLIT rows („a“, he said, „b? needs " on second segment).
+            _last_open = fixed.rfind(_QE_OPEN)
+            if _last_open >= 0 and not _QE_ANY_CLOSE_RE.search(fixed[_last_open + 1:]):
+                fixed = fixed + _QE_CLOSE
 
         if fixed != c:
             row["content"] = fixed
