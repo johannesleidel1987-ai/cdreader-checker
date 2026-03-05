@@ -889,21 +889,29 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # ── Pass 0: Strip spurious closing quotes from multi-row dialogue openers ───────────
     # Gemini frequently ignores the quote_role="open" hint and adds a closing “ to
-    # rows that are the opening line of a multi-row dialogue (e.g. „Ricky!“ instead
-    # of the correct „Ricky!). We detect these by comparing the original input role
-    # and strip any trailing closing quote from the rephrased output.
+    # rows that open a multi-row dialogue (e.g. „Ricky!“ instead of correct „Ricky!).
+    # Guard: only strip when the NEXT row is NOT a Begleitsatz. A genuine multi-row
+    # opener is always followed by more dialogue content, never by an attribution clause.
+    # If the next row IS a Begleitsatz, the input machine translation was simply missing
+    # its closing quote (Gemini correctly added it) and we must keep it so Rules C/F
+    # can add the required comma.
     _role_by_sort = {r.get("sort", i): r.get("_quote_role", "both") for i, r in enumerate(input_data)}
     _open_role_fixes = 0
-    _ALL_CLOSE_CHARS = ('“', '”', '"')  # U+201C, U+201D, ASCII
-    for row in sorted_rows:
-        if _role_by_sort.get(row.get("sort")) == "open":
-            c = row.get("content", "")
-            # Strip trailing closing quote (with optional punctuation after it)
-            # e.g. „Ricky!“  →  „Ricky!    or    „Ricky!“,  →  „Ricky!
-            stripped = _re.sub(r'[“”"](\s*[,.])?\s*$', '', c).rstrip()
-            if stripped != c and stripped.startswith(('„', '“', '"')):  # must still open
-                row["content"] = stripped
-                _open_role_fixes += 1
+    for _p0_idx, row in enumerate(sorted_rows):
+        if _role_by_sort.get(row.get("sort")) != "open":
+            continue
+        c = row.get("content", "")
+        # Check next row: if it is a Begleitsatz, this row really closes a speech
+        # turn — the closing quote is correct and needed for Rule C to add a comma.
+        next_content = sorted_rows[_p0_idx + 1].get("content", "") if _p0_idx + 1 < len(sorted_rows) else ""
+        if _is_begleitsatz(next_content):
+            continue  # preserve the closing quote; Rule C will handle the comma
+        # Strip trailing closing quote (with optional trailing punctuation)
+        # e.g. „Ricky!“  →  „Ricky!    or    „Ricky!“,  →  „Ricky!
+        stripped = _re.sub(r'[“”"](\s*[,.])?\s*$', '', c).rstrip()
+        if stripped != c and stripped.startswith(('„', '“', '"')):  # must still open
+            row["content"] = stripped
+            _open_role_fixes += 1
     if _open_role_fixes:
         log(f"  🔓 Post-processing: stripped spurious closing quote(s) from {_open_role_fixes} multi-row opener(s).")
 
@@ -1351,6 +1359,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     similar_rows = [
         (sn, out, mt, sim) for sn, out, mt, sim in _sim_scores
         if sim >= SIM_THRESHOLD and len(out.split()) >= 4
+        # Never rewrite dialogue rows — speech content is constrained by meaning;
+        # high similarity to the machine translation is expected and correct.
+        and not any(q in out for q in ('„', '“', '”'))
     ]
 
     if similar_rows:
