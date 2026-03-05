@@ -454,10 +454,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     input_data = [
         {
             "sort": r.get("sort", i),
-            "original": english_originals[i],
+            "original": r.get("eContent") or r.get("eeContent") or raw_contents[i] or "",
             "content": raw_contents[i],
             "machine_translation": r.get("machineChapterContent") or r.get("modifChapterContent") or "",
-            "source_content": raw_contents[i],
             "_quote_role": quote_roles[i],
         }
         for i, r in enumerate(rows)
@@ -1093,34 +1092,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     SIM_THRESHOLD = 0.60   # flag rows at or above this combined similarity
     SIM_MIN_WORDS = 4      # skip very short rows (titles, exclamations)
 
-    # Build per-sort lookup for both reference texts
-    src_by_sort = {r.get("sort", i): r.get("source_content", "")
-                   for i, r in enumerate(rows)}
-    mt_by_sort  = {r.get("sort", i): r.get("machine_translation", "")
-                   for i, r in enumerate(rows)}
+    # chapterConetnt is ENGLISH (confirmed by DIAG logs) — comparing German output
+    # against it is meaningless. Only compare against machineChapterContent (German).
+    mt_by_sort = {r.get("sort", i): r.get("machine_translation", "")
+                  for i, r in enumerate(rows)}
 
     similar_rows = []
-    # Diagnostic: show what the guard actually measures for first 3 rows
-    _diag_count = 0
     for row in all_rephrased:
         sort_n = row.get("sort")
         out    = row.get("content", "")
-        src    = src_by_sort.get(sort_n, "")
         mt     = mt_by_sort.get(sort_n, "")
-        if not out or len(out.split()) < SIM_MIN_WORDS:
+        if not out or not mt or len(out.split()) < SIM_MIN_WORDS:
             continue
-        sim_src = _row_sim(out, src) if src else 0.0
-        sim_mt  = _row_sim(out, mt)  if mt  else 0.0
-        sim     = max(sim_src, sim_mt)
-        ref_used = src if sim_src >= sim_mt else mt
-        # Log first 3 rows so we can see what the guard is actually comparing
-        if _diag_count < 3:
-            log(f"  [DIAG sim] sort={sort_n} out={out[:40]!r} | "
-                f"src={src[:40]!r} sim_src={sim_src:.0%} | "
-                f"mt={mt[:40]!r} sim_mt={sim_mt:.0%} | final={sim:.0%}")
-            _diag_count += 1
+        sim = _row_sim(out, mt)
         if sim >= SIM_THRESHOLD:
-            similar_rows.append((sort_n, out, ref_used, sim))
+            similar_rows.append((sort_n, out, mt, sim))
 
     if similar_rows:
         log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
