@@ -1170,7 +1170,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
         # Restore missing closing " (only when original English had one)
         already_closed = bool(_re.search(ALL_CLOSE_RE + r'\s*[,!?.]?\s*$', fixed))
-        if orig_closes and not already_closed:
+        # Guard: only restore closing " when the row itself opens with „.
+        # Narrative rows (Michael schmunzelte.) must never get a lone closing ".
+        out_opens_now = fixed.startswith(('„', '“', '”', '"'  ))
+        if orig_closes and not already_closed and out_opens_now:
             # Guard: don't add if a close quote already appears mid-sentence
             # (restructured sentence like „Text!“, schoss sie zurück.)
             already_has_mid = bool(_re.search(ALL_CLOSE_RE + r'[ ,!?.]', fixed))
