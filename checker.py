@@ -12,8 +12,9 @@ import time
 from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-BASE_URL   = "https://translatorserverwebapi-de.cdreader.com/api"
-GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+BASE_URL    = "https://translatorserverwebapi-de.cdreader.com/api"
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL  = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 ACCOUNT_NAME   = os.environ.get("CDREADER_EMAIL",    "")
 ACCOUNT_PWD    = os.environ.get("CDREADER_PASSWORD", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -1065,8 +1066,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
         # Rule J: Insert missing opening „ after colon when direct speech follows without one.
         # e.g. „erwiderte sie: Du hast...“  →  „erwiderte sie: „Du hast...“
+        # Guard: only trigger when a speech verb immediately precedes the colon —
+        # avoids false positives on narrative colons ("Er hatte drei Ziele: Stärke..."),
+        # Kapitel headers, and time expressions ("18:30 Uhr").
         c_j = row.get("content", "")
-        if _re.search(r':\s+[A-ZÄÖÜ]', c_j) and not _re.search(r':\s*[„“"]', c_j):
+        _J_SV_BEFORE_COLON = _re.compile(
+            rf'(?:{_SV_CORE})\s*:\s+[A-ZÄÖÜ]', _re.IGNORECASE
+        )
+        if _J_SV_BEFORE_COLON.search(c_j) and not _re.search(r':\s*[„“"]', c_j):
             fixed_j = _re.sub(
                 r'(:\s+)([A-ZÄÖÜ])',
                 lambda m: m.group(1) + '„' + m.group(2),
@@ -1225,8 +1232,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             for api_key in ([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS):
                 try:
                     r_resp = requests.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/"
-                        f"{GEMINI_MODEL}:generateContent?key={api_key}",
+                        f"{GEMINI_URL}?key={api_key}",
                         json={"contents": [{"parts": [{"text": retry_prompt}]}],
                               "generationConfig": {"temperature": 1.0, "maxOutputTokens": 512}},
                         timeout=45,
@@ -1350,8 +1356,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 for api_key in keys_to_try:
                     try:
                         r_resp = requests.post(
-                            f"https://generativelanguage.googleapis.com/v1beta/models/"
-                            f"{GEMINI_MODEL}:generateContent?key={api_key}",
+                            f"{GEMINI_URL}?key={api_key}",
                             json={
                                 "contents": [{"parts": [{"text": retry_prompt}]}],
                                 "generationConfig": {"temperature": 0.9, "maxOutputTokens": 512},
@@ -1862,8 +1867,30 @@ def run():
             }]
             # Try Gemini first for single-row retry (save Groq quota)
             retry_result = None
-            if GEMINI_API_KEY:
-                retry_result = rephrase_with_gemini.__wrapped_call_gemini(single_batch, sort_n, 1, None) if hasattr(rephrase_with_gemini, '__wrapped_call_gemini') else None
+            retry_key = next((k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys), None)
+            if retry_key:
+                single_prompt = (
+                    "Du bist ein erfahrener deutscher Lektor. Formuliere diesen deutschen Satz um — "
+                    "verwende andere Worte oder Satzstruktur, ohne die Bedeutung zu verändern. "
+                    "Antworte NUR mit einem JSON-Array: [{\"sort\": " + str(sort_n) + ", \"content\": \"<umformuliert>\"}]\n"
+                    + json.dumps([{"sort": sort_n, "content": single_batch[0]["content"]}], ensure_ascii=False)
+                )
+                try:
+                    r_resp = requests.post(
+                        f"{GEMINI_URL}?key={retry_key}",
+                        json={"contents": [{"parts": [{"text": single_prompt}]}],
+                              "generationConfig": {"temperature": 0.7, "maxOutputTokens": 256}},
+                        timeout=30,
+                    )
+                    if r_resp.status_code == 200:
+                        r_text = r_resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if r_text.startswith("```"):
+                            r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                        parsed = json.loads(r_text)
+                        if isinstance(parsed, list) and parsed and parsed[0].get("content", "").strip():
+                            retry_result = parsed
+                except Exception as exc:
+                    log(f"    ⚠️  Empty-row Gemini retry error for sort={sort_n}: {exc}")
             # Simple direct approach: just copy original content as fallback
             if not retry_result or not retry_result[0].get("content", "").strip():
                 fallback_content = orig_row.get("chapterConetnt") or orig_row.get("modifChapterContent") or ""
