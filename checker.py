@@ -391,8 +391,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Keep raw terms for per-batch filtering; also pre-format full list as fallback
     glossary_text_full = format_glossary_for_prompt(glossary_terms)
 
-    # Build input data: sort + English original + German pre-translation to rephrase
-    # Field names from API: eContent=English source, chapterConetnt=German pre-translation (note typo)
+    # Build input data: sort + English original (context) + German to rephrase
+    # CONFIRMED by DIAG: chapterConetnt=English source, machineChapterContent=German machine translation
+    # Gemini must rephrase the German machine translation, NOT re-translate from English.
 
     def _classify_quote_role(text):
         """
@@ -424,7 +425,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         return "none"
 
     raw_contents = [
-        r.get("chapterConetnt") or r.get("content") or r.get("modifChapterContent") or ""
+        # Use German machine translation as the text Gemini rephrases.
+        # chapterConetnt is English — using it would make Gemini re-translate from
+        # English, producing output similar to the existing machine translation.
+        r.get("machineChapterContent") or r.get("modifChapterContent") or r.get("peContent") or ""
+        for r in rows
+    ]
+    # English source (chapterConetnt) used as context only, not as content to rephrase
+    english_originals = [
+        r.get("chapterConetnt") or r.get("eContent") or r.get("eeContent") or ""
         for r in rows
     ]
 
@@ -454,9 +463,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     input_data = [
         {
             "sort": r.get("sort", i),
-            "original": r.get("eContent") or r.get("eeContent") or raw_contents[i] or "",
-            "content": raw_contents[i],
-            "machine_translation": r.get("machineChapterContent") or r.get("modifChapterContent") or "",
+            "original": english_originals[i],   # English source — context for Gemini
+            "content": raw_contents[i],           # German machine translation — primary text to rephrase
+            "machine_translation": raw_contents[i],  # same German text used by similarity guard
             "_quote_role": quote_roles[i],
         }
         for i, r in enumerate(rows)
@@ -561,11 +570,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             f"{batch_glossary_text}\n\n"
             f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
             f"For each row:\n"
-            f"  - \"original\": English source (may be empty, for context only).\n"
-            f"  - \"machine_translation\": CDReader's existing machine translation. Where non-empty, "
-            f"your output MUST differ from it in phrasing and/or sentence structure — CDReader will "
-            f"reject output that is too similar.\n"
-            f"  - \"content\": German pre-translation — use as primary input for rephrasing.\n"
+            f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
+            f"  - \"content\": German machine translation — this is what you MUST rephrase. "
+            f"Rewrite it in natural, idiomatic German while preserving the exact meaning. "
+            f"Your output must read noticeably better than the input and differ in phrasing or sentence structure.\n"
             f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
             f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
         )
