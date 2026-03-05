@@ -1055,55 +1055,75 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if gloss_fixes:
             log(f"  📖 Post-processing: enforced glossary terms in {gloss_fixes} row(s).")
 
-    # ── Similarity guard: retry rows too similar to machineChapterContent ─────
+    # ── Similarity guard: retry rows too similar to CDReader's reference texts ──
     # CDReader triggers ErrMessage10 when submitted text is too similar to its
-    # stored machine translation (machineChapterContent). We measure word-level
-    # Jaccard overlap between each output row and the machine translation, then
-    # re-request any flagged row with an explicit diversification instruction.
-    def _word_sim(a, b):
-        import re as _re2
-        wa = set(_re2.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a.lower()))
-        wb = set(_re2.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b.lower()))
-        if not wa or not wb:
-            return 0.0
-        return len(wa & wb) / len(wa | wb)
+    # stored translation. Root causes of previous false-passes:
+    #   1. Old guard compared against machineChapterContent only — but CDReader
+    #      most likely compares the submission against chapterConetnt (the text
+    #      we fed to Gemini as input). Now we check BOTH and take the max.
+    #   2. Jaccard word-set similarity misses word-order-only changes and minor
+    #      substitutions. Now we combine Jaccard with character trigram similarity.
+    import re as _re_sim
 
-    SIM_THRESHOLD = 0.72   # flag rows at or above this word-overlap ratio
+    def _row_sim(output, ref):
+        """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
+        def _norm(s):
+            return _re_sim.sub(r"[^\w\s]", "", s.lower())
+        def _jaccard(a, b):
+            wa = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
+            wb = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
+            return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
+        def _trigram(a, b):
+            na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
+            nb = set(b[i:i+3] for i in range(max(0, len(b)-2)))
+            return len(na & nb) / len(na | nb) if (na and nb) else 0.0
+        no, nr = _norm(output), _norm(ref)
+        return max(_jaccard(no, nr), _trigram(no, nr))
+
+    SIM_THRESHOLD = 0.60   # flag rows at or above this combined similarity
     SIM_MIN_WORDS = 4      # skip very short rows (titles, exclamations)
 
-    mt_by_sort = {r.get("sort", i): r.get("machine_translation", "")
-                  for i, r in enumerate(rows)}
+    # Build per-sort lookup for both reference texts
+    src_by_sort = {r.get("sort", i): r.get("source_content", "")
+                   for i, r in enumerate(rows)}
+    mt_by_sort  = {r.get("sort", i): r.get("machine_translation", "")
+                   for i, r in enumerate(rows)}
 
     similar_rows = []
     for row in all_rephrased:
         sort_n = row.get("sort")
-        mt = mt_by_sort.get(sort_n, "")
-        out = row.get("content", "")
-        if not mt or not out or len(out.split()) < SIM_MIN_WORDS:
+        out    = row.get("content", "")
+        src    = src_by_sort.get(sort_n, "")
+        mt     = mt_by_sort.get(sort_n, "")
+        if not out or len(out.split()) < SIM_MIN_WORDS:
             continue
-        sim = _word_sim(out, mt)
+        sim_src = _row_sim(out, src) if src else 0.0
+        sim_mt  = _row_sim(out, mt)  if mt  else 0.0
+        sim     = max(sim_src, sim_mt)
+        ref_used = src if sim_src >= sim_mt else mt
         if sim >= SIM_THRESHOLD:
-            similar_rows.append((sort_n, out, mt, sim))
+            similar_rows.append((sort_n, out, ref_used, sim))
 
     if similar_rows:
-        log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} threshold \u2014 re-requesting...")
+        log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
         rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
 
-        for sort_n, current_out, mt, sim in similar_rows:
+        for sort_n, current_out, ref_text, sim in similar_rows:
             log(f"    sort={sort_n} sim={sim:.0%}: {current_out[:70]!r}")
 
-            retry_row = [{"sort": sort_n, "machine_translation": mt, "content": current_out}]
+            retry_row = [{"sort": sort_n, "reference": ref_text, "content": current_out}]
             retry_prompt = (
                 BASE_PROMPT + "\n\n"
                 "SIMILARITY RE-REQUEST \u2014 ONE ROW ONLY\n"
                 "The row below was flagged: its current rephrasing is too similar to "
-                "the machine translation (" + f"{sim:.0%}" + " word overlap). "
-                "CDReader will reject it. Rewrite it with clearly different vocabulary "
-                "and/or sentence structure while preserving the exact same meaning. "
+                "the reference text (" + f"{sim:.0%}" + " similarity). "
+                "CDReader will reject the chapter if this is not improved. "
+                "Rewrite it with clearly different vocabulary and/or sentence structure "
+                "while preserving the exact same meaning. "
                 "Natural, idiomatic German is still the priority \u2014 do not produce "
                 "stilted language just to differ.\n\n"
-                "  - \"machine_translation\": the reference text to diverge from\n"
-                "  - \"content\": the current phrasing to improve upon\n\n"
+                "  - \"reference\": the text your output must clearly differ from\n"
+                "  - \"content\": the current phrasing to improve\n\n"
                 "Return ONLY a JSON array with one object: "
                 "{\"sort\": <number>, \"content\": \"<rewritten text>\"}\n"
                 + json.dumps(retry_row, ensure_ascii=False)
@@ -1140,7 +1160,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 log(f"    \u26a0\ufe0f  Similarity retry exception: {exc}")
 
             if retry_result and retry_result != current_out:
-                new_sim = _word_sim(retry_result, mt)
+                new_sim = _row_sim(retry_result, ref_text)
                 log(f"    \u2705 sort={sort_n} new sim={new_sim:.0%}: {retry_result[:70]!r}")
                 rephrased_by_sort[sort_n]["content"] = retry_result
             else:
@@ -1150,7 +1170,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     else:
         log(f"  \u2705 Similarity guard: all rows within threshold.")
 
-        return all_rephrased
+    return all_rephrased
+
 
 
 # ─── Phase 5: Verify ──────────────────────────────────────────────────────────
