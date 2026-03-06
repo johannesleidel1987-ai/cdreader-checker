@@ -777,9 +777,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
         r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
-        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte||wollte||sprach|beruhigte|"
+        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
         # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
-        r"wollte|beruhigte|erwähnte|wies"
+        r"wollte|beruhigte|erwähnte|wies|sprach"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -1326,7 +1326,49 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Only fire if the chapter modification rate is below the CDReader floor (18% = 3pt buffer
     # above CDReader's 15% block threshold). If already above floor, skip entirely.
     # If below floor, only retry the minimum rows needed to reach 18% — not all verbatim rows.
+    #
+    # METRIC: We use the SIM-based mod rate (rows with sim < 0.99 vs MT) rather than exact
+    # string equality. Exact equality ignores punctuation-only changes (comma additions from
+    # post-processing) and can report an inflated rate — hiding chapters that are genuinely
+    # unchanged in content. SIM-based rate is consistent with the similarity guard below.
     _input_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
+
+    # Pre-compute SIM scores now (before similarity guard) so both gates share the same metric.
+    import re as _re_sim
+
+    def _row_sim(output, ref):
+        """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
+        def _norm(s):
+            return _re_sim.sub(r"[^\w\s]", "", s.lower())
+        def _jaccard(a, b):
+            wa = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
+            wb = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
+            return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
+        def _trigram(a, b):
+            na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
+            nb = set(b[i:i+3] for i in range(max(0, len(b)-2)))
+            return len(na & nb) / len(na | nb) if (na and nb) else 0.0
+        no, nr = _norm(output), _norm(ref)
+        return max(_jaccard(no, nr), _trigram(no, nr))
+
+    mt_by_sort = {r.get("sort", i): (r.get("machineChapterContent") or r.get("modifChapterContent") or "")
+                  for i, r in enumerate(rows)}
+
+    _pre_sim_scores = []
+    for row in all_rephrased:
+        sort_n = row.get("sort")
+        out = row.get("content", "")
+        mt  = mt_by_sort.get(sort_n, "")
+        if out and mt:
+            _pre_sim_scores.append((sort_n, out, mt, _row_sim(out, mt)))
+
+    _MODIFICATION_FLOOR = 0.18
+    _SIM_MODIFIED_COUNT  = sum(1 for _, _, _, s in _pre_sim_scores if s < 0.99)
+    _total_rows_for_gate = len(_pre_sim_scores)
+    _mod_rate_gate = _SIM_MODIFIED_COUNT / _total_rows_for_gate if _total_rows_for_gate else 0.0
+    log(f"  [MOD RATE] before mandatory retry: {_mod_rate_gate:.0%} "
+        f"({_SIM_MODIFIED_COUNT}/{_total_rows_for_gate} rows sim-modified)")
+
     _mandatory_retry = [
         (row.get("sort"), row.get("content", ""), _input_by_sort.get(row.get("sort"), ""))
         for row in all_rephrased
@@ -1335,18 +1377,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         and len(row.get("content", "").split()) >= 4
     ]
 
-    _MODIFICATION_FLOOR = 0.18
-    _total_rows_for_gate = sum(1 for r in all_rephrased if _input_by_sort.get(r.get("sort"), ""))
-    _mod_rate_gate = (
-        (_total_rows_for_gate - len(_mandatory_retry)) / _total_rows_for_gate
-        if _total_rows_for_gate else 0.0
-    )
-    log(f"  [MOD RATE] before mandatory retry: {_mod_rate_gate:.0%} ({_total_rows_for_gate - len(_mandatory_retry)}/{_total_rows_for_gate} rows modified, {len(_mandatory_retry)} verbatim)")
-
     if _mod_rate_gate >= _MODIFICATION_FLOOR:
         log(f"  ✅ Mandatory change pass: rate {_mod_rate_gate:.0%} ≥ {_MODIFICATION_FLOOR:.0%} floor — skipping.")
     elif _mandatory_retry:
-        _needed = max(1, int(_MODIFICATION_FLOOR * _total_rows_for_gate) - (_total_rows_for_gate - len(_mandatory_retry)))
+        _needed = max(1, int(_MODIFICATION_FLOOR * _total_rows_for_gate) - _SIM_MODIFIED_COUNT)
         # Prioritise longer rows — they benefit most from rephrasing and move the rate furthest
         _mandatory_retry_capped = sorted(_mandatory_retry, key=lambda x: len(x[1].split()), reverse=True)[:_needed]
         log(f"  🔄 Mandatory change pass: rate={_mod_rate_gate:.0%} < floor — retrying {len(_mandatory_retry_capped)}/{len(_mandatory_retry)} verbatim row(s) to reach {_MODIFICATION_FLOOR:.0%}...")
@@ -1390,36 +1424,15 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # ── Similarity guard: retry rows too similar to CDReader's reference texts ──
     # CDReader triggers ErrMessage10 when submitted text is too similar to its
     # stored machine translation. We log a full distribution to diagnose failures.
-    import re as _re_sim
+    # _row_sim and mt_by_sort are already defined above in the mandatory retry block.
 
-    def _row_sim(output, ref):
-        """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
-        def _norm(s):
-            return _re_sim.sub(r"[^\w\s]", "", s.lower())
-        def _jaccard(a, b):
-            wa = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
-            wb = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
-            return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
-        def _trigram(a, b):
-            na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
-            nb = set(b[i:i+3] for i in range(max(0, len(b)-2)))
-            return len(na & nb) / len(na | nb) if (na and nb) else 0.0
-        no, nr = _norm(output), _norm(ref)
-        return max(_jaccard(no, nr), _trigram(no, nr))
+    SIM_THRESHOLD    = 0.97  # flag rows at or above this combined similarity
+    _SIM_MAX_RETRIES = 15    # hard cap: prevents timeout if something systematic causes
+                             # mass MT restoration (e.g. a future regex bug). Retries
+                             # only the longest rows up to this cap and logs a warning.
 
-    SIM_THRESHOLD = 0.97   # flag rows at or above this combined similarity
-    # Raised from 0.90 to 0.97: under selective-rephrase mode Gemini intentionally leaves
-    # natural rows unchanged. Rows at 90-96% similarity already have meaningful differences;
-    # only near-verbatim output (≥97%) warrants a re-request, and only if the chapter
-    # modification rate is still below the CDReader floor (see gate below).
-
-    # chapterConetnt is ENGLISH \u2014 only compare against machineChapterContent (German).
-    # Read machineChapterContent directly from raw API rows.
-    # "machine_translation" only exists in input_data, NOT in rows — hence no_ref=146 bug.
-    mt_by_sort = {r.get("sort", i): (r.get("machineChapterContent") or r.get("modifChapterContent") or "")
-                  for i, r in enumerate(rows)}
-
-    # \u2500\u2500 Diagnostic: log full similarity distribution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Recompute sim scores on the current state of all_rephrased (reflects any
+    # mandatory-retry updates) and produce the diagnostic distribution.
     _sim_scores = []
     _rows_no_ref = 0
     _rows_identical = 0
@@ -1455,9 +1468,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         for sn, out_s, mt_s, sim_s in top5:
             log(f"  [SIM DIAG] sort={sn} sim={sim_s:.0%}: out={out_s[:45]!r} ref={mt_s[:45]!r}")
     else:
-        log(f"  [SIM DIAG] no rows with machineChapterContent \u2014 no_ref={_rows_no_ref} (guard blind!)")
+        log(f"  [SIM DIAG] no rows with machineChapterContent — no_ref={_rows_no_ref} (guard blind!)")
 
-    # Exclude short rows (< 4 words) from similarity retry --
+    # Exclude short rows (< 4 words) from similarity retry —
     # single-word exclamations like "Emma!" cannot be rephrased and score 100%.
     similar_rows = [
         (sn, out, mt, sim) for sn, out, mt, sim in _sim_scores
@@ -1468,16 +1481,19 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     ]
 
     if similar_rows:
-        # Chapter-level gate: same floor logic as mandatory retry.
-        # After mandatory retry, recompute modification rate from current _sim_scores.
-        # Rows scoring < 0.99 are considered "modified" for floor purposes.
-        _MODIFICATION_FLOOR = 0.18
-        _sim_modified = sum(1 for _, _, _, s in _sim_scores if s < 0.99)
-        _sim_mod_rate = _sim_modified / _total_checked if _total_checked else 0.0
-        log(f"  [MOD RATE] before similarity guard: {_sim_mod_rate:.0%} ({_sim_modified}/{_total_checked} rows modified)")
+        # Chapter-level gate: use the same SIM-based metric as the mandatory retry gate.
+        _sim_modified_post = sum(1 for _, _, _, s in _sim_scores if s < 0.99)
+        _sim_mod_rate = _sim_modified_post / _total_checked if _total_checked else 0.0
+        log(f"  [MOD RATE] before similarity guard: {_sim_mod_rate:.0%} "
+            f"({_sim_modified_post}/{_total_checked} rows sim-modified)")
         if _sim_mod_rate >= _MODIFICATION_FLOOR:
             log(f"  ✅ Similarity guard: rate {_sim_mod_rate:.0%} ≥ {_MODIFICATION_FLOOR:.0%} floor — skipping re-requests.")
         else:
+            if len(similar_rows) > _SIM_MAX_RETRIES:
+                log(f"  ⚠️  Similarity guard: {len(similar_rows)} rows flagged — capped at {_SIM_MAX_RETRIES} "
+                    f"(longest rows prioritised). High count may indicate a systematic issue.")
+                similar_rows = sorted(similar_rows, key=lambda x: len(x[1].split()), reverse=True)[:_SIM_MAX_RETRIES]
+            log(f"  🔄 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} — re-requesting...")
             log(f"  🔄 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} — re-requesting...")
             rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
 
