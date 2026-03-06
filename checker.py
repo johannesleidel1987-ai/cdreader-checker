@@ -37,6 +37,10 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_12", ""),
     os.environ.get("GEMINI_API_KEY_13", ""),
     os.environ.get("GEMINI_API_KEY_14", ""),
+    os.environ.get("GEMINI_API_KEY_15", ""),
+    os.environ.get("GEMINI_API_KEY_16", ""),
+    os.environ.get("GEMINI_API_KEY_17", ""),
+    os.environ.get("GEMINI_API_KEY_18", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -2254,7 +2258,11 @@ def run_test():
     k12_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_12") else "⚠️  not set"
     k13_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_13") else "⚠️  not set"
     k14_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_14") else "⚠️  not set"
-    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status} | key 11: {k11_status} | key 12: {k12_status} | key 13: {k13_status} | key 14: {k14_status}")
+    k15_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_15") else "⚠️  not set"
+    k16_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_16") else "⚠️  not set"
+    k17_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_17") else "⚠️  not set"
+    k18_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_18") else "⚠️  not set"
+    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status} | key 11: {k11_status} | key 12: {k12_status} | key 13: {k13_status} | key 14: {k14_status} | key 15: {k15_status} | key 16: {k16_status} | key 17: {k17_status} | key 18: {k18_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2335,7 +2343,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'} | key 11: {'configured' if os.environ.get('GEMINI_API_KEY_11') else 'not set'} | key 12: {'configured' if os.environ.get('GEMINI_API_KEY_12') else 'not set'} | key 13: {'configured' if os.environ.get('GEMINI_API_KEY_13') else 'not set'} | key 14: {'configured' if os.environ.get('GEMINI_API_KEY_14') else 'not set'}\n"
+        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'} | key 11: {'configured' if os.environ.get('GEMINI_API_KEY_11') else 'not set'} | key 12: {'configured' if os.environ.get('GEMINI_API_KEY_12') else 'not set'} | key 13: {'configured' if os.environ.get('GEMINI_API_KEY_13') else 'not set'} | key 14: {'configured' if os.environ.get('GEMINI_API_KEY_14') else 'not set'} | key 15: {'configured' if os.environ.get('GEMINI_API_KEY_15') else 'not set'} | key 16: {'configured' if os.environ.get('GEMINI_API_KEY_16') else 'not set'} | key 17: {'configured' if os.environ.get('GEMINI_API_KEY_17') else 'not set'} | key 18: {'configured' if os.environ.get('GEMINI_API_KEY_18') else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
