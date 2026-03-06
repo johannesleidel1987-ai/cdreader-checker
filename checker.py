@@ -774,7 +774,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
-        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte"
+        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
+        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
+        # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
+        r"wollte|beruhigte|erwähnte|wies"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -785,7 +788,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"warf|stieß|spuckte|platzte|brach|fiel|gab|presste|rang|"
         r"drängte|keifte|ächzte|sprach|gestand|bekannte|schwor|versprach|"
         r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
-        r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück"
+        r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück|"
+        # Added: template row 30 — "neckte" (teased)
+        r"neckte"
     )
     # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
     _NEGATION_AFTER_SV = _re.compile(
@@ -1260,13 +1265,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 comma_adds += 1
 
                 # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
-        # Pattern: „Speech!“, attribution verb.“  ← trailing “ is wrong.
+        # Pattern: „Text“, attribution verb.“  ← trailing “ is wrong.
         # Happens when LLM copies source quote position onto a restructured German sentence.
+        # GUARD: never strip when trailing “ follows ?/! — that closes genuine speech content
+        # (e.g. INLINE_SPLIT rows: „Und“, fragte sie, „was?“  → trailing “ is valid).
         c = row.get("content", "")
-        if (c.endswith('“') or c.endswith('"')) and _re.search(r'[“"]\s*,\s*\w', c):
-            stripped = c.rstrip('“"')
-            if stripped != c:
-                row["content"] = stripped
+        if (c.endswith('“') or c.endswith('”')) and _re.search(r'[“”"]\s*,\s*\w', c):
+            if not _re.search(r'[?!][“”"]\s*$', c):  # safe: not closing genuine speech
+                stripped = c.rstrip('“”')
+                if stripped != c:
+                    row["content"] = stripped
 
     # Rule H removed: quote enforcement is now handled entirely by Pass QE above.
     # Pass QE enforces opening/closing quote structure deterministically from
