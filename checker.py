@@ -34,6 +34,9 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_9", ""),
     os.environ.get("GEMINI_API_KEY_10", ""),
     os.environ.get("GEMINI_API_KEY_11", ""),
+    os.environ.get("GEMINI_API_KEY_12", ""),
+    os.environ.get("GEMINI_API_KEY_13", ""),
+    os.environ.get("GEMINI_API_KEY_14", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -984,7 +987,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 _eng_rest = _re.sub(r'^[„“”\'"\u00ab]+', '', eng.lstrip())
                 _eng_has_inline_close = bool(_QE_ANY_CLOSE_RE.search(_eng_rest))
                 if _eng_has_inline_close:
-                    # INLINE_BGS confirmed — insert “ before attribution verb.
+                    # INLINE_BGS confirmed — insert " before attribution verb.
                     _m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
                     if _m_sv_a:
                         fixed = fixed[:_m_sv_a.start()] + _QE_CLOSE + fixed[_m_sv_a.start():]
@@ -997,13 +1000,26 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                             fixed = fixed[:_m_sv_b.start()] + _QE_CLOSE + fixed[_m_sv_b.start():]
                 # else: genuine multi-row opener — no closing quote needed here
             else:
-                # Has a closing quote: only strip if spuriously at the very end.
-                # e.g. „Ricky!“ → „Ricky!   (Gemini added close to a genuine opener)
-                stripped = _re.sub(r'[\u201c\u201d"]([,!?.])?\s*$',
-                                    lambda m: (m.group(1) or ''),
-                                    fixed).rstrip()
-                if _QE_STARTS_OPEN.match(stripped):
-                    fixed = stripped
+                # Has a closing quote: only strip if spuriously at the very end,
+                # AND only for genuine single-segment openers.
+                # INLINE_SPLIT rows (two „ openers, e.g. „first“, attr, „second.“) are
+                # misclassified as "open" when the English chapterConetnt field is missing
+                # its final closing ". For those rows the trailing “ is correct — do NOT strip.
+                # Guard: if there are 2+ „ chars this is an INLINE_SPLIT; preserve trailing close.
+                if fixed.count(_QE_OPEN) < 2:
+                    # Genuine single-segment opener — strip spurious trailing close.
+                    # e.g. „Ricky!" → „Ricky!   (Gemini added close to a genuine opener)
+                    stripped = _re.sub(r'[\u201c\u201d"]([,!?.])?\s*$',
+                                        lambda m: (m.group(1) or ''),
+                                        fixed).rstrip()
+                    if _QE_STARTS_OPEN.match(stripped):
+                        fixed = stripped
+            # Orphan check for INLINE_SPLIT rows: if the last „ has no closing " after
+            # it, append one. Only fires when _last_open_o > 0 (second „, not position 0)
+            # so genuine single-segment openers are left untouched.
+            _last_open_o = fixed.rfind(_QE_OPEN)
+            if _last_open_o > 0 and not _QE_ANY_CLOSE_RE.search(fixed[_last_open_o + 1:]):
+                fixed = fixed + _QE_CLOSE
 
         elif role == "close":
             # Ensure a closing " is present.
@@ -2212,7 +2228,10 @@ def run_test():
     k9_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_9") else "⚠️  not set"
     k10_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_10") else "⚠️  not set"
     k11_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_11") else "⚠️  not set"
-    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status} | key 11: {k11_status}")
+    k12_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_12") else "⚠️  not set"
+    k13_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_13") else "⚠️  not set"
+    k14_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_14") else "⚠️  not set"
+    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status} | key 11: {k11_status} | key 12: {k12_status} | key 13: {k13_status} | key 14: {k14_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2293,7 +2312,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'} | key 11: {'configured' if os.environ.get('GEMINI_API_KEY_11') else 'not set'}\n"
+        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'} | key 11: {'configured' if os.environ.get('GEMINI_API_KEY_11') else 'not set'} | key 12: {'configured' if os.environ.get('GEMINI_API_KEY_12') else 'not set'} | key 13: {'configured' if os.environ.get('GEMINI_API_KEY_13') else 'not set'} | key 14: {'configured' if os.environ.get('GEMINI_API_KEY_14') else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
