@@ -82,6 +82,11 @@ Each object must have exactly:
   "content": rephrased German text
 Example: [{"sort": 0, "content": "rephrased line"}, {"sort": 1, "content": "..."}]
 
+🚫 ROW BOUNDARIES ARE ABSOLUTE: Each sort number maps to exactly one row of the original text.
+Never merge content from two rows into one, and never split one row's content across two.
+Never move a Begleitsatz (e.g. "sagte er", "flüsterte sie") from one row into an adjacent row.
+If a row contains only a short attribution clause, output exactly that — do not borrow from neighbours.
+
 CAPITALIZATION & SOURCE FORMATTING
 - All-caps lines: rephrase in ALL CAPS (e.g. "GRAND KING" → "GROẞER KÖNIG")
 - Lines beginning with "Kapitel": capitalize first letter of each word (e.g. "Kapitel 168 Sie Überraschte Wilbur")
@@ -732,6 +737,19 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if result is None:
                 log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
                 return None
+        # ── Guard 1: Missing-sort reconciliation ────────────────────────────────
+        # Gemini occasionally returns fewer rows than were sent (output truncation,
+        # dropped rows under context pressure). Any missing sort number means that
+        # row would be absent from the final output — structural corruption.
+        # Detect and fill with the machine translation so no row is ever lost.
+        _batch_sorts = {r.get("sort"): True for r in batch}
+        _result_sorts = {r.get("sort"): True for r in result}
+        _missing = [r for r in batch if r.get("sort") not in _result_sorts]
+        if _missing:
+            log(f"  ⚠️  Batch {i}: {len(_missing)} missing sort(s) from Gemini — restoring from MT: "
+                + ", ".join(str(r.get("sort")) for r in _missing))
+            for _mr in _missing:
+                result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -756,7 +774,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
-        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|wollte|schlug|beruhigte"
+        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -821,6 +839,62 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     comma_adds = 0
     dash_fixes = 0
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+
+    # ── Pre-Pass QE: BGS confusion guard ─────────────────────────────────────────
+    # Gemini occasionally outputs a pure Begleitsatz (attribution clause) for a row
+    # whose English source is dialogue (starts with "). This is a structural error:
+    # a dialogue row must contain speech content, not just "erwiderte Hendrick.".
+    # Caused by Gemini merging rows across sort boundaries under prompt pressure.
+    # Fix: detect the mismatch and restore the row from the machine translation.
+    # Pass QE will then correctly apply the quote structure on the restored text.
+    #
+    # Detection: eng starts with " (dialogue) AND German output matches Begleitsatz.
+    # A genuine Begleitsatz never starts with a quote character, so testing the raw
+    # output (not stripped) is safe — "„Ich schoss..." does NOT match BGS.
+    _mt_by_sort_pre = {r.get("sort", i): r.get("content", "")
+                       for i, r in enumerate(input_data)}
+    _eng_by_sort_pre = {r.get("sort", i): r.get("original", "")
+                        for i, r in enumerate(input_data)}
+    _bgs_confusion_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        out    = row.get("content", "").strip()
+        eng_s  = _eng_by_sort_pre.get(sort_n, "")
+        mt_s   = _mt_by_sort_pre.get(sort_n, "")
+        # Guard 2: restore empty/whitespace rows from MT
+        if not out:
+            if mt_s:
+                row["content"] = mt_s
+                _bgs_confusion_fixes += 1
+                log(f"  ⚠️  Empty row: sort={sort_n} restored from MT {mt_s[:60]!r}")
+            continue
+        if not eng_s or not mt_s: continue
+        # General row-misalignment guard:
+        # A bare Begleitsatz ("erwiderte er.", "fragte sie leise.") is NEVER a valid
+        # standalone translated row unless the English source itself is a short
+        # attribution sentence ("she asked.", "Petter said.").  Any other row type
+        # (dialogue, narrative, description) producing a BGS as output means Gemini
+        # has injected content from an adjacent row — restore from MT.
+        # This covers both dialogue rows AND narrative rows receiving displaced BGS.
+        _eng_is_attribution = (
+            not eng_s.lstrip().startswith('"')           # not itself dialogue
+            and len(eng_s.split()) <= 8                    # short sentence
+            and bool(_re.search(
+                r'\b(?:said|asked|replied|answered|whispered|shouted|called|muttered|'
+                r'remarked|added|continued|insisted|demanded|exclaimed|cried|'
+                r'explained|told|warned|ordered|nodded|smiled|sighed|'
+                r'laughed|teased|snapped|groaned|sobbed|gasped|hissed|'
+                r'growled|chuckled|corrected|interrupted|murmured|suggested|'
+                r'conceded|admitted|acknowledged|declared|announced|breathed)\b',
+                eng_s, _re.IGNORECASE))
+        )
+        if _is_begleitsatz(out) and not _eng_is_attribution:
+            row["content"] = mt_s
+            _bgs_confusion_fixes += 1
+            log(f"  ⚠️  BGS confusion: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
+    if _bgs_confusion_fixes:
+        log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
+
 
     # ── Pass QE: Deterministic quote structure enforcement ────────────────────
     # Replaces the fragile Pass 0 + Rule H approach.
@@ -887,22 +961,32 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if not _QE_STARTS_OPEN.match(fixed):
                 fixed = _QE_OPEN + fixed
             if not _QE_ANY_CLOSE_RE.search(fixed[1:]):
-                # No closing quote anywhere: check for inline attribution verb.
-                # INLINE_BGS: English "Speech," she said. ends with . after attr verb
-                # so _classify returns "open" (no closing " at end of English).
-                # German needs " inserted before the attribution verb.
-                # „Speech, neckte sie ihn. → „Speech“, neckte sie ihn.
-                _m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
-                if _m_sv_a:
-                    fixed = fixed[:_m_sv_a.start()] + _QE_CLOSE + fixed[_m_sv_a.start():]
-                else:
-                    _m_sv_b = _re.search(
-                        r'(?<=[a-z\u00e4\u00f6\u00fc\u00df!?. ])\s+('+ _SV + r')\b',
-                        fixed, _re.IGNORECASE
-                    )
-                    if _m_sv_b:
-                        fixed = fixed[:_m_sv_b.start()] + _QE_CLOSE + fixed[_m_sv_b.start():]
-                    # else: genuine multi-row opener, leave without closing "
+                # No closing quote in German output. Only insert one if the English
+                # source ALSO has a closing quote after the opening one (INLINE_BGS).
+                # If English is a genuine multi-row opener like "I shot his leg.
+                # (no second quote at all), do NOT insert — the dialogue continues below.
+                # This guards against _SV false-positives such as "schoss" (fired a shot)
+                # being mistaken for an attribution verb.
+                # Strip the leading quote from English, then check if ANY further quote
+                # character remains anywhere in the rest of the line.
+                # Note: _QE_ENG_CLOSE_RE only matches at end-of-string — wrong for
+                # INLINE_BGS where the close is mid-sentence ("Speech," she said.).
+                # Using _QE_ANY_CLOSE_RE (matches anywhere) is the correct check.
+                _eng_rest = _re.sub(r'^[„“”\'"\u00ab]+', '', eng.lstrip())
+                _eng_has_inline_close = bool(_QE_ANY_CLOSE_RE.search(_eng_rest))
+                if _eng_has_inline_close:
+                    # INLINE_BGS confirmed — insert “ before attribution verb.
+                    _m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
+                    if _m_sv_a:
+                        fixed = fixed[:_m_sv_a.start()] + _QE_CLOSE + fixed[_m_sv_a.start():]
+                    else:
+                        _m_sv_b = _re.search(
+                            r'(?<=[a-z\u00e4\u00f6\u00fc\u00df!?. ])\s+('+ _SV + r')\b',
+                            fixed, _re.IGNORECASE
+                        )
+                        if _m_sv_b:
+                            fixed = fixed[:_m_sv_b.start()] + _QE_CLOSE + fixed[_m_sv_b.start():]
+                # else: genuine multi-row opener — no closing quote needed here
             else:
                 # Has a closing quote: only strip if spuriously at the very end.
                 # e.g. „Ricky!“ → „Ricky!   (Gemini added close to a genuine opener)
