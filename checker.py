@@ -775,7 +775,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
         r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
-        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
+        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte||wollte||sprach|beruhigte|"
         # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
         r"wollte|beruhigte|erwähnte|wies"
     )
