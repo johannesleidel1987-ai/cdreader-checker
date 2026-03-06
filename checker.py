@@ -32,8 +32,6 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_7", ""),
     os.environ.get("GEMINI_API_KEY_8", ""),
     os.environ.get("GEMINI_API_KEY_9", ""),
-    os.environ.get("GEMINI_API_KEY_10", ""),
-    os.environ.get("GEMINI_API_KEY_11", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -731,7 +729,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    log(f"  Using {key_count} Gemini key(s) (keys 1-11) with automatic rotation on 429.")
+    log(f"  Using {key_count} Gemini key(s) (keys 1-9) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
@@ -779,9 +777,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
         r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
-        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte||wollte||sprach|beruhigte|"
+        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
         # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
-        r"wollte|beruhigte|erwähnte|wies"
+        r"wollte|beruhigte|erwähnte|wies|sprach"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -1450,6 +1448,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     ]
 
     if similar_rows:
+        # Hard cap: if more than 15 rows need retrying something is systematically wrong
+        # (e.g. a bug caused mass MT restoration). Retry only the longest rows up to
+        # this cap rather than spinning off 50+ individual Gemini calls and timing out.
+        _SIM_MAX_RETRIES = 15
+        if len(similar_rows) > _SIM_MAX_RETRIES:
+            log(f"  ⚠️  Similarity guard: {len(similar_rows)} rows flagged — capped at {_SIM_MAX_RETRIES} "
+                f"(longest rows prioritised). High count likely indicates a systematic issue.")
+            similar_rows = sorted(similar_rows, key=lambda x: len(x[1].split()), reverse=True)[:_SIM_MAX_RETRIES]
         log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
         rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
 
@@ -2202,9 +2208,7 @@ def run_test():
     k7_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_7") else "⚠️  not set"
     k8_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_8") else "⚠️  not set"
     k9_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_9") else "⚠️  not set"
-    k10_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_10") else "⚠️  not set"
-    k11_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_11") else "⚠️  not set"
-    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status} | key 11: {k11_status}")
+    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2285,7 +2289,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'} | key 11: {'configured' if os.environ.get('GEMINI_API_KEY_11') else 'not set'}\n"
+        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
