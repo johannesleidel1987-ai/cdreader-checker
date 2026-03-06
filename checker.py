@@ -32,6 +32,7 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_7", ""),
     os.environ.get("GEMINI_API_KEY_8", ""),
     os.environ.get("GEMINI_API_KEY_9", ""),
+    os.environ.get("GEMINI_API_KEY_10", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -75,7 +76,7 @@ You are an experienced German creative writer and senior editor. Your task is to
 
 ⚠️ IMPORTANT: The input is a machine translation that often sounds flat and unnatural. Your output must read noticeably better than the input — eliminating awkward phrasing, stiff word order, and literal translations wherever they occur. The goal is authentic German prose.
 
-🚫 HARD RULE: Every single row you return MUST differ from the input — even if only by a synonym substitution or slight restructuring. Returning a row identical to the input is a validation failure that causes CDReader to reject the entire chapter. If a row is already natural, find the smallest natural improvement (word choice, sentence rhythm) rather than leaving it unchanged.
+📌 SELECTIVE REPHRASE RULE: Only rephrase rows where the German machine translation is genuinely awkward, stilted, or unnatural. If a row already reads as fluent, idiomatic German, return it exactly as-is — unchanged is the correct answer for well-translated rows. Aim to rephrase approximately 20–25% of all rows in the batch: those where improvement is clearly warranted. CDReader requires a minimum 15% modification rate across the chapter — do not fall below this floor, but do not force unnecessary changes above 25%.
 
 OUTPUT FORMAT (CRITICAL)
 Return ONLY a valid JSON array — no markdown, no preamble, no explanation.
@@ -587,10 +588,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
             f"  - \"content\": German machine translation — this is what you MUST rephrase. "
             f"Rewrite it in natural, idiomatic German while preserving the exact meaning. "
-            f"Your output must differ from the input in vocabulary or sentence structure — "
-            f"returning a row IDENTICAL to the input is a hard validation error and will "
-            f"cause CDReader to reject the entire chapter. Even short rows must have "
-            f"at minimum a small synonym substitution or word-order change.\n"
+            f"Only rephrase rows where the machine translation is genuinely awkward, stiff, or unnatural — "
+            f"if a row already reads as natural German, return it unchanged. "
+            f"Target: rephrase approximately 20–25% of rows in this batch.\n"
             f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
             f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
         )
@@ -729,7 +729,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    log(f"  Using {key_count} Gemini key(s) (keys 1-9) with automatic rotation on 429.")
+    log(f"  Using {key_count} Gemini key(s) (keys 1-10) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
@@ -1322,6 +1322,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     # ── Mandatory change pass: retry rows returned verbatim by Gemini ───────────
     # CDReader rejects chapters where too many rows are unchanged from machine translation.
+    # GATE: Under selective-rephrase mode, Gemini intentionally leaves natural rows unchanged.
+    # Only fire if the chapter modification rate is below the CDReader floor (18% = 3pt buffer
+    # above CDReader's 15% block threshold). If already above floor, skip entirely.
+    # If below floor, only retry the minimum rows needed to reach 18% — not all verbatim rows.
     _input_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
     _mandatory_retry = [
         (row.get("sort"), row.get("content", ""), _input_by_sort.get(row.get("sort"), ""))
@@ -1330,10 +1334,24 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         and row.get("content", "").strip() == _input_by_sort.get(row.get("sort"), "").strip()
         and len(row.get("content", "").split()) >= 4
     ]
-    if _mandatory_retry:
-        log(f"  🔄 Mandatory change pass: {len(_mandatory_retry)} verbatim row(s)...")
+
+    _MODIFICATION_FLOOR = 0.18
+    _total_rows_for_gate = sum(1 for r in all_rephrased if _input_by_sort.get(r.get("sort"), ""))
+    _mod_rate_gate = (
+        (_total_rows_for_gate - len(_mandatory_retry)) / _total_rows_for_gate
+        if _total_rows_for_gate else 0.0
+    )
+    log(f"  [MOD RATE] before mandatory retry: {_mod_rate_gate:.0%} ({_total_rows_for_gate - len(_mandatory_retry)}/{_total_rows_for_gate} rows modified, {len(_mandatory_retry)} verbatim)")
+
+    if _mod_rate_gate >= _MODIFICATION_FLOOR:
+        log(f"  ✅ Mandatory change pass: rate {_mod_rate_gate:.0%} ≥ {_MODIFICATION_FLOOR:.0%} floor — skipping.")
+    elif _mandatory_retry:
+        _needed = max(1, int(_MODIFICATION_FLOOR * _total_rows_for_gate) - (_total_rows_for_gate - len(_mandatory_retry)))
+        # Prioritise longer rows — they benefit most from rephrasing and move the rate furthest
+        _mandatory_retry_capped = sorted(_mandatory_retry, key=lambda x: len(x[1].split()), reverse=True)[:_needed]
+        log(f"  🔄 Mandatory change pass: rate={_mod_rate_gate:.0%} < floor — retrying {len(_mandatory_retry_capped)}/{len(_mandatory_retry)} verbatim row(s) to reach {_MODIFICATION_FLOOR:.0%}...")
         rephrased_by_sort_m = {r.get("sort"): r for r in all_rephrased}
-        for sort_n, current_out, orig_inp in _mandatory_retry:
+        for sort_n, current_out, orig_inp in _mandatory_retry_capped:
             retry_prompt = (
                 "Du bist ein erfahrener deutscher Lektor. Formuliere diesen deutschen Satz um — "
                 "verwende andere Worte oder Satzstruktur, ohne die Bedeutung zu verändern. "
@@ -1367,7 +1385,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     log(f"    ⚠️  sort={sort_n} retry error: {exc}"); continue
         all_rephrased = sorted(rephrased_by_sort_m.values(), key=lambda r: r.get("sort", 0))
     else:
-        log(f"  ✅ Mandatory change pass: all rows were modified.")
+        log(f"  ✅ Mandatory change pass: no verbatim rows to retry.")
 
     # ── Similarity guard: retry rows too similar to CDReader's reference texts ──
     # CDReader triggers ErrMessage10 when submitted text is too similar to its
@@ -1389,9 +1407,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         no, nr = _norm(output), _norm(ref)
         return max(_jaccard(no, nr), _trigram(no, nr))
 
-    SIM_THRESHOLD = 0.90   # flag rows at or above this combined similarity
-    # 0.90 chosen because Jaccard word-overlap scores well-rephrased sentences at 50-75%;
-    # only genuinely unchanged or near-identical rows score above 90%.
+    SIM_THRESHOLD = 0.97   # flag rows at or above this combined similarity
+    # Raised from 0.90 to 0.97: under selective-rephrase mode Gemini intentionally leaves
+    # natural rows unchanged. Rows at 90-96% similarity already have meaningful differences;
+    # only near-verbatim output (≥97%) warrants a re-request, and only if the chapter
+    # modification rate is still below the CDReader floor (see gate below).
 
     # chapterConetnt is ENGLISH \u2014 only compare against machineChapterContent (German).
     # Read machineChapterContent directly from raw API rows.
@@ -1448,68 +1468,78 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     ]
 
     if similar_rows:
-        log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
-        rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
+        # Chapter-level gate: same floor logic as mandatory retry.
+        # After mandatory retry, recompute modification rate from current _sim_scores.
+        # Rows scoring < 0.99 are considered "modified" for floor purposes.
+        _MODIFICATION_FLOOR = 0.18
+        _sim_modified = sum(1 for _, _, _, s in _sim_scores if s < 0.99)
+        _sim_mod_rate = _sim_modified / _total_checked if _total_checked else 0.0
+        log(f"  [MOD RATE] before similarity guard: {_sim_mod_rate:.0%} ({_sim_modified}/{_total_checked} rows modified)")
+        if _sim_mod_rate >= _MODIFICATION_FLOOR:
+            log(f"  ✅ Similarity guard: rate {_sim_mod_rate:.0%} ≥ {_MODIFICATION_FLOOR:.0%} floor — skipping re-requests.")
+        else:
+            log(f"  🔄 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} — re-requesting...")
+            rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
 
-        for sort_n, current_out, ref_text, sim in similar_rows:
-            log(f"    sort={sort_n} sim={sim:.0%}: {current_out[:70]!r}")
+            for sort_n, current_out, ref_text, sim in similar_rows:
+                log(f"    sort={sort_n} sim={sim:.0%}: {current_out[:70]!r}")
 
-            retry_row = [{"sort": sort_n, "reference": ref_text, "content": current_out}]
-            retry_prompt = (
-                BASE_PROMPT + "\n\n"
-                "SIMILARITY RE-REQUEST \u2014 ONE ROW ONLY\n"
-                "The row below was flagged: its current rephrasing is too similar to "
-                "the reference text (" + f"{sim:.0%}" + " similarity). "
-                "CDReader will reject the chapter if this is not improved. "
-                "Rewrite it with clearly different vocabulary and/or sentence structure "
-                "while preserving the exact same meaning. "
-                "Natural, idiomatic German is still the priority \u2014 do not produce "
-                "stilted language just to differ.\n\n"
-                "  - \"reference\": the text your output must clearly differ from\n"
-                "  - \"content\": the current phrasing to improve\n\n"
-                "Return ONLY a JSON array with one object: "
-                "{\"sort\": <number>, \"content\": \"<rewritten text>\"}\n"
-                + json.dumps(retry_row, ensure_ascii=False)
-            )
+                retry_row = [{"sort": sort_n, "reference": ref_text, "content": current_out}]
+                retry_prompt = (
+                    BASE_PROMPT + "\n\n"
+                    "SIMILARITY RE-REQUEST \u2014 ONE ROW ONLY\n"
+                    "The row below was flagged: its current rephrasing is too similar to "
+                    "the reference text (" + f"{sim:.0%}" + " similarity). "
+                    "CDReader will reject the chapter if this is not improved. "
+                    "Rewrite it with clearly different vocabulary and/or sentence structure "
+                    "while preserving the exact same meaning. "
+                    "Natural, idiomatic German is still the priority \u2014 do not produce "
+                    "stilted language just to differ.\n\n"
+                    "  - \"reference\": the text your output must clearly differ from\n"
+                    "  - \"content\": the current phrasing to improve\n\n"
+                    "Return ONLY a JSON array with one object: "
+                    "{\"sort\": <number>, \"content\": \"<rewritten text>\"}\n"
+                    + json.dumps(retry_row, ensure_ascii=False)
+                )
 
-            retry_result = None
-            try:
-                keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS
-                for api_key in keys_to_try:
-                    try:
-                        r_resp = requests.post(
-                            f"{GEMINI_URL}?key={api_key}",
-                            json={
-                                "contents": [{"parts": [{"text": retry_prompt}]}],
-                                "generationConfig": {"temperature": 0.9, "maxOutputTokens": 512},
-                            },
-                            timeout=45,
-                        )
-                        if r_resp.status_code == 429:
+                retry_result = None
+                try:
+                    keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS
+                    for api_key in keys_to_try:
+                        try:
+                            r_resp = requests.post(
+                                f"{GEMINI_URL}?key={api_key}",
+                                json={
+                                    "contents": [{"parts": [{"text": retry_prompt}]}],
+                                    "generationConfig": {"temperature": 0.9, "maxOutputTokens": 512},
+                                },
+                                timeout=45,
+                            )
+                            if r_resp.status_code == 429:
+                                continue
+                            r_resp.raise_for_status()
+                            r_body = r_resp.json()
+                            r_text = r_body["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if r_text.startswith("```"):
+                                r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                            parsed = json.loads(r_text)
+                            if isinstance(parsed, list) and parsed:
+                                retry_result = parsed[0].get("content", "").strip()
+                            break
+                        except Exception:
                             continue
-                        r_resp.raise_for_status()
-                        r_body = r_resp.json()
-                        r_text = r_body["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        if r_text.startswith("```"):
-                            r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                        parsed = json.loads(r_text)
-                        if isinstance(parsed, list) and parsed:
-                            retry_result = parsed[0].get("content", "").strip()
-                        break
-                    except Exception:
-                        continue
-            except Exception as exc:
-                log(f"    \u26a0\ufe0f  Similarity retry exception: {exc}")
+                except Exception as exc:
+                    log(f"    \u26a0\ufe0f  Similarity retry exception: {exc}")
 
-            if retry_result and retry_result != current_out:
-                new_sim = _row_sim(retry_result, ref_text)
-                log(f"    \u2705 sort={sort_n} new sim={new_sim:.0%}: {retry_result[:70]!r}")
-                rephrased_by_sort[sort_n]["content"] = retry_result
-            else:
-                log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged or failed, keeping original")
-            time.sleep(1)  # avoid RPM burnout across multiple similarity retries
+                if retry_result and retry_result != current_out:
+                    new_sim = _row_sim(retry_result, ref_text)
+                    log(f"    \u2705 sort={sort_n} new sim={new_sim:.0%}: {retry_result[:70]!r}")
+                    rephrased_by_sort[sort_n]["content"] = retry_result
+                else:
+                    log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged or failed, keeping original")
+                time.sleep(1)  # avoid RPM burnout across multiple similarity retries
 
-        all_rephrased = sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
+            all_rephrased = sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
     else:
         log(f"  \u2705 Similarity guard: all rows within threshold.")
 
@@ -2200,7 +2230,8 @@ def run_test():
     k7_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_7") else "⚠️  not set"
     k8_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_8") else "⚠️  not set"
     k9_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_9") else "⚠️  not set"
-    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status}")
+    k10_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_10") else "⚠️  not set"
+    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2281,7 +2312,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'}\n"
+        f"🔑 Key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | Key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | Key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | Key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | Key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
