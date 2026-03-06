@@ -85,7 +85,7 @@ Example: [{"sort": 0, "content": "rephrased line"}, {"sort": 1, "content": "..."
 CAPITALIZATION & SOURCE FORMATTING
 - All-caps lines: rephrase in ALL CAPS (e.g. "GRAND KING" → "GROẞER KÖNIG")
 - Lines beginning with "Kapitel": capitalize first letter of each word (e.g. "Kapitel 168 Sie Überraschte Wilbur")
-- Lines containing only punctuation or single words (e.g. "!" or "Los!"): retain exactly as-is
+- Lines containing only punctuation or single words (e.g. "!", "Los!", "Emma!", "Liz!"): retain EXACTLY as-is — do NOT add words, context, or imperative verbs
 - Standard lines: standard German capitalization rules
 
 LINGUISTIC GUIDELINES
@@ -756,7 +756,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
         r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
         r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
-        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|wollte|beruhigte|schlug"
+        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|wollte|schlug|beruhigte"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -970,21 +970,24 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         cn1     = row_n1.get("content", "").strip()
 
         # ── Type A: inline attribution also left stranded in next row ──
-        m_inline = _re.search(r'[“”"]+\s*,\s*(.+)$', cn)
+        # Root cause: Gemini merges speech + Begleitsatz into row N (e.g.
+        # „Seid ihr bereit?", fragte Peter.) while row N+1 correctly has the
+        # Begleitsatz on its own. Fix: strip the stranded attribution from row N.
+        # Row N+1 is already correct — leave it alone.
+        # The old guard `orig_n1 != cn1` blocked this when MT == Gemini output
+        # for the Begleitsatz (perfectly normal for a short attribution). Removed.
+        m_inline = _re.search(r'[\u201c\u201d"]+\s*,\s*(.+)$', cn)
         if m_inline:
             inline_bgs = m_inline.group(1).strip()
             if inline_bgs and cn1 and (
                 inline_bgs.lower() == cn1.lower() or
                 inline_bgs.lower().rstrip(".") == cn1.lower().rstrip(".")
             ):
-                orig_n1 = _orig_by_sort.get(row_n1.get("sort"), "")
-                if orig_n1 and orig_n1.strip() != cn1:
-                    row_n1["content"] = orig_n1
-                    _dup_fixes += 1
-                    row_n["content"] = _re.sub(
-                        r"\s*,\s*" + _re.escape(inline_bgs) + r"\s*$", "", cn
-                    ).rstrip(",").rstrip()
-                    continue  # pair handled
+                row_n["content"] = _re.sub(
+                    r"\s*,\s*" + _re.escape(inline_bgs) + r"\s*$", "", cn
+                ).rstrip(",").rstrip()
+                _dup_fixes += 1
+                continue  # pair handled; row N+1 left as-is
 
         # ── Type B: row N+1 starts with full content of row N ──
         # Gemini puts dialogue+attribution in row N+1, while row N has only the dialogue.
@@ -1001,6 +1004,26 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 # Restore row N+1 from its original machine translation
                 row_n1["content"] = orig_n1
                 _dup_fixes += 1
+
+    # ── Single-word source guard ────────────────────────────────────────
+    # Gemini occasionally expands single-word rows (e.g. "Liz!" → "Liz, stopp!")
+    # violating the prompt rule "single words: retain exactly as-is".
+    # Guard: if MT has exactly 1 meaningful word and the output keeps that
+    # word as its first token but adds more — restore from MT.
+    # Legitimate rephrasing ("Okay." → "In Ordnung.") has a different first
+    # token and is NOT affected by this guard.
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        out    = row.get("content", "")
+        mt     = (_orig_by_sort.get(sort_n) or "").strip()
+        if not mt or not out: continue
+        _mt_words  = _re.findall(r"[a-zA-ZäöüÄÖÜß']+", mt)
+        _out_words = _re.findall(r"[a-zA-ZäöüÄÖÜß']+", out)
+        if len(_mt_words) != 1: continue          # only single-word sources
+        if len(_out_words) <= 1: continue         # output already single word
+        if _out_words[0].lower() != _mt_words[0].lower(): continue  # legitimate rephrase
+        row["content"] = mt
+        log(f"  ⚠️  Single-word guard: sort={sort_n} restored from {out!r} → {mt!r}")
 
     if _dup_fixes:
         log(f"  🔁 Post-processing: fixed {_dup_fixes} duplicate content row(s).")
