@@ -30,6 +30,8 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_5", ""),
     os.environ.get("GEMINI_API_KEY_6", ""),
     os.environ.get("GEMINI_API_KEY_7", ""),
+    os.environ.get("GEMINI_API_KEY_8", ""),
+    os.environ.get("GEMINI_API_KEY_9", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -727,7 +729,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    log(f"  Using {key_count} Gemini key(s) (keys 1-6) with automatic rotation on 429.")
+    log(f"  Using {key_count} Gemini key(s) (keys 1-9) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
@@ -2196,7 +2198,9 @@ def run_test():
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
     k6_status = "✅ configured" if GEMINI_API_KEY_6 else "⚠️  not set"
     k7_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_7") else "⚠️  not set"
-    log(f"Gemini key 6: {k6_status} | key 7: {k7_status}")
+    k8_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_8") else "⚠️  not set"
+    k9_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_9") else "⚠️  not set"
+    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status}")
     log("=" * 60)
 
     # Synthetic test rows — realistic German pre-translation content
@@ -2277,7 +2281,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'}\n"
+        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
