@@ -48,5 +48,8 @@ jobs:
           GEMINI_API_KEY_9: ${{ secrets.GEMINI_API_KEY_9 }}
           GEMINI_API_KEY_10: ${{ secrets.GEMINI_API_KEY_10 }}
           GEMINI_API_KEY_11: ${{ secrets.GEMINI_API_KEY_11 }}
+          GEMINI_API_KEY_12: ${{ secrets.GEMINI_API_KEY_12 }}
+          GEMINI_API_KEY_13: ${{ secrets.GEMINI_API_KEY_13 }}
+          GEMINI_API_KEY_14: ${{ secrets.GEMINI_API_KEY_14 }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
         run: python checker.py
