@@ -96,7 +96,7 @@ If a row contains only a short attribution clause, output exactly that — do no
 
 CAPITALIZATION & SOURCE FORMATTING
 - All-caps lines: rephrase in ALL CAPS (e.g. "GRAND KING" → "GROẞER KÖNIG")
-- Lines beginning with "Kapitel": capitalize first letter of each word (e.g. "Kapitel 168 Sie Überraschte Wilbur")
+- Lines beginning with "Kapitel": capitalize first letter of each word, no colon after the chapter number (e.g. "Kapitel 168 Sie Überraschte Wilbur")
 - Lines containing only punctuation or single words (e.g. "!", "Los!", "Emma!", "Liz!"): retain EXACTLY as-is — do NOT add words, context, or imperative verbs
 - Standard lines: standard German capitalization rules
 
@@ -727,14 +727,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 continue
         return None  # all rotations exhausted
 
+    # Sort=0 is always the chapter title row (e.g. "Kapitel 60 Auftauchen Und Das Rampenlicht Stehlen!").
+    # Gemini cannot return valid JSON for a 6-word title row reliably, and rephrasing it produces
+    # wrong output (all-lowercase, restructured titles). Bypass Gemini for sort=0 entirely —
+    # pass it through unchanged and let Rule G enforce correct title-case in post-processing.
+    _title_row = next((r for r in input_data if r.get("sort") == 0), None)
+    gemini_input_data = [r for r in input_data if r.get("sort") != 0]
+
     # Split into batches and call Gemini for each
-    batches = [input_data[i:i+BATCH_SIZE] for i in range(0, len(input_data), BATCH_SIZE)]
+    batches = [gemini_input_data[i:i+BATCH_SIZE] for i in range(0, len(gemini_input_data), BATCH_SIZE)]
     total_batches = len(batches)
-    log(f"  Splitting {len(input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
+    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    log(f"  Using {key_count} Gemini key(s) (keys 1-9) with automatic rotation on 429.")
+    log(f"  Using {key_count} Gemini key(s) (keys 1-{key_count}) with automatic rotation on 429.")
     for i, batch in enumerate(batches, 1):
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
         next_first = batches[i][0] if i < total_batches else None
@@ -768,6 +775,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             time.sleep(5)
 
     log(f"  Total rows rephrased: {len(all_rephrased)}")
+
+    # Re-inject the bypassed title row (sort=0) with its original content.
+    # Rule G (post-processing below) will enforce correct title-case formatting.
+    if _title_row is not None:
+        all_rephrased.append({"sort": 0, "content": _title_row.get("content", ""),
+                               "_quote_role": _title_row.get("_quote_role", "none")})
+        all_rephrased = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
 
     # ── Post-process: German dialogue punctuation enforcement ─────────────────
     import re as _re
@@ -1237,14 +1251,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 row["content"] = c_f
                 comma_adds += 1
 
-        # Rule G: Title-case Kapitel header rows.
-        # Strip any colon after the chapter number (model sometimes adds 'Kapitel 210: Title')
-        # then capitalise first letter of every word.
-        if _re.match(r'^Kapitel\s+\d+', c):
-            c_g = _re.sub(r'^(Kapitel\s+\d+)\s*:\s*', r'\1 ', c).strip()
-            titled = ' '.join(w[0].upper() + w[1:] if w else w for w in c_g.split(' '))
-            if titled != c:
-                row['content'] = titled
+        # Rule G: Enforce canonical Kapitel header format: "Kapitel N Title Case Title"
+        # Gemini sometimes returns headers all-lowercase, with a spurious colon, or with
+        # wrong casing. Match case-insensitively to catch "kapitel 60 ..." variants.
+        # Canonical form: "Kapitel {N} {Each Word Title-Cased}" (no colon)
+        if _re.match(r'^[Kk]apitel\s+\d+', c):
+            _m_g = _re.match(r'^[Kk]apitel\s+(\d+)\s*:?\s*(.*)', c, _re.DOTALL)
+            if _m_g:
+                _num_g  = _m_g.group(1)
+                _rest_g = _m_g.group(2).strip()
+                # Title-case each word in the rest
+                _rest_titled = ' '.join(w[0].upper() + w[1:] if w else w
+                                        for w in _rest_g.split(' '))
+                titled = f"Kapitel {_num_g} {_rest_titled}" if _rest_titled else f"Kapitel {_num_g}"
+                if titled != c:
+                    row['content'] = titled
         # Rule H2: Insert missing closing “ after ?/! when dialogue is followed by
         # a new sentence in the same row (opening „ present, closing “ absent).
         # e.g. „Wo bist du? Emmas Sorge vertiefte sich.“ → „Wo bist du?“ Emmas ...
@@ -1347,6 +1368,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if _input_by_sort.get(row.get("sort"), "")
         and row.get("content", "").strip() == _input_by_sort.get(row.get("sort"), "").strip()
         and len(row.get("content", "").split()) >= 4
+        and row.get("sort") != 0  # chapter title row — correct to be verbatim, never retry
     ]
     if _mandatory_retry:
         log(f"  🔄 Mandatory change pass: {len(_mandatory_retry)} verbatim row(s)...")
@@ -1463,6 +1485,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Never rewrite dialogue rows — speech content is constrained by meaning;
         # high similarity to the machine translation is expected and correct.
         and not any(q in out for q in ('„', '“', '”'))
+        and sn != 0  # chapter title row — always verbatim by design
     ]
 
     if similar_rows:
