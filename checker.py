@@ -801,7 +801,9 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
         r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück|"
         # Added: template row 30 — "neckte" (teased)
-        r"neckte"
+        r"neckte|"
+        # Added: Screenshot 2 — spottete (mocked), höhnte (sneered/jeered)
+        r"spottete|höhnte"
     )
     # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
     _NEGATION_AFTER_SV = _re.compile(
@@ -847,6 +849,47 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
 
 
+
+    def _is_continuation_row(text):
+        """Cross-row comma decision: True iff the next row syntactically continues
+        the preceding dialogue and therefore requires a trailing comma on the
+        closing-quote row.
+
+        Root cause of Screenshots 1 & 3:
+          • Screenshot 1 (false positive): 'Kaum hatte er mir einen Stirnkuss
+            gegeben, fragte ich.' → starts with uppercase 'K' → new sentence →
+            no comma warranted, but _is_begleitsatz with IGNORECASE matched
+            'fragte' anywhere and fired.
+          • Screenshot 3 (false negative): 'versuchte Hendrick, mich zu
+            beruhigen.' → starts lowercase 'v' → is a continuation → comma
+            warranted, but 'versuchte' was absent from _SV_CORE so the check
+            returned False.
+
+        Fix: In German prose, a Begleitsatz (attribution clause) that follows
+        closing dialogue is ALWAYS syntactically subordinate — it continues the
+        sentence opened by the dialogue and therefore NEVER capitalises its first
+        word.  Conversely, a new sentence (action, description, new speaker) ALWAYS
+        starts with an uppercase letter.  Capitalisation is therefore a sufficient
+        and unambiguous discriminant:
+
+            lowercase-first  → continuation → comma required
+            uppercase-first  → new sentence → no comma
+
+        This replaces _is_begleitsatz() for cross-row comma decisions.
+        _is_begleitsatz() is retained for the BGS confusion guard (Pre-Pass QE),
+        where the task is different: detecting whether Gemini's entire output IS
+        an attribution clause, not whether the next row continues from dialogue.
+
+        Edge-case guards:
+          • Empty text → False
+          • Row ending with ':' → introduces new speech, does not attribute old
+            speech.  Even though it starts lowercase ('fragte sie: …'), no comma.
+        """
+        if not text or not text[0].islower():
+            return False
+        if text.rstrip().endswith(':'):
+            return False
+        return True
 
     comma_fixes = 0
     comma_adds = 0
@@ -1055,6 +1098,31 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if _last_open >= 0 and not _QE_ANY_CLOSE_RE.search(fixed[_last_open + 1:]):
                 fixed = fixed + _QE_CLOSE
 
+            # ── Inline-attribution-dropped guard (Screenshot 2) ────────────────────
+            # Root cause: Gemini drops the inline attribution entirely.
+            # English: "Liz being Liz," he mocked.  -> after closing " comes ' he mocked.'
+            # German:  „Liz ist eben Liz, wie immer“, -> closing " placed but nothing after
+            # Detection:
+            #   1. English has meaningful content after its closing quote (>= 2 words)
+            #   2. German fixed has a closing quote but NO word follows it
+            # Fix: restore from MT which preserves the full sentence incl. attribution.
+            _eng_close_pos = max(eng.rfind('"'), eng.rfind('”'), eng.rfind('“'))
+            _eng_after_close = eng[_eng_close_pos + 1:].strip().lstrip(',').strip() if _eng_close_pos >= 0 else ""
+            _eng_has_inline_attr = len(_eng_after_close.split()) >= 2
+            _de_close_pos = max(fixed.rfind('"'), fixed.rfind('”'), fixed.rfind('“'))
+            _de_after_close = fixed[_de_close_pos + 1:].strip().lstrip(',').strip() if _de_close_pos >= 0 else ""
+            _de_has_inline_attr = len(_de_after_close.split()) >= 1
+            # Refinement: if German already contains an attribution verb, the
+            # attribution was NOT dropped — just the closing quote is missing.
+            # That is Pass QE territory. Only restore from MT when the attribution
+            # verb is genuinely absent from the German output.
+            _de_has_sv_inline = bool(_re.search(r'\b(?:' + _SV + r')\b', fixed, _re.IGNORECASE))
+            if _eng_has_inline_attr and not _de_has_inline_attr and not _de_has_sv_inline:
+                _mt_fallback = _mt_by_sort_pre.get(sort_n, "")
+                if _mt_fallback:
+                    fixed = _mt_fallback
+                    log(f"  ⚠️  Inline attr dropped: sort={sort_n} restored from MT {_mt_fallback[:60]!r}")
+
         if fixed != c:
             row["content"] = fixed
             qe_fixes += 1
@@ -1152,7 +1220,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if _re.search(r'[“”"],[.]$', c):
             c_base = c[:-3]           # everything before closing_quote
             c_quote = c[-3]           # the closing quote character
-            if _is_begleitsatz(next_content):
+            if _is_continuation_row(next_content):
                 c = c_base + "." + c_quote + ","   # „....",  (period inside, comma kept)
             else:
                 c = c_base + "." + c_quote          # „...."   (period inside, comma dropped)
@@ -1161,7 +1229,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
         # Rule B: Remove cross-row comma when next row is NOT a Begleitsatz.
         if len(c) >= 2 and c[-1] == ',' and c[-2] in ('"', '“', '”'):
-            if not _is_begleitsatz(next_content):
+            if not _is_continuation_row(next_content):
                 row["content"] = c[:-1]
                 c = c[:-1]
                 comma_fixes += 1
@@ -1170,7 +1238,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Applies to ALL closing quote variants including ?" and !" (same need for comma).
         # Cross-row: row ends with " (any variant, no comma yet) and next IS Begleitsatz.
         elif c and c[-1] in ('“', '”', '"') and not c.endswith(','):
-            if _is_begleitsatz(next_content):
+            if _is_continuation_row(next_content):
                 row["content"] = c + ","
                 c = c + ","
                 comma_adds += 1
@@ -1211,7 +1279,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 r'\1,\2', c
             )
             if c_e == c and (c.endswith(',“') or c.endswith(',"')):
-                if _is_begleitsatz(next_content):
+                if _is_continuation_row(next_content):
                     c_e = c[:-2] + c[-1] + ','
             if c_e != c:
                 row["content"] = c_e
@@ -1234,7 +1302,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             )
             # Cross-row: row ends with !" and next row is Begleitsatz
             if c_f == c and _re.search(r'![“"]$', c):
-                if _is_begleitsatz(next_content):
+                if _is_continuation_row(next_content):
                     c_f = c + ','
             if c_f != c:
                 row["content"] = c_f
