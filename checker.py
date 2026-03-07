@@ -11,6 +11,9 @@ import sys
 import time
 from datetime import datetime
 
+# Alias used throughout — avoids repeated local `import re` inside closures
+_re = re
+
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL    = "https://translatorserverwebapi-de.cdreader.com/api"
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -47,11 +50,8 @@ _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
 _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
 
 # Fallback chain — used when all Gemini keys hit their daily quota (RPD)
-#
-# Tier 1: Llama 3.3 70B via Groq (free, 14,400 RPD, CI-friendly)
-#   Set GROQ_API_KEY in GitHub Actions secrets to enable.
-#   Sign up at console.groq.com — no credit card required for free tier.
-# Fallback uses GEMINI_API_KEY_6 and GEMINI_API_KEY_7 (keys 6-7 in rotation pool above).
+# No automatic fallback is currently active; the run aborts and the next
+# scheduled run will retry with refreshed daily quotas.
 
 
 
@@ -418,30 +418,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         """
         Classify whether a text row is an opening, closing, middle, or standalone
         dialogue line based on quote balance.
-        Returns one of: "open", "close", "middle", "both", "none"
+        Returns one of: "open", "close", "middle_or_none", "both"
         """
-        import re as _re
-        # Strip whitespace
         t = text.strip()
-        # Count unescaped opening (« „ ") and closing (" » ") quote chars
-        # We look at start/end of text for German/English dialogue markers
-        opens = t.startswith(('„', '"', '„', '“'))
-        closes = t.endswith(('"', '»', '”', '"'))
-        # Also handle cases like: text ends with '" ' or '",' or '".'
-        closes = closes or bool(_re.search(r'["”»]\s*[,!?.]?\s*$', t))
-        opens = opens or bool(_re.match(r'^[„"„“«]', t))
+        # Use regex so the quote characters are explicit Unicode escapes, not invisible literals
+        opens  = bool(_re.match(r'^„|“|"|\xab', t))   # „ " " «
+        closes = bool(_re.search(r'[“”"\xbb]\s*[,!?.]?\s*$', t))  # " " " »
 
         if opens and closes:
             return "both"
-        elif opens and not closes:
+        elif opens:
             return "open"
-        elif closes and not opens:
+        elif closes:
             return "close"
-        elif not opens and not closes:
-            # Could be a middle dialogue line — check if it looks like speech
-            # Simple heuristic: if previous context is open dialogue, treat as middle
+        else:
             return "middle_or_none"
-        return "none"
 
     raw_contents = [
         # Use German machine translation as the text Gemini rephrases.
@@ -622,6 +613,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
         # RPD-exhausted keys (daily quota) are marked permanently and never retried.
         # Max full RPM-reset rotations before giving up: MAX_RETRIES_429
+        resp = None  # safe before first request; allows Retry-After header read in wait block
         full_rotations = 0
         while full_rotations < MAX_RETRIES_429:
             try:
@@ -751,16 +743,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         next_first = batches[i][0] if i < total_batches else None
         result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
         if result is None:
-            # All Gemini keys RPD-exhausted — no further fallback available.
-            if result is None:
-                log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
-                return None
+            log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
+            return None
         # ── Guard 1: Missing-sort reconciliation ────────────────────────────────
         # Gemini occasionally returns fewer rows than were sent (output truncation,
         # dropped rows under context pressure). Any missing sort number means that
         # row would be absent from the final output — structural corruption.
         # Detect and fill with the machine translation so no row is ever lost.
-        _batch_sorts = {r.get("sort"): True for r in batch}
         _result_sorts = {r.get("sort"): True for r in result}
         _missing = [r for r in batch if r.get("sort") not in _result_sorts]
         if _missing:
@@ -772,9 +761,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
         # RPD-exhausted keys are preserved in _rpd_exhausted_keys and not affected.
-        _exhausted_keys.difference_update(
-            [k for k in _exhausted_keys if k not in _rpd_exhausted_keys]
-        )
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
         if i < total_batches:
             time.sleep(5)
 
@@ -788,7 +775,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         all_rephrased = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
 
     # ── Post-process: German dialogue punctuation enforcement ─────────────────
-    import re as _re
     # _SV_CORE: Pure speech/communication verbs used for CROSS-ROW comma decisions
     # (Rules B and C). Must be conservative — these verbs almost exclusively signal
     # speech attribution and rarely appear as pure narrative action starters.
@@ -836,18 +822,20 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _re.IGNORECASE | _re.VERBOSE
     )
 
-    def _is_begleitsatz(text, _max_words=30):
+    def _is_begleitsatz(text, _max_words=15):
         """True only if text is a genuine attribution clause after dialogue.
         Guards against false positives:
           - Rows ending with ':' introduce NEW dialogue (not attributing previous speech)
-          - Very long rows (> max_words) that aren't attribution
+          - Long rows (> max_words=15) that aren't attribution — genuine Begleitsätze
+            are short (2-12 words typically). 30 was too permissive: "Er wollte sie
+            nicht wegen der Ereignisse..." (23w) matched 'er wollte' and triggered
+            a false positive restoration. 15 excludes all such narrative sentences.
           - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
         """
         # Inline speech: attribution verb followed by colon + uppercase = introduces
         # direct speech in the same row („Antwortete sie entschlossen: Nein.“) —
         # this is NOT a pure Begleitsatz following previous speech.
-        import re as _re_bgs
-        if _re_bgs.search(r':\s+[A-ZÄÖÜ]', text):
+        if _re.search(r':\s+[A-ZÄÖÜ]', text):
             return False
         if text.rstrip().endswith(':'):
             return False  # ends with ':' → introduces new speech, doesn't attribute old
@@ -857,12 +845,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             return False
         return bool(_BEGLEITSATZ_BASE.match(text))
 
-    # Alias for the rest of post-processing — replaces direct .match() calls
-    class _BGS:
-        @staticmethod
-        def match(text):
-            return _is_begleitsatz(text)
-    BEGLEITSATZ_PATTERN = _BGS()
+
 
 
     comma_fixes = 0
@@ -1169,7 +1152,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if _re.search(r'[“”"],[.]$', c):
             c_base = c[:-3]           # everything before closing_quote
             c_quote = c[-3]           # the closing quote character
-            if BEGLEITSATZ_PATTERN.match(next_content):
+            if _is_begleitsatz(next_content):
                 c = c_base + "." + c_quote + ","   # „....",  (period inside, comma kept)
             else:
                 c = c_base + "." + c_quote          # „...."   (period inside, comma dropped)
@@ -1177,8 +1160,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             comma_fixes += 1
 
         # Rule B: Remove cross-row comma when next row is NOT a Begleitsatz.
-        if c.endswith('",') or c.endswith('“,') or c.endswith('”,'):
-            if not BEGLEITSATZ_PATTERN.match(next_content):
+        if len(c) >= 2 and c[-1] == ',' and c[-2] in ('"', '“', '”'):
+            if not _is_begleitsatz(next_content):
                 row["content"] = c[:-1]
                 c = c[:-1]
                 comma_fixes += 1
@@ -1186,8 +1169,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Rule C: Add missing comma when closing quote is followed by Begleitsatz.
         # Applies to ALL closing quote variants including ?" and !" (same need for comma).
         # Cross-row: row ends with " (any variant, no comma yet) and next IS Begleitsatz.
-        elif (c.endswith('“') or c.endswith('”') or c.endswith('"'))                 and not c.endswith(','):
-            if BEGLEITSATZ_PATTERN.match(next_content):
+        elif c and c[-1] in ('“', '”', '"') and not c.endswith(','):
+            if _is_begleitsatz(next_content):
                 row["content"] = c + ","
                 c = c + ","
                 comma_adds += 1
@@ -1214,6 +1197,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if c_nodash != c:
                 row["content"] = c_nodash
                 dash_fixes += 1
+                c = row["content"]
 
         # Rule E: Move comma from BEFORE closing quote to AFTER it.
         # Wrong: „Text,“ sagte / „Text," sagte
@@ -1227,11 +1211,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 r'\1,\2', c
             )
             if c_e == c and (c.endswith(',“') or c.endswith(',"')):
-                if BEGLEITSATZ_PATTERN.match(next_content):
+                if _is_begleitsatz(next_content):
                     c_e = c[:-2] + c[-1] + ','
             if c_e != c:
                 row["content"] = c_e
                 comma_fixes += 1
+                c = row["content"]
 
         # Rule F: Add missing comma after !" before Begleitsatz.
         # German: ! ends speech with exclamation, but comma is still needed
@@ -1249,11 +1234,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             )
             # Cross-row: row ends with !" and next row is Begleitsatz
             if c_f == c and _re.search(r'![“"]$', c):
-                if BEGLEITSATZ_PATTERN.match(next_content):
+                if _is_begleitsatz(next_content):
                     c_f = c + ','
             if c_f != c:
                 row["content"] = c_f
                 comma_adds += 1
+                c = row["content"]
 
         # Rule G: Enforce canonical Kapitel header format: "Kapitel N Title Case Title"
         # Gemini sometimes returns headers all-lowercase, with a spurious colon, or with
@@ -1342,7 +1328,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # Sort by length descending so multi-word terms match before subterms
         replacement_pairs.sort(key=lambda x: len(x[0]), reverse=True)
 
-        import re as _re2
         gloss_fixes = 0
         for row in all_rephrased:
             original_content = row.get("content", "")
@@ -1350,11 +1335,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             for src, tgt in replacement_pairs:
                 # Word-boundary aware replacement, case-insensitive
                 try:
-                    pattern = _re2.compile(r'(?<![\w\-])' + _re2.escape(src) + r'(?![\w\-])', _re2.IGNORECASE)
+                    pattern = _re.compile(r'(?<![\w\-])' + _re.escape(src) + r'(?![\w\-])', _re.IGNORECASE)
                     replaced = pattern.sub(tgt, new_content)
                     if replaced != new_content:
                         new_content = replaced
-                except _re2.error:
+                except _re.error:
                     pass  # skip malformed patterns
             if new_content != original_content:
                 row["content"] = new_content
@@ -1385,6 +1370,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 "Antworte NUR mit: [{\"sort\": " + str(sort_n) + ", \"content\": \"<umformuliert>\"}]\n"
                 + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
             )
+            _last_exc_str = None
+            _repeated_exc_count = 0
             for api_key in ([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS):
                 try:
                     r_resp = requests.post(
@@ -1408,7 +1395,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                             log(f"    ⚠️  sort={sort_n}: still unchanged after retry")
                     break
                 except Exception as exc:
-                    log(f"    ⚠️  sort={sort_n} retry error: {exc}"); continue
+                    exc_str = str(exc)
+                    log(f"    ⚠️  sort={sort_n} retry error: {exc_str}")
+                    # Early bail: if the same error repeats 3 times the problem is
+                    # content-based (e.g. Gemini consistently returns malformed JSON
+                    # for this specific row), not a key issue. Further retries waste
+                    # keys and time — bail immediately.
+                    if exc_str == _last_exc_str:
+                        _repeated_exc_count += 1
+                        if _repeated_exc_count >= 2:  # 3 identical errors total
+                            log(f"    ⛔ sort={sort_n}: same error 3×, content-based failure — skipping row")
+                            break
+                    else:
+                        _last_exc_str = exc_str
+                        _repeated_exc_count = 0
+                    continue
         all_rephrased = sorted(rephrased_by_sort_m.values(), key=lambda r: r.get("sort", 0))
     else:
         log(f"  ✅ Mandatory change pass: all rows were modified.")
@@ -1416,15 +1417,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # ── Similarity guard: retry rows too similar to CDReader's reference texts ──
     # CDReader triggers ErrMessage10 when submitted text is too similar to its
     # stored machine translation. We log a full distribution to diagnose failures.
-    import re as _re_sim
 
     def _row_sim(output, ref):
         """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
         def _norm(s):
-            return _re_sim.sub(r"[^\w\s]", "", s.lower())
+            return _re.sub(r"[^\w\s]", "", s.lower())
         def _jaccard(a, b):
-            wa = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
-            wb = set(_re_sim.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
+            wa = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
+            wb = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
             return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
         def _trigram(a, b):
             na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
@@ -1905,7 +1905,7 @@ def run():
 
                 if DRY_RUN:
                     log(f"  [DRY RUN] Would claim: {ch_name}")
-                    claimed_chapters.append((book, ch_name, ch_id, "dry-run", None))
+                    claimed_chapters.append((book, ch_name, ch_id, "dry-run", None, None))
                     break
 
                 result = claim_chapter(token, ch_id)
@@ -1928,7 +1928,7 @@ def run():
                     elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
                         claim_proc_id = int(rdata)
                     log(f"  Claim response data: {rdata} → proc_id={claim_proc_id}")
-                    claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id))
+                    claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id, None))
                     break
                 elif no_chapter:
                     # Log full response — data may contain the currently active chapter ID
@@ -1942,7 +1942,7 @@ def run():
                         orphan_id = int(rdata)
                     if orphan_id:
                         log(f"  Found orphaned active chapter ID={orphan_id} in submithint response")
-                        claimed_chapters.append((book, ch_name, orphan_id, "claimed", orphan_id))
+                        claimed_chapters.append((book, ch_name, orphan_id, "claimed", orphan_id, None))
                         break
                 else:
                     log(f"  ⚠️  Unexpected claim response: {result}")
@@ -1954,8 +1954,8 @@ def run():
     # ── Phase 2-6: Process each claimed chapter ──
     entry = claimed_chapters[0]
     book, ch_name, ch_id, status = entry[0], entry[1], entry[2], entry[3]
-    task_id = entry[5] if len(entry) > 5 else None  # Task Center task ID for closing
-    claim_proc_id = entry[4] if len(entry) > 4 else None
+    task_id = entry[5]       # Task Center task ID for closing (None for freshly claimed)
+    claim_proc_id = entry[4]
     book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
     book_name = book.get("toBookName") or book.get("bookName") or book.get("name") or ""
 
@@ -2030,7 +2030,6 @@ def run():
 
     # ── Post-process: replace English quotes with German quotes ─────────────────
     # Groq and sometimes Gemini use " instead of „/". Fix deterministically.
-    import re as _re
     quote_fixes = 0
     for row in rephrased:
         c = row.get("content", "")
@@ -2064,14 +2063,13 @@ def run():
         log(f"  🔤 Post-processing: converted English quotes to German in {quote_fixes} row(s).")
 
     # ── Post-process: fix "X family" / "X-Familie" → "Familie X" ───────────────
-    import re as _re2
     # Two separate patterns to avoid IGNORECASE corrupting the uppercase-name check:
     # Pattern A: hyphenated "Surname-Familie" — safe, no article ambiguity
-    _fam_hyphen = _re2.compile(
+    _fam_hyphen = _re.compile(
         r"\b([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:-[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)*)-Familie\b"
     )
     # Pattern B: space-separated single-word surname before "family" or " Familie"
-    _fam_space = _re2.compile(
+    _fam_space = _re.compile(
         r"\b([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)\s+[Ff]amil(?:y|ie)\b"
     )
     _FAM_SKIP = {"Die", "Der", "Das", "Den", "Dem", "Des", "The", "Eine", "Ein",
@@ -2249,36 +2247,34 @@ def run_test():
     log("=" * 60)
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
-    k6_status = "✅ configured" if GEMINI_API_KEY_6 else "⚠️  not set"
-    k7_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_7") else "⚠️  not set"
-    k8_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_8") else "⚠️  not set"
-    k9_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_9") else "⚠️  not set"
-    k10_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_10") else "⚠️  not set"
-    k11_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_11") else "⚠️  not set"
-    k12_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_12") else "⚠️  not set"
-    k13_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_13") else "⚠️  not set"
-    k14_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_14") else "⚠️  not set"
-    k15_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_15") else "⚠️  not set"
-    k16_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_16") else "⚠️  not set"
-    k17_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_17") else "⚠️  not set"
-    k18_status = "✅ configured" if os.environ.get("GEMINI_API_KEY_18") else "⚠️  not set"
-    log(f"Gemini key 6: {k6_status} | key 7: {k7_status} | key 8: {k8_status} | key 9: {k9_status} | key 10: {k10_status} | key 11: {k11_status} | key 12: {k12_status} | key 13: {k13_status} | key 14: {k14_status} | key 15: {k15_status} | key 16: {k16_status} | key 17: {k17_status} | key 18: {k18_status}")
+    # Log status of every configured Gemini key dynamically
+    key_statuses = " | ".join(
+        f"key {i+1}: {'✅' if k else '⚠️ not set'}"
+        for i, k in enumerate(
+            os.environ.get(f"GEMINI_API_KEY{'_' + str(i) if i > 0 else ''}", "")
+            for i in range(18)
+        )
+    )
+    log(f"Gemini key status: {key_statuses}")
     log("=" * 60)
 
-    # Synthetic test rows — realistic German pre-translation content
+    # Synthetic test rows — use the same field names as the real CDReader API response.
+    # rephrase_with_gemini reads machineChapterContent (German MT) as the text to rephrase
+    # and chapterConetnt (English source) for context. Rows with only "content" would send
+    # empty text to Gemini and produce meaningless test output.
     TEST_ROWS = [
-        {"sort": 0,  "content": "Kapitel 249 Wie Konnte Er Sie Nicht Wollen?"},
-        {"sort": 1,  "content": "Die Moss family war seit Generationen in der Stadt bekannt."},
-        {"sort": 2,  "content": '„Ich werde nicht gehen", sagte sie bestimmt.'},
-        {"sort": 3,  "content": "Er antwortete ihr nicht."},
-        {"sort": 4,  "content": '„Dann bleib", flüsterte er leise.'},
-        {"sort": 5,  "content": "Sie schaute ihn lange an, bevor sie sprach."},
-        {"sort": 6,  "content": '„Was hast du gesagt?" fragte sie ungläubig,'},
-        {"sort": 7,  "content": "sagte er mit ruhiger Stimme."},
-        {"sort": 8,  "content": "Die Williams family hatte immer zu ihr gehalten."},
-        {"sort": 9,  "content": "Er trat einen Schritt zurück und verschränkte die Arme."},
-        {"sort": 10, "content": '"You should leave now," he said coldly.'},
-        {"sort": 11, "content": "Sie nickte langsam und verließ das Zimmer ohne ein weiteres Wort."},
+        {"sort": 0,  "machineChapterContent": "Kapitel 249 Wie Konnte Er Sie Nicht Wollen?",       "chapterConetnt": "Chapter 249 How Could He Not Want Her?"},
+        {"sort": 1,  "machineChapterContent": "Die Moss-Familie war seit Generationen in der Stadt bekannt.",    "chapterConetnt": "The Moss family had been known in the city for generations."},
+        {"sort": 2,  "machineChapterContent": '„Ich werde nicht gehen", sagte sie bestimmt.',        "chapterConetnt": '"I will not go," she said firmly.'},
+        {"sort": 3,  "machineChapterContent": "Er antwortete ihr nicht.",                            "chapterConetnt": "He did not answer her."},
+        {"sort": 4,  "machineChapterContent": '„Dann bleib", flüsterte er leise.',                   "chapterConetnt": '"Then stay," he whispered softly.'},
+        {"sort": 5,  "machineChapterContent": "Sie schaute ihn lange an, bevor sie sprach.",         "chapterConetnt": "She looked at him for a long time before she spoke."},
+        {"sort": 6,  "machineChapterContent": '„Was hast du gesagt?" fragte sie ungläubig.',        "chapterConetnt": '"What did you say?" she asked in disbelief.'},
+        {"sort": 7,  "machineChapterContent": "sagte er mit ruhiger Stimme.",                        "chapterConetnt": "he said in a calm voice."},
+        {"sort": 8,  "machineChapterContent": "Die Williams-Familie hatte immer zu ihr gehalten.",   "chapterConetnt": "The Williams family had always stood by her."},
+        {"sort": 9,  "machineChapterContent": "Er trat einen Schritt zurück und verschränkte die Arme.", "chapterConetnt": "He took a step back and crossed his arms."},
+        {"sort": 10, "machineChapterContent": "Er sagte kalt, sie solle jetzt gehen.",              "chapterConetnt": '"You should leave now," he said coldly.'},
+        {"sort": 11, "machineChapterContent": "Sie nickte langsam und verließ das Zimmer ohne ein weiteres Wort.", "chapterConetnt": "She nodded slowly and left the room without another word."},
     ]
 
     SAMPLE_GLOSSARY = [
@@ -2302,7 +2298,7 @@ def run_test():
 
     # ── Show before/after comparison ──────────────────────────────────────────
     log("\n[2/4] Before → After comparison:")
-    orig_map = {r["sort"]: r["content"] for r in TEST_ROWS}
+    orig_map = {r["sort"]: r.get("machineChapterContent") or r.get("content", "") for r in TEST_ROWS}
     for r in result:
         s = r.get("sort")
         before = orig_map.get(s, "?")
@@ -2316,7 +2312,6 @@ def run_test():
     log("\n[3/4] Post-processors:")
 
     # Count family name fixes
-    import re as _re
     _fam_en = _re.compile(r"(?:[Tt]he\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:\s[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})\s+[Ff]amily\b")
     _fam_de = _re.compile(r"(?:[Dd]ie\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:[-\s][A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})[-\s]Familie\b")
     fam_hits = sum(1 for r in result if _fam_en.search(r.get("content","")) or _fam_de.search(r.get("content","")))
@@ -2343,7 +2338,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Gemini key 6: {'configured' if GEMINI_API_KEY_6 else 'not set'} | key 7: {'configured' if os.environ.get('GEMINI_API_KEY_7') else 'not set'} | key 8: {'configured' if os.environ.get('GEMINI_API_KEY_8') else 'not set'} | key 9: {'configured' if os.environ.get('GEMINI_API_KEY_9') else 'not set'} | key 10: {'configured' if os.environ.get('GEMINI_API_KEY_10') else 'not set'} | key 11: {'configured' if os.environ.get('GEMINI_API_KEY_11') else 'not set'} | key 12: {'configured' if os.environ.get('GEMINI_API_KEY_12') else 'not set'} | key 13: {'configured' if os.environ.get('GEMINI_API_KEY_13') else 'not set'} | key 14: {'configured' if os.environ.get('GEMINI_API_KEY_14') else 'not set'} | key 15: {'configured' if os.environ.get('GEMINI_API_KEY_15') else 'not set'} | key 16: {'configured' if os.environ.get('GEMINI_API_KEY_16') else 'not set'} | key 17: {'configured' if os.environ.get('GEMINI_API_KEY_17') else 'not set'} | key 18: {'configured' if os.environ.get('GEMINI_API_KEY_18') else 'not set'}\n"
+        f"🔑 Keys configured: {len(GEMINI_KEYS)}/{18}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
