@@ -788,7 +788,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
         r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
         # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
-        r"wollte|beruhigte|erwähnte|wies|sprach"
+        r"wollte|beruhigte|erwähnte|wies|sprach|"
+        # Added: verbs of rebuke/correction whose BGS output is indistinguishable from
+        # speech attribution (schalt = schelten/to scold, tadelte = tadeln/to reprimand)
+        r"schalt|tadelte"
     )
     # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
     # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
@@ -944,10 +947,30 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 r'conceded|admitted|acknowledged|declared|announced|breathed)\b',
                 eng_s, _re.IGNORECASE))
         )
-        if _is_begleitsatz(out) and not _eng_is_attribution:
+        # Fix 3a: strip leading quote before BGS check.
+        # Root cause (SS3-row2): Gemini outputs „schalt Henry mich aus. (attribution
+        # prefixed with spurious „). _BEGLEITSATZ_BASE requires ^(SV|pronoun+SV), so
+        # _is_begleitsatz on the raw output never matches. Stripping the leading quote
+        # first lets the pattern see the attribution verb directly.
+        _out_unquoted = _re.sub(r'^[„“"]+', '', out).strip()
+        _is_bgs_raw      = _is_begleitsatz(out)
+        _is_bgs_unquoted = _is_begleitsatz(_out_unquoted)
+        if (_is_bgs_raw or _is_bgs_unquoted) and not _eng_is_attribution:
             row["content"] = mt_s
             _bgs_confusion_fixes += 1
             log(f"  ⚠️  BGS confusion: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
+            continue
+        # Fix 3b: lowercase-first output guard.
+        # Root cause (SS4): Gemini displaces narrative from row N into row N+1, whose
+        # English source is a dialogue/narrative row starting uppercase. The displaced
+        # content starts lowercase (e.g. 'ich versuchte, gleichgültig zu klingen.').
+        # In standard German prose every sentence starts uppercase; a lowercase-first
+        # row is always wrong. Guard: if German output starts lowercase AND the MT for
+        # that row starts uppercase, the content is displaced — restore from MT.
+        if out and out[0].islower() and mt_s and mt_s.strip() and mt_s.strip()[0].isupper():
+            row["content"] = mt_s
+            _bgs_confusion_fixes += 1
+            log(f"  ⚠️  Lowercase-first displaced: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
     if _bgs_confusion_fixes:
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
@@ -1042,6 +1065,42 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         )
                         if _m_sv_b:
                             fixed = fixed[:_m_sv_b.start()] + _QE_CLOSE + fixed[_m_sv_b.start():]
+                        else:
+                            # Fix 4: English-guided close insertion.
+                            # Root cause (SS2/SS5): row has inline dialogue + pure narrative
+                            # ('"Yes," Henry\'s voice was barely a whisper.').  No attribution
+                            # verb exists in the German, so both SV searches above fail.
+                            # The English closing-quote position encodes WHERE the speech
+                            # ends: the char immediately before the English close is the
+                            # sentence-level separator (comma or period/!/?).
+                            # Rule: find that separator's Nth occurrence in the German
+                            # (same occurrence count as in the English speech segment)
+                            # and place the German closing quote there.
+                            _eng_close_i = max(
+                                eng.rfind('"'), eng.rfind('”'), eng.rfind('“')
+                            )
+                            _eng_open_i = max(
+                                eng.find('"'), eng.find('„'), eng.find('“')
+                            )
+                            if _eng_close_i > _eng_open_i >= 0:
+                                _sep = eng[_eng_close_i - 1]  # char before English close
+                                _speech_en = eng[_eng_open_i + 1 : _eng_close_i]
+                                _de_body = fixed[1:]  # German after opening „
+                                if _sep == ',':
+                                    # Count commas in English speech, find Nth in German
+                                    _n = _speech_en.count(',')
+                                    _pos = -1
+                                    for _ in range(max(_n, 1)):
+                                        _pos = _de_body.find(',', _pos + 1)
+                                        if _pos < 0: break
+                                    if _pos >= 0:
+                                        fixed = fixed[:1 + _pos] + _QE_CLOSE + fixed[1 + _pos:]
+                                elif _sep in '.?!':
+                                    # Place close after first matching punctuation in German
+                                    _pm = _re.search(rf'[{_re.escape(_sep)}]', _de_body)
+                                    if _pm:
+                                        _ppos = _pm.start() + 1  # after the punct
+                                        fixed = fixed[:1 + _ppos] + _QE_CLOSE + fixed[1 + _ppos:]
                 # else: genuine multi-row opener — no closing quote needed here
             else:
                 # Has a closing quote: only strip if spuriously at the very end,
@@ -1318,9 +1377,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if _m_g:
                 _num_g  = _m_g.group(1)
                 _rest_g = _m_g.group(2).strip()
-                # Title-case each word in the rest
-                _rest_titled = ' '.join(w[0].upper() + w[1:] if w else w
-                                        for w in _rest_g.split(' '))
+                # Title-case each word in the rest.
+                # Bug fix: w[0].upper() silently fails for words starting with
+                # punctuation like '(' — '('.upper() == '(', so '(teil' stays '(teil'.
+                # Fix: scan for first alpha character and uppercase it instead.
+                def _tc_word(w):
+                    for _i, _ch in enumerate(w):
+                        if _ch.isalpha():
+                            return w[:_i] + w[_i].upper() + w[_i+1:]
+                    return w
+                _rest_titled = ' '.join(_tc_word(w) for w in _rest_g.split(' '))
                 titled = f"Kapitel {_num_g} {_rest_titled}" if _rest_titled else f"Kapitel {_num_g}"
                 if titled != c:
                     row['content'] = titled
