@@ -818,11 +818,17 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # or with a lowercase pronoun + verb. The [Name]+[SV] arm is intentionally absent:
     # "Jenifer murmelte leise vor sich hin." starts with a proper name, not the verb
     # so the comma rule must not fire for those rows.
+    #
+    # \b after each verb alternation is required to prevent prefix false-positives:
+    # Without it, 'wies' matches 'Wieso?', 'schalt' matches 'Schaltete er',
+    # 'sprach' matches 'Sprache' — all legitimate dialogue/narrative rows that
+    # would be incorrectly restored from MT by the BGS confusion guard.
+    # Confirmed by simulation (2026-03-08): sort=116 „Wieso?" was falsely flagged.
     _BEGLEITSATZ_BASE = _re.compile(
         rf"""^(?:
-            (?:{_SV_CORE})
+            (?:(?:{_SV_CORE})\b)
             |
-            (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:{_SV_CORE}))
+            (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:(?:{_SV_CORE})\b))
         )""",
         _re.IGNORECASE | _re.VERBOSE
     )
