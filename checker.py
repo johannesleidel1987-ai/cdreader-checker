@@ -100,7 +100,6 @@ If a row contains only a short attribution clause, output exactly that — do no
 
 CAPITALIZATION & SOURCE FORMATTING
 - All-caps lines: rephrase in ALL CAPS (e.g. "GRAND KING" → "GROẞER KÖNIG")
-- Lines beginning with "Kapitel": capitalize first letter of each word, no colon after the chapter number (e.g. "Kapitel 168 Sie Überraschte Wilbur")
 - Lines containing only punctuation or single words (e.g. "!", "Los!", "Emma!", "Liz!"): retain EXACTLY as-is — do NOT add words, context, or imperative verbs
 - Standard lines: standard German capitalization rules
 
@@ -114,8 +113,6 @@ LINGUISTIC GUIDELINES
 - Word count: approximately maintain the original word count per line; avoid excessive shortening
 - Action beats: preserve or enrich character actions and physical reactions
 - Contextual flow: consider surrounding rows for narrative continuity and emotional arc
-- Dashes (—): never translate literally; restructure using conjunctions, verbs, or relative clauses
-  Example: "...in the news—a softer version..." → "...in den Nachrichten, und wirkte wie eine sanftere Version..."
 
 THE PRONOUN PROTOCOL (CRITICAL)
 - "du": only for family (parents, children, siblings), romantic partners, demonstrably close long-term friends
@@ -123,9 +120,6 @@ THE PRONOUN PROTOCOL (CRITICAL)
 - Absolute consistency: never switch "du"/"Sie" between the same two people within a chapter
 
 DIALOGUE & HONORIFICS
-- German quotation marks ONLY: „ to open, " to close
-- Accompanying sentences (Begleitsatz): If a line of direct speech ends with a closing quotation mark and is immediately followed by an accompanying sentence (e.g. "sagte sie", "flüsterte er", "antwortete er leise"), you MUST add a comma after the closing quotation mark. If the next row is NOT a speech attribution but begins a new thought, describes an action, or starts a new speaker — do NOT add a comma after the closing ".
-- Never use English quotation marks (" or ')
 - "Mr." → "Herr", "Mrs."/"Miss"/"Ms." → "Frau"
 
 UNIVERSAL GLOSSARY
@@ -139,11 +133,9 @@ Currency: Dollar→Euro
 
 FINAL SELF-CHECK (perform before responding)
 1. Output has EXACTLY the same number of JSON objects as input rows?
-2. Begleitsatz comma rule applied correctly — comma ONLY when next row is a speech attribution?
-3. du/Sie consistent per character relationship?
-4. All glossary terms applied?
-5. No literal dash (—) translations — restructured naturally?
-6. Response is pure JSON with zero extra text?"""
+2. du/Sie consistent per character relationship?
+3. All glossary terms applied?
+4. Response is pure JSON with zero extra text?"""
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -401,509 +393,348 @@ def format_glossary_for_prompt(glossary_terms):
     return "\n".join(lines) if lines else "(No book-specific glossary terms)"
 
 
-# ─── Phase 4: Rephrase with Gemini ───────────────────────────────────────────
-def rephrase_with_gemini(rows, glossary_terms, book_name):
-    if not GEMINI_KEYS:
-        log("❌ No GEMINI_API_KEY configured.")
-        return None
 
-    # Keep raw terms for per-batch filtering; also pre-format full list as fallback
-    glossary_text_full = format_glossary_for_prompt(glossary_terms)
+# ─── Post-processing constants and helpers (module level) ─────────────────────
+# ── Post-process: German dialogue punctuation enforcement ─────────────────
+# _SV_CORE: Pure speech/communication verbs used for CROSS-ROW comma decisions
+# (Rules B and C). Must be conservative — these verbs almost exclusively signal
+# speech attribution and rarely appear as pure narrative action starters.
+# Deliberately excludes dual-use action verbs like nickte, lächelte, seufzte,
+# versprach, zögerte etc. which cause false positives when they start narrative rows.
+_SV_CORE = (
+    r"sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|bemerkte|"
+    r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
+    r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
+    r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
+    r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
+    r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
+    # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
+    r"wollte|beruhigte|erwähnte|wies|sprach|"
+    # Added: verbs of rebuke/correction whose BGS output is indistinguishable from
+    # speech attribution (schalt = schelten/to scold, tadelte = tadeln/to reprimand)
+    r"schalt|tadelte"
+)
+# _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
+# Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
+_SV = (
+    _SV_CORE + r"|"
+    r"nickte|lächelte|seufzte|wisperte|schnappte|stöhnte|schluchzte|"
+    r"keuchte|grunzte|gluckste|bettelte|jammerte|klagte|schimpfte|fuhr|setzte|"
+    r"warf|stieß|spuckte|platzte|brach|fiel|gab|presste|rang|"
+    r"drängte|keifte|ächzte|sprach|gestand|bekannte|schwor|versprach|"
+    r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
+    r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück|"
+    # Added: template row 30 — "neckte" (teased)
+    r"neckte|"
+    # Added: Screenshot 2 — spottete (mocked), höhnte (sneered/jeered)
+    r"spottete|höhnte"
+)
+# Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
+_NEGATION_AFTER_SV = _re.compile(
+    rf"(?:{_SV_CORE})\s+(?:nicht|kein|keine|keinen|keinem|keiner|nie|niemals|nichts)",
+    _re.IGNORECASE
+)
 
-    # Build input data: sort + English original (context) + German to rephrase
-    # CONFIRMED by DIAG: chapterConetnt=English source, machineChapterContent=German machine translation
-    # Gemini must rephrase the German machine translation, NOT re-translate from English.
+# _BEGLEITSATZ_BASE: a genuine Begleitsatz starts DIRECTLY with the speech verb
+# or with a lowercase pronoun + verb. The [Name]+[SV] arm is intentionally absent:
+# "Jenifer murmelte leise vor sich hin." starts with a proper name, not the verb
+# so the comma rule must not fire for those rows.
+#
+# \b after each verb alternation is required to prevent prefix false-positives:
+# Without it, 'wies' matches 'Wieso?', 'schalt' matches 'Schaltete er',
+# 'sprach' matches 'Sprache' — all legitimate dialogue/narrative rows that
+# would be incorrectly restored from MT by the BGS confusion guard.
+# Confirmed by simulation (2026-03-08): sort=116 „Wieso?" was falsely flagged.
+_BEGLEITSATZ_BASE = _re.compile(
+    rf"""^(?:
+        (?:(?:{_SV_CORE})\b)
+        |
+        (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:(?:{_SV_CORE})\b))
+    )""",
+    _re.IGNORECASE | _re.VERBOSE
+)
 
-    def _classify_quote_role(text):
-        """
-        Classify whether a text row is an opening, closing, middle, or standalone
-        dialogue line based on quote balance.
-        Returns one of: "open", "close", "middle_or_none", "both"
-        """
-        t = text.strip()
-        # Use regex so the quote characters are explicit Unicode escapes, not invisible literals
-        opens  = bool(_re.match(r'^„|“|"|\xab', t))   # „ " " «
-        closes = bool(_re.search(r'[“”"\xbb]\s*[,!?.]?\s*$', t))  # " " " »
+def _is_begleitsatz(text, _max_words=15):
+    """True only if text is a genuine attribution clause after dialogue.
+    Guards against false positives:
+      - Rows ending with ':' introduce NEW dialogue (not attributing previous speech)
+      - Long rows (> max_words=15) that aren't attribution — genuine Begleitsätze
+        are short (2-12 words typically). 30 was too permissive: "Er wollte sie
+        nicht wegen der Ereignisse..." (23w) matched 'er wollte' and triggered
+        a false positive restoration. 15 excludes all such narrative sentences.
+      - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
+    """
+    # Inline speech: attribution verb followed by colon + uppercase = introduces
+    # direct speech in the same row („Antwortete sie entschlossen: Nein.“) —
+    # this is NOT a pure Begleitsatz following previous speech.
+    if _re.search(r':\s+[A-ZÄÖÜ]', text):
+        return False
+    if text.rstrip().endswith(':'):
+        return False  # ends with ':' → introduces new speech, doesn't attribute old
+    if len(text.split()) > _max_words:
+        return False
+    if _NEGATION_AFTER_SV.search(text):
+        return False
+    return bool(_BEGLEITSATZ_BASE.match(text))
 
-        if opens and closes:
-            return "both"
-        elif opens:
-            return "open"
-        elif closes:
-            return "close"
-        else:
-            return "middle_or_none"
 
-    raw_contents = [
-        # Use German machine translation as the text Gemini rephrases.
-        # chapterConetnt is English — using it would make Gemini re-translate from
-        # English, producing output similar to the existing machine translation.
-        r.get("machineChapterContent") or r.get("modifChapterContent") or r.get("peContent") or ""
-        for r in rows
-    ]
-    # English source (chapterConetnt) used as context only, not as content to rephrase
-    english_originals = [
-        r.get("chapterConetnt") or r.get("eContent") or r.get("eeContent") or ""
-        for r in rows
-    ]
 
-    # Determine quote roles using the ENGLISH source, not the German MT.
-    # German MT frequently has „ without closing ", which causes the state machine
-    # to get stuck in in_dialogue=True and misclassify all subsequent no-quote rows
-    # as "middle" when they are independent dialogue lines or narrative.
-    # English quote placement is self-consistent and reliable for open/close tracking.
-    quote_roles = []
-    in_dialogue = False
-    for i, eng_text in enumerate(english_originals):
-        role = _classify_quote_role(eng_text)
-        if role == "both":
-            in_dialogue = False
-            quote_roles.append("both")
-        elif role == "open":
-            in_dialogue = True
-            quote_roles.append("open")
-        elif role == "close":
-            in_dialogue = False
-            quote_roles.append("close")
-        elif role == "middle_or_none":
-            if in_dialogue:
-                quote_roles.append("middle")
-            else:
-                quote_roles.append("none")
-        else:
-            in_dialogue = False
-            quote_roles.append("none")
 
-    input_data = [
-        {
-            "sort": r.get("sort", i),
-            "original": english_originals[i],   # English source — context for Gemini
-            "content": raw_contents[i],           # German machine translation — primary text to rephrase
-            "machine_translation": raw_contents[i],  # same German text used by similarity guard
-            "_quote_role": quote_roles[i],
-        }
-        for i, r in enumerate(rows)
-    ]
-    non_empty = sum(1 for r in input_data if r["content"].strip())
-    log(f"  Input data: {len(input_data)} rows, {non_empty} with non-empty content")
-    if rows:
-        r0 = rows[0]
-        fields = ["chapterConetnt","eContent","eeContent","modifChapterContent","machineChapterContent","languageContent","peContent","referenceContent"]
-        log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
+def _is_continuation_row(text):
+    """Cross-row comma decision: True iff the next row syntactically continues
+    the preceding dialogue and therefore requires a trailing comma on the
+    closing-quote row.
 
-    BATCH_SIZE = 40
-    MAX_RETRIES = 3
-    MAX_RETRIES_429 = 3    # If 429 persists beyond 3 tries, RPD is likely exhausted — fail fast
+    Root cause of Screenshots 1 & 3:
+      • Screenshot 1 (false positive): 'Kaum hatte er mir einen Stirnkuss
+        gegeben, fragte ich.' → starts with uppercase 'K' → new sentence →
+        no comma warranted, but _is_begleitsatz with IGNORECASE matched
+        'fragte' anywhere and fired.
+      • Screenshot 3 (false negative): 'versuchte Hendrick, mich zu
+        beruhigen.' → starts lowercase 'v' → is a continuation → comma
+        warranted, but 'versuchte' was absent from _SV_CORE so the check
+        returned False.
 
-    def _fix_json_strings(s):
-        """Fix literal newlines/tabs inside JSON string values."""
-        result = []
-        in_string = False
-        escape_next = False
-        for ch in s:
-            if escape_next:
-                result.append(ch)
-                escape_next = False
-            elif ch == '\\':
-                result.append(ch)
-                escape_next = True
-            elif ch == '"' and not escape_next:
-                in_string = not in_string
-                result.append(ch)
-            elif in_string and ch == '\n':
-                result.append('\\n')
-            elif in_string and ch == '\r':
-                result.append('\\r')
-            elif in_string and ch == '\t':
-                result.append('\\t')
-            else:
-                result.append(ch)
-        return ''.join(result)
+    Fix: In German prose, a Begleitsatz (attribution clause) that follows
+    closing dialogue is ALWAYS syntactically subordinate — it continues the
+    sentence opened by the dialogue and therefore NEVER capitalises its first
+    word.  Conversely, a new sentence (action, description, new speaker) ALWAYS
+    starts with an uppercase letter.  Capitalisation is therefore a sufficient
+    and unambiguous discriminant:
 
-    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None):
-        """Build the prompt string and clean batch data, shared by both providers."""
-        lookahead_note = ""
-        if next_batch_first is not None:
-            lookahead_note = (
-                "\n\nLOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):\n"
-                f"The row immediately following this batch starts with: {json.dumps(next_batch_first.get('content', ''), ensure_ascii=False)}"
-            )
-        clean_batch = [
-            {
-                "sort": r["sort"],
-                "original": r.get("original", ""),
-                "machine_translation": r.get("machine_translation", ""),
-                "content": r["content"],
-            }
-            for r in batch_data
-        ]
-        quote_hints = []
-        for r in batch_data:
-            role = r.get("_quote_role", "both")
-            sort_n = r['sort']
-            if role == "open":
-                quote_hints.append(f"  sort {sort_n}: OPENS a multi-row dialogue — use „ to open, NO closing “ at end")
-            elif role == "close":
-                quote_hints.append(f"  sort {sort_n}: CLOSES a multi-row dialogue — NO opening „, but add closing “ at end")
-            elif role == "middle":
-                quote_hints.append(f"  sort {sort_n}: MIDDLE of a multi-row dialogue — NO opening or closing quotes")
-        quote_hint_block = ""
-        if quote_hints:
-            quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
+        lowercase-first  → continuation → comma required
+        uppercase-first  → new sentence → no comma
 
-        # Filter glossary to only terms present in this batch's text — reduces prompt
-        # size dramatically and keeps
-        # the model focused on only the relevant terms rather than all 200+ entries.
-        batch_text = " ".join(
-            (r.get("original", "") + " " + r.get("content", "")).lower()
-            for r in batch_data
-        )
-        if glossary_terms:
-            # Build a set of all English words present in the batch (lowercased)
-            # for efficient multi-word substring matching.
-            batch_text_lower = batch_text.lower()
-            def _term_in_batch(term):
-                key = (term.get("dictionaryKey") or "").strip().lower()
-                sur = (term.get("enSurname") or "").strip().lower()
-                return (key and key in batch_text_lower) or (sur and sur in batch_text_lower)
+    This replaces _is_begleitsatz() for cross-row comma decisions.
+    _is_begleitsatz() is retained for the BGS confusion guard (Pre-Pass QE),
+    where the task is different: detecting whether Gemini's entire output IS
+    an attribution clause, not whether the next row continues from dialogue.
 
-            merged = [t for t in glossary_terms if _term_in_batch(t)]
-            # Fallback: if filter produces nothing (e.g. batch is all German already),
-            # send the full list so the model still has context.
-            if not merged:
-                merged = glossary_terms
-            batch_glossary_text = format_glossary_for_prompt(merged)
-        else:
-            merged = []
-            batch_glossary_text = glossary_text_full
-        log(f"  Glossary for batch {batch_num}: {len(merged)} relevant terms (of {len(glossary_terms or [])} total)")
+    Edge-case guards:
+      • Empty text → False
+      • Row ending with ':' → introduces new speech, does not attribute old
+        speech.  Even though it starts lowercase ('fragte sie: …'), no comma.
+    """
+    if not text or not text[0].islower():
+        return False
+    if text.rstrip().endswith(':'):
+        return False
+    return True
 
-        prompt = (
-            f"{BASE_PROMPT}\n\n"
-            f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
-            f"{batch_glossary_text}\n\n"
-            f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
-            f"For each row:\n"
-            f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
-            f"  - \"content\": German machine translation — this is what you MUST rephrase. "
-            f"Rewrite it in natural, idiomatic German while preserving the exact meaning. "
-            f"Your output must differ from the input in vocabulary or sentence structure — "
-            f"returning a row IDENTICAL to the input is a hard validation error and will "
-            f"cause CDReader to reject the entire chapter. Even short rows must have "
-            f"at minimum a small synonym substitution or word-order change.\n"
-            f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
-            f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
-        )
-        return prompt, clean_batch
+comma_fixes = 0
+comma_adds = 0
+dash_fixes = 0
+# sorted_rows provided as parameter
 
-    def _parse_llm_response(text, batch_num):
-        """Parse JSON from LLM response text, with fallback fix."""
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            text = text.rsplit("```", 1)[0].strip()
+
+_QE_OPEN   = '„'  # „ U+201E
+_QE_CLOSE  = '“'  # " U+201C
+_QE_ANY_CLOSE_RE  = _re.compile(r'[“”"]')
+_QE_CLOSE_AT_END  = _re.compile(r'[“”"]\s*[,!?.]?\s*$')
+_QE_STARTS_OPEN   = _re.compile(r'^[„“”"]')
+
+_qe_role_by_sort  = {r.get("sort", i): r.get("_quote_role", "none")
+                     for i, r in enumerate(input_data)}
+_qe_eng_by_sort   = {r.get("sort", i): r.get("original", "")
+                     for i, r in enumerate(input_data)}
+_QE_ENG_OPEN_RE   = _re.compile(r'^[„“”‘\"«]')
+_QE_ENG_CLOSE_RE  = _re.compile(r'[“”\"]\s*[,!?.]?\s*$')
+
+
+def _row_sim(output, ref):
+    """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
+    def _norm(s):
+        return _re.sub(r"[^\w\s]", "", s.lower())
+    def _jaccard(a, b):
+        wa = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
+        wb = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
+        return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
+    def _trigram(a, b):
+        na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
+        nb = set(b[i:i+3] for i in range(max(0, len(b)-2)))
+        return len(na & nb) / len(na | nb) if (na and nb) else 0.0
+    no, nr = _norm(output), _norm(ref)
+    return max(_jaccard(no, nr), _trigram(no, nr))
+
+
+SIM_THRESHOLD = 0.90   # flag rows at or above this combined similarity
+
+
+def _call_gemini_simple(prompt, temperature=0.9, max_tokens=512):
+    """Simple Gemini call with key rotation for retries. Returns parsed JSON list or None."""
+    keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS
+    for api_key in keys_to_try:
         try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return json.loads(_fix_json_strings(text))
-
-    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
-        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
-
-        # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
-        # RPD-exhausted keys (daily quota) are marked permanently and never retried.
-        # Max full RPM-reset rotations before giving up: MAX_RETRIES_429
-        resp = None  # safe before first request; allows Retry-After header read in wait block
-        full_rotations = 0
-        while full_rotations < MAX_RETRIES_429:
-            try:
-                # Fail fast if every key has hit its daily quota
-                if _all_keys_rpd_dead():
-                    log(f"❌ All Gemini keys have hit their daily quota (RPD). No point retrying.")
-                    return None
-                api_key = _next_gemini_key()
-                if not api_key:
-                    # All remaining (non-RPD) keys are RPM-exhausted — wait for reset
-                    full_rotations += 1
-                    if full_rotations >= MAX_RETRIES_429:
-                        log(f"❌ All Gemini keys RPM-exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
-                        return None
-                    # Honour Retry-After header if present (more precise than flat 60s)
-                    retry_after = None
-                    try:
-                        retry_after = int(resp.headers.get("Retry-After", 0))
-                    except Exception:
-                        pass
-                    wait = retry_after if retry_after and retry_after > 0 else 60
-                    rpm_exhausted_count = len([k for k in GEMINI_KEYS if k in _exhausted_keys and k not in _rpd_exhausted_keys])
-                    log(f"  ⚠️ {rpm_exhausted_count} key(s) RPM-limited. Waiting {wait}s for reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
-                    _exhausted_keys.clear()  # only clears RPM-exhausted, not RPD
-                    time.sleep(wait)
-                    continue
-                resp = requests.post(
-                    f"{GEMINI_URL}?key={api_key}",
-                    json={
-                        "contents": [{"parts": [{"text": batch_prompt}]}],
-                        "generationConfig": {
-                            "temperature": 0.3,
-                            "maxOutputTokens": 16384,
-                            "responseMimeType": "application/json",
-                        },
-                    },
-                    timeout=300,
-                )
-                if resp.status_code == 429:
-                    # Parse error body to distinguish RPD (daily) from RPM (per-minute)
-                    is_rpd = False
-                    try:
-                        err_body = resp.json()
-                        err_obj = err_body.get("error", {})
-                        err_msg = str(err_obj.get("message", "")).lower()
-                        err_status = str(err_obj.get("status", "")).upper()
-                        err_details = str(err_obj.get("details", "")).lower()
-                        combined = err_msg + err_details
-                        # RPD keywords: covers both "exceeded your current quota / billing"
-                        # messages AND classic "per day / daily" quota messages
-                        rpd_keywords = (
-                            "per day", "daily", "1 day", "per_day",
-                            "billing", "your current quota", "quota_exceeded",
-                            "check your plan",
-                        )
-                        is_rpd = (
-                            any(kw in combined for kw in rpd_keywords)
-                            or err_status == "RESOURCE_EXHAUSTED"
-                        )
-                        limit_hint = f" [{err_msg[:80]}]" if err_msg else ""
-                    except Exception:
-                        limit_hint = ""
-                    if is_rpd:
-                        _rpd_exhausted_keys.add(api_key)
-                        _exhausted_keys.add(api_key)
-                        remaining = len([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys])
-                        log(f"  📵 Key daily quota (RPD) exhausted{limit_hint}, {remaining} key(s) left...")
-                    else:
-                        _exhausted_keys.add(api_key)
-                        remaining = len([k for k in GEMINI_KEYS if k not in _exhausted_keys])
-                        log(f"  🔄 Key RPM-limited{limit_hint}, {remaining} key(s) remaining...")
-                    continue
-                resp.raise_for_status()
-                body = resp.json()
-
-                # Log finish reason for diagnostics
-                finish_reason = (body.get("candidates", [{}])[0].get("finishReason", "?"))
-                if finish_reason not in ("STOP", ""):
-                    log(f"  ⚠️ Gemini finishReason={finish_reason} on batch {batch_num}")
-
-                text = (
-                    body.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                )
-                if not text:
-                    log(f"❌ Empty Gemini response on batch {batch_num}: {body}")
-                    return None
-                # Success — exit retry loop
-
-                parsed = _parse_llm_response(text, batch_num)
-                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Gemini.")
+            resp = requests.post(
+                f"{GEMINI_URL}?key={api_key}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+                },
+                timeout=45,
+            )
+            if resp.status_code == 429:
+                continue
+            resp.raise_for_status()
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            parsed = json.loads(text)
+            if isinstance(parsed, list) and parsed:
                 return parsed
-
-            except json.JSONDecodeError as e:
-                log(f"❌ Gemini JSON parse error on batch {batch_num}: {e}")
-                log(f"   Raw response (first 500 chars): {text[:500]}")
-                log(f"  Retrying in 15s...")
-                time.sleep(15)
-                continue
-            except Exception as e:
-                log(f"❌ Gemini error on batch {batch_num}: {e}")
-                log(f"  Retrying in 15s...")
-                time.sleep(15)
-                full_rotations += 1
-                continue
-        return None  # all rotations exhausted
-
-    # Sort=0 is always the chapter title row (e.g. "Kapitel 60 Auftauchen Und Das Rampenlicht Stehlen!").
-    # Gemini cannot return valid JSON for a 6-word title row reliably, and rephrasing it produces
-    # wrong output (all-lowercase, restructured titles). Bypass Gemini for sort=0 entirely —
-    # pass it through unchanged and let Rule G enforce correct title-case in post-processing.
-    _title_row = next((r for r in input_data if r.get("sort") == 0), None)
-    gemini_input_data = [r for r in input_data if r.get("sort") != 0]
-
-    # Split into batches and call Gemini for each
-    batches = [gemini_input_data[i:i+BATCH_SIZE] for i in range(0, len(gemini_input_data), BATCH_SIZE)]
-    total_batches = len(batches)
-    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
-
-    all_rephrased = []
-    key_count = len(GEMINI_KEYS)
-    log(f"  Using {key_count} Gemini key(s) (keys 1-{key_count}) with automatic rotation on 429.")
-    for i, batch in enumerate(batches, 1):
-        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
-        next_first = batches[i][0] if i < total_batches else None
-        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
-        if result is None:
-            log(f"❌ Batch {i} failed — all providers exhausted. Aborting.")
             return None
-        # ── Guard 1: Missing-sort reconciliation ────────────────────────────────
-        # Gemini occasionally returns fewer rows than were sent (output truncation,
-        # dropped rows under context pressure). Any missing sort number means that
-        # row would be absent from the final output — structural corruption.
-        # Detect and fill with the machine translation so no row is ever lost.
-        _result_sorts = {r.get("sort"): True for r in result}
-        _missing = [r for r in batch if r.get("sort") not in _result_sorts]
-        if _missing:
-            log(f"  ⚠️  Batch {i}: {len(_missing)} missing sort(s) from Gemini — restoring from MT: "
-                + ", ".join(str(r.get("sort")) for r in _missing))
-            for _mr in _missing:
-                result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
-        all_rephrased.extend(result)
-        # Clear RPM-exhausted state after each successful batch — keys that were
-        # rate-limited mid-chapter have likely recovered by the time the next batch starts.
-        # RPD-exhausted keys are preserved in _rpd_exhausted_keys and not affected.
-        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
-        if i < total_batches:
-            time.sleep(5)
-
-    log(f"  Total rows rephrased: {len(all_rephrased)}")
-
-    # Re-inject the bypassed title row (sort=0) with its original content.
-    # Rule G (post-processing below) will enforce correct title-case formatting.
-    if _title_row is not None:
-        all_rephrased.append({"sort": 0, "content": _title_row.get("content", ""),
-                               "_quote_role": _title_row.get("_quote_role", "none")})
-        all_rephrased = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
-
-    # ── Post-process: German dialogue punctuation enforcement ─────────────────
-    # _SV_CORE: Pure speech/communication verbs used for CROSS-ROW comma decisions
-    # (Rules B and C). Must be conservative — these verbs almost exclusively signal
-    # speech attribution and rarely appear as pure narrative action starters.
-    # Deliberately excludes dual-use action verbs like nickte, lächelte, seufzte,
-    # versprach, zögerte etc. which cause false positives when they start narrative rows.
-    _SV_CORE = (
-        r"sagte|flüsterte|antwortete|rief|fragte|murmelte|erwiderte|bemerkte|"
-        r"fügte|entgegnete|zischte|hauchte|stammelte|schrie|brüllte|"
-        r"wisperte|knurrte|ergänzte|meinte|verkündete|wiederholte|"
-        r"flehte|bat|raunte|schoss|konterte|erklärte|betonte|"
-        r"protestierte|unterbrach|insistierte|meldete|berichtete|informierte|"
-        r"teilte|verriet|offenbarte|kündigte|gestand|erkundigte|wandte|"
-        # Added: genuine attribution verbs confirmed by template rows 44, 49, 57, 116
-        r"wollte|beruhigte|erwähnte|wies|sprach|"
-        # Added: verbs of rebuke/correction whose BGS output is indistinguishable from
-        # speech attribution (schalt = schelten/to scold, tadelte = tadeln/to reprimand)
-        r"schalt|tadelte"
-    )
-    # _SV_ALL: Full verb list for INLINE same-row attribution matching (Rules C2, E, F,
-    # Fix 1b). Context (same-row dialogue) makes ambiguity much lower here.
-    _SV = (
-        _SV_CORE + r"|"
-        r"nickte|lächelte|seufzte|wisperte|schnappte|stöhnte|schluchzte|"
-        r"keuchte|grunzte|gluckste|bettelte|jammerte|klagte|schimpfte|fuhr|setzte|"
-        r"warf|stieß|spuckte|platzte|brach|fiel|gab|presste|rang|"
-        r"drängte|keifte|ächzte|sprach|gestand|bekannte|schwor|versprach|"
-        r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
-        r"zuckte|zögerte|stockte|hielt|begann|fuhr fort|schoss zurück|"
-        # Added: template row 30 — "neckte" (teased)
-        r"neckte|"
-        # Added: Screenshot 2 — spottete (mocked), höhnte (sneered/jeered)
-        r"spottete|höhnte"
-    )
-    # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
-    _NEGATION_AFTER_SV = _re.compile(
-        rf"(?:{_SV_CORE})\s+(?:nicht|kein|keine|keinen|keinem|keiner|nie|niemals|nichts)",
-        _re.IGNORECASE
-    )
-
-    # _BEGLEITSATZ_BASE: a genuine Begleitsatz starts DIRECTLY with the speech verb
-    # or with a lowercase pronoun + verb. The [Name]+[SV] arm is intentionally absent:
-    # "Jenifer murmelte leise vor sich hin." starts with a proper name, not the verb
-    # so the comma rule must not fire for those rows.
-    #
-    # \b after each verb alternation is required to prevent prefix false-positives:
-    # Without it, 'wies' matches 'Wieso?', 'schalt' matches 'Schaltete er',
-    # 'sprach' matches 'Sprache' — all legitimate dialogue/narrative rows that
-    # would be incorrectly restored from MT by the BGS confusion guard.
-    # Confirmed by simulation (2026-03-08): sort=116 „Wieso?" was falsely flagged.
-    _BEGLEITSATZ_BASE = _re.compile(
-        rf"""^(?:
-            (?:(?:{_SV_CORE})\b)
-            |
-            (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:(?:{_SV_CORE})\b))
-        )""",
-        _re.IGNORECASE | _re.VERBOSE
-    )
-
-    def _is_begleitsatz(text, _max_words=15):
-        """True only if text is a genuine attribution clause after dialogue.
-        Guards against false positives:
-          - Rows ending with ':' introduce NEW dialogue (not attributing previous speech)
-          - Long rows (> max_words=15) that aren't attribution — genuine Begleitsätze
-            are short (2-12 words typically). 30 was too permissive: "Er wollte sie
-            nicht wegen der Ereignisse..." (23w) matched 'er wollte' and triggered
-            a false positive restoration. 15 excludes all such narrative sentences.
-          - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
-        """
-        # Inline speech: attribution verb followed by colon + uppercase = introduces
-        # direct speech in the same row („Antwortete sie entschlossen: Nein.“) —
-        # this is NOT a pure Begleitsatz following previous speech.
-        if _re.search(r':\s+[A-ZÄÖÜ]', text):
-            return False
-        if text.rstrip().endswith(':'):
-            return False  # ends with ':' → introduces new speech, doesn't attribute old
-        if len(text.split()) > _max_words:
-            return False
-        if _NEGATION_AFTER_SV.search(text):
-            return False
-        return bool(_BEGLEITSATZ_BASE.match(text))
+        except Exception:
+            continue
+    return None
 
 
+def _unified_retry(all_rephrased, input_data, rows):
+    """Identify and retry rows that are verbatim, too similar to MT, or truncated.
+    
+    Combines the former mandatory-change pass, similarity guard, and truncation guard
+    into a single retry mechanism. Returns the updated list.
+    """
+    _input_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
+    mt_by_sort = {r.get("sort", i): (r.get("machineChapterContent") or r.get("modifChapterContent") or "")
+                  for i, r in enumerate(rows)}
+
+    # ── Collect all rows needing retry ────────────────────────────────────────
+    retry_candidates = {}  # sort -> (current_out, reference, reason)
+
+    for row in all_rephrased:
+        sort_n = row.get("sort")
+        out = row.get("content", "")
+        if not out or sort_n == 0:
+            continue
+
+        inp = _input_by_sort.get(sort_n, "")
+        mt  = mt_by_sort.get(sort_n, "")
+
+        # Check 1: Verbatim (identical to input)
+        if inp and out.strip() == inp.strip() and len(out.split()) >= 4:
+            retry_candidates[sort_n] = (out, inp, "verbatim")
+            continue
+
+        # Check 2: Too similar to MT
+        if mt and len(out.split()) >= 4:
+            if not any(q in out for q in ('„', '“', '”')):
+                sim = _row_sim(out, mt)
+                if sim >= SIM_THRESHOLD:
+                    retry_candidates[sort_n] = (out, mt, f"similar ({sim:.0%})")
+                    continue
+
+        # Check 3: Truncated (output < 35% of input words, input >= 6 words)
+        if inp:
+            inp_w = len(inp.split())
+            out_w = len(out.split())
+            if inp_w >= 6 and out_w < 0.35 * inp_w:
+                retry_candidates[sort_n] = (out, inp, f"truncated ({out_w}/{inp_w} words)")
+
+    if not retry_candidates:
+        log("  ✅ Unified retry: no rows need retrying.")
+        return all_rephrased
+
+    # ── Similarity diagnostic ──────────────────────────────────────────────
+    _sim_scores = []
+    for row in all_rephrased:
+        sort_n = row.get("sort")
+        out = row.get("content", "")
+        mt = mt_by_sort.get(sort_n, "")
+        if out and mt:
+            _sim_scores.append((sort_n, out, mt, _row_sim(out, mt)))
+    if _sim_scores:
+        bands = {"0-25%": 0, "25-50%": 0, "50-75%": 0, "75-90%": 0, "90-100%": 0}
+        for _, _, _, s in _sim_scores:
+            if s < 0.25:   bands["0-25%"] += 1
+            elif s < 0.50: bands["25-50%"] += 1
+            elif s < 0.75: bands["50-75%"] += 1
+            elif s < 0.90: bands["75-90%"] += 1
+            else:          bands["90-100%"] += 1
+        avg_sim = sum(s for _, _, _, s in _sim_scores) / len(_sim_scores)
+        above = sum(1 for _, _, _, s in _sim_scores if s >= SIM_THRESHOLD)
+        log(f"  [SIM DIAG] rows={len(_sim_scores)} avg={avg_sim:.0%} above_{SIM_THRESHOLD:.0%}={above}")
+        log(f"  [SIM DIAG] bands: " + " | ".join(f"{k}:{v}" for k, v in bands.items()))
+
+    # Hard cap
+    _MAX_RETRIES = 20
+    if len(retry_candidates) > _MAX_RETRIES:
+        log(f"  ⚠️  Unified retry: {len(retry_candidates)} rows flagged — capped at {_MAX_RETRIES}")
+        sorted_cands = sorted(retry_candidates.items(), key=lambda x: -len(x[1][0].split()))
+        retry_candidates = dict(sorted_cands[:_MAX_RETRIES])
+
+    log(f"  \U0001f504 Unified retry: {len(retry_candidates)} row(s) to retry...")
+    for sort_n, (out, ref, reason) in retry_candidates.items():
+        log(f"    sort={sort_n} [{reason}]: {out[:60]!r}")
+
+    # ── Retry each row ────────────────────────────────────────────────
+    rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
+
+    for sort_n, (current_out, ref_text, reason) in retry_candidates.items():
+        if "truncated" in reason:
+            prompt = (
+                "Du bist ein erfahrener deutscher Lektor. "
+                "Die folgende Zeile wurde zu stark gek\u00fcrzt und ist unvollst\u00e4ndig. "
+                "Formuliere den VOLLST\u00c4NDIGEN deutschen Text um "
+                "\u2014 bewahre alle Inhalte und Bedeutungen. K\u00fcrze NICHT.\n"
+                "Antworte NUR mit: "
+                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<vollst\u00e4ndig umformuliert>\"}]\n"
+                + json.dumps([{"sort": sort_n, "content": ref_text}], ensure_ascii=False)
+            )
+            temp = 0.7
+        elif "similar" in reason:
+            prompt = (
+                "Du bist ein erfahrener deutscher Lektor. Der folgende Satz ist zu "
+                "\u00e4hnlich zum Referenztext. Formuliere ihn deutlich um \u2014 verwende "
+                "andere Worte und Satzstruktur, ohne die Bedeutung zu ver\u00e4ndern. "
+                "Nat\u00fcrliches, idiomatisches Deutsch hat Priorit\u00e4t.\n"
+                "Antworte NUR mit: "
+                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<umformuliert>\"}]\n"
+                + json.dumps([{"sort": sort_n, "reference": ref_text, "content": current_out}],
+                             ensure_ascii=False)
+            )
+            temp = 0.9
+        else:  # verbatim
+            prompt = (
+                "Du bist ein erfahrener deutscher Lektor. Formuliere diesen deutschen Satz um \u2014 "
+                "verwende andere Worte oder Satzstruktur, ohne die Bedeutung zu ver\u00e4ndern. "
+                "Gib NICHT denselben Satz zur\u00fcck.\n"
+                "Antworte NUR mit: [{\"sort\": " + str(sort_n) + ", \"content\": \"<umformuliert>\"}]\n"
+                + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
+            )
+            temp = 1.0
+
+        result = _call_gemini_simple(prompt, temperature=temp,
+                                     max_tokens=1024 if "truncated" in reason else 512)
+        if result and result[0].get("content", "").strip():
+            new_content = result[0]["content"].strip()
+            if new_content != current_out:
+                new_sim = _row_sim(new_content, ref_text) if "similar" in reason else 0
+                log(f"    \u2705 sort={sort_n}: retry OK" + 
+                    (f" (sim={new_sim:.0%})" if new_sim else "") +
+                    f": {new_content[:60]!r}")
+                rephrased_by_sort[sort_n]["content"] = new_content
+            else:
+                log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged, keeping original")
+        else:
+            log(f"    \u26a0\ufe0f  sort={sort_n}: retry failed, keeping original")
+        time.sleep(1)
+
+    return sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
 
 
-    def _is_continuation_row(text):
-        """Cross-row comma decision: True iff the next row syntactically continues
-        the preceding dialogue and therefore requires a trailing comma on the
-        closing-quote row.
 
-        Root cause of Screenshots 1 & 3:
-          • Screenshot 1 (false positive): 'Kaum hatte er mir einen Stirnkuss
-            gegeben, fragte ich.' → starts with uppercase 'K' → new sentence →
-            no comma warranted, but _is_begleitsatz with IGNORECASE matched
-            'fragte' anywhere and fired.
-          • Screenshot 3 (false negative): 'versuchte Hendrick, mich zu
-            beruhigen.' → starts lowercase 'v' → is a continuation → comma
-            warranted, but 'versuchte' was absent from _SV_CORE so the check
-            returned False.
-
-        Fix: In German prose, a Begleitsatz (attribution clause) that follows
-        closing dialogue is ALWAYS syntactically subordinate — it continues the
-        sentence opened by the dialogue and therefore NEVER capitalises its first
-        word.  Conversely, a new sentence (action, description, new speaker) ALWAYS
-        starts with an uppercase letter.  Capitalisation is therefore a sufficient
-        and unambiguous discriminant:
-
-            lowercase-first  → continuation → comma required
-            uppercase-first  → new sentence → no comma
-
-        This replaces _is_begleitsatz() for cross-row comma decisions.
-        _is_begleitsatz() is retained for the BGS confusion guard (Pre-Pass QE),
-        where the task is different: detecting whether Gemini's entire output IS
-        an attribution clause, not whether the next row continues from dialogue.
-
-        Edge-case guards:
-          • Empty text → False
-          • Row ending with ':' → introduces new speech, does not attribute old
-            speech.  Even though it starts lowercase ('fragte sie: …'), no comma.
-        """
-        if not text or not text[0].islower():
-            return False
-        if text.rstrip().endswith(':'):
-            return False
-        return True
+def _post_process(sorted_rows, input_data, glossary_terms):
+    """Run all post-processing passes on sorted_rows (modified in place).
+    
+    Called after initial Gemini batch processing AND after each retry pass,
+    ensuring all output gets the same treatment (Pass QE, comma rules, glossary, etc.).
+    """
+    # Build lookup dicts from input_data
+    _orig_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
 
     comma_fixes = 0
     comma_adds = 0
     dash_fixes = 0
-    sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
 
     # ── Pre-Pass QE: BGS confusion guard ─────────────────────────────────────────
     # Gemini occasionally outputs a pure Begleitsatz (attribution clause) for a row
@@ -943,7 +774,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # This covers both dialogue rows AND narrative rows receiving displaced BGS.
         _eng_is_attribution = (
             not eng_s.lstrip().startswith('"')           # not itself dialogue
-            and len(eng_s.split()) <= 8                    # short sentence
+            and len(eng_s.split()) <= 12                   # short sentence
             and bool(_re.search(
                 r'\b(?:said|asked|replied|answered|whispered|shouted|called|muttered|'
                 r'remarked|added|continued|insisted|demanded|exclaimed|cried|'
@@ -1002,18 +833,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     #
     # German quote chars: „ = U+201E (opening), “ = U+201C (closing)
 
-    _QE_OPEN   = '„'  # „ U+201E
-    _QE_CLOSE  = '“'  # " U+201C
-    _QE_ANY_CLOSE_RE  = _re.compile(r'[“”"]')
-    _QE_CLOSE_AT_END  = _re.compile(r'[“”"]\s*[,!?.]?\s*$')
-    _QE_STARTS_OPEN   = _re.compile(r'^[„“”"]')
 
     _qe_role_by_sort  = {r.get("sort", i): r.get("_quote_role", "none")
                          for i, r in enumerate(input_data)}
     _qe_eng_by_sort   = {r.get("sort", i): r.get("original", "")
                          for i, r in enumerate(input_data)}
-    _QE_ENG_OPEN_RE   = _re.compile(r'^[„“”‘\"«]')
-    _QE_ENG_CLOSE_RE  = _re.compile(r'[“”\"]\s*[,!?.]?\s*$')
 
     qe_fixes = 0
     for row in sorted_rows:
@@ -1438,10 +1262,12 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
         # Pattern: „Text“, attribution verb.“  ← trailing “ is wrong.
         # Happens when LLM copies source quote position onto a restructured German sentence.
-        # GUARD: never strip when trailing “ follows ?/! — that closes genuine speech content
+        # GUARD 1: never strip when trailing “ follows ?/! — that closes genuine speech content
         # (e.g. INLINE_SPLIT rows: „Und“, fragte sie, „was?“  → trailing “ is valid).
+        # GUARD 2: never strip on role=both/open rows — Pass QE placed those quotes deliberately.
         c = row.get("content", "")
-        if (c.endswith('“') or c.endswith('”')) and _re.search(r'[“”"]\s*,\s*\w', c):
+        _rule_i_role = _qe_role_by_sort.get(row.get("sort"), "none")
+        if _rule_i_role not in ("both", "open") and (c.endswith('“') or c.endswith('”')) and _re.search(r'[“”"]\s*,\s*\w', c):
             if not _re.search(r'[?!][“”"]\s*$', c):  # safe: not closing genuine speech
                 stripped = c.rstrip('“”')
                 if stripped != c:
@@ -1469,7 +1295,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         replacement_pairs.sort(key=lambda x: len(x[0]), reverse=True)
 
         gloss_fixes = 0
-        for row in all_rephrased:
+        for row in sorted_rows:
             original_content = row.get("content", "")
             new_content = original_content
             for src, tgt in replacement_pairs:
@@ -1488,290 +1314,400 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if gloss_fixes:
             log(f"  📖 Post-processing: enforced glossary terms in {gloss_fixes} row(s).")
 
-    # ── Mandatory change pass: retry rows returned verbatim by Gemini ───────────
-    # CDReader rejects chapters where too many rows are unchanged from machine translation.
-    _input_by_sort = {r.get("sort", i): r.get("content", "") for i, r in enumerate(input_data)}
-    _mandatory_retry = [
-        (row.get("sort"), row.get("content", ""), _input_by_sort.get(row.get("sort"), ""))
-        for row in all_rephrased
-        if _input_by_sort.get(row.get("sort"), "")
-        and row.get("content", "").strip() == _input_by_sort.get(row.get("sort"), "").strip()
-        and len(row.get("content", "").split()) >= 4
-        and row.get("sort") != 0  # chapter title row — correct to be verbatim, never retry
+
+
+# ─── Phase 4: Rephrase with Gemini ───────────────────────────────────────────
+def rephrase_with_gemini(rows, glossary_terms, book_name):
+    if not GEMINI_KEYS:
+        log("❌ No GEMINI_API_KEY configured.")
+        return None
+
+    # Keep raw terms for per-batch filtering; also pre-format full list as fallback
+    glossary_text_full = format_glossary_for_prompt(glossary_terms)
+
+    # Build input data: sort + English original (context) + German to rephrase
+    # CONFIRMED by DIAG: chapterConetnt=English source, machineChapterContent=German machine translation
+    # Gemini must rephrase the German machine translation, NOT re-translate from English.
+
+    def _classify_quote_role(text):
+        """
+        Classify whether a text row is an opening, closing, middle, or standalone
+        dialogue line based on quote balance.
+        Returns one of: "open", "close", "middle_or_none", "both"
+        """
+        t = text.strip()
+        # Use regex so the quote characters are explicit Unicode escapes, not invisible literals
+        opens  = bool(_re.match(r'^„|“|"|\xab', t))   # „ " " «
+        closes = bool(_re.search(r'[“”"\xbb]\s*[,!?.]?\s*$', t))  # " " " »
+
+        if opens and closes:
+            return "both"
+        elif opens:
+            return "open"
+        elif closes:
+            return "close"
+        else:
+            return "middle_or_none"
+
+    raw_contents = [
+        # Use German machine translation as the text Gemini rephrases.
+        # chapterConetnt is English — using it would make Gemini re-translate from
+        # English, producing output similar to the existing machine translation.
+        r.get("machineChapterContent") or r.get("modifChapterContent") or r.get("peContent") or ""
+        for r in rows
     ]
-    if _mandatory_retry:
-        log(f"  🔄 Mandatory change pass: {len(_mandatory_retry)} verbatim row(s)...")
-        rephrased_by_sort_m = {r.get("sort"): r for r in all_rephrased}
-        for sort_n, current_out, orig_inp in _mandatory_retry:
-            retry_prompt = (
-                "Du bist ein erfahrener deutscher Lektor. Formuliere diesen deutschen Satz um — "
-                "verwende andere Worte oder Satzstruktur, ohne die Bedeutung zu verändern. "
-                "Gib NICHT denselben Satz zurück.\n"
-                "Antworte NUR mit: [{\"sort\": " + str(sort_n) + ", \"content\": \"<umformuliert>\"}]\n"
-                + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
-            )
-            _last_exc_str = None
-            _repeated_exc_count = 0
-            for api_key in ([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS):
-                try:
-                    r_resp = requests.post(
-                        f"{GEMINI_URL}?key={api_key}",
-                        json={"contents": [{"parts": [{"text": retry_prompt}]}],
-                              "generationConfig": {"temperature": 1.0, "maxOutputTokens": 512}},
-                        timeout=45,
-                    )
-                    if r_resp.status_code == 429: continue
-                    r_resp.raise_for_status()
-                    r_text = r_resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    if r_text.startswith("```"):
-                        r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                    parsed = json.loads(r_text)
-                    if isinstance(parsed, list) and parsed:
-                        result = parsed[0].get("content", "").strip()
-                        if result and result != current_out:
-                            log(f"    ✅ sort={sort_n}: {current_out[:40]!r} → {result[:40]!r}")
-                            rephrased_by_sort_m[sort_n]["content"] = result
-                        else:
-                            log(f"    ⚠️  sort={sort_n}: still unchanged after retry")
-                    break
-                except Exception as exc:
-                    exc_str = str(exc)
-                    log(f"    ⚠️  sort={sort_n} retry error: {exc_str}")
-                    # Early bail: if the same error repeats 3 times the problem is
-                    # content-based (e.g. Gemini consistently returns malformed JSON
-                    # for this specific row), not a key issue. Further retries waste
-                    # keys and time — bail immediately.
-                    if exc_str == _last_exc_str:
-                        _repeated_exc_count += 1
-                        if _repeated_exc_count >= 2:  # 3 identical errors total
-                            log(f"    ⛔ sort={sort_n}: same error 3×, content-based failure — skipping row")
-                            break
-                    else:
-                        _last_exc_str = exc_str
-                        _repeated_exc_count = 0
-                    continue
-        all_rephrased = sorted(rephrased_by_sort_m.values(), key=lambda r: r.get("sort", 0))
-    else:
-        log(f"  ✅ Mandatory change pass: all rows were modified.")
-
-    # ── Similarity guard: retry rows too similar to CDReader's reference texts ──
-    # CDReader triggers ErrMessage10 when submitted text is too similar to its
-    # stored machine translation. We log a full distribution to diagnose failures.
-
-    def _row_sim(output, ref):
-        """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
-        def _norm(s):
-            return _re.sub(r"[^\w\s]", "", s.lower())
-        def _jaccard(a, b):
-            wa = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
-            wb = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
-            return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
-        def _trigram(a, b):
-            na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
-            nb = set(b[i:i+3] for i in range(max(0, len(b)-2)))
-            return len(na & nb) / len(na | nb) if (na and nb) else 0.0
-        no, nr = _norm(output), _norm(ref)
-        return max(_jaccard(no, nr), _trigram(no, nr))
-
-    SIM_THRESHOLD = 0.90   # flag rows at or above this combined similarity
-    # 0.90 chosen because Jaccard word-overlap scores well-rephrased sentences at 50-75%;
-    # only genuinely unchanged or near-identical rows score above 90%.
-
-    # chapterConetnt is ENGLISH \u2014 only compare against machineChapterContent (German).
-    # Read machineChapterContent directly from raw API rows.
-    # "machine_translation" only exists in input_data, NOT in rows — hence no_ref=146 bug.
-    mt_by_sort = {r.get("sort", i): (r.get("machineChapterContent") or r.get("modifChapterContent") or "")
-                  for i, r in enumerate(rows)}
-
-    # \u2500\u2500 Diagnostic: log full similarity distribution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    _sim_scores = []
-    _rows_no_ref = 0
-    _rows_identical = 0
-    for row in all_rephrased:
-        sort_n = row.get("sort")
-        out    = row.get("content", "")
-        mt     = mt_by_sort.get(sort_n, "")
-        if not out:
-            continue
-        if not mt:
-            _rows_no_ref += 1
-            continue
-        sim = _row_sim(out, mt)
-        _sim_scores.append((sort_n, out, mt, sim))
-        if sim >= 0.99:
-            _rows_identical += 1
-
-    _total_checked = len(_sim_scores)
-    if _total_checked:
-        bands = {"0-25%": 0, "25-50%": 0, "50-75%": 0, "75-90%": 0, "90-100%": 0}
-        for _, _, _, s in _sim_scores:
-            if s < 0.25:   bands["0-25%"] += 1
-            elif s < 0.50: bands["25-50%"] += 1
-            elif s < 0.75: bands["50-75%"] += 1
-            elif s < 0.90: bands["75-90%"] += 1
-            else:          bands["90-100%"] += 1
-        avg_sim = sum(s for _, _, _, s in _sim_scores) / _total_checked
-        above_thresh = sum(1 for _, _, _, s in _sim_scores if s >= SIM_THRESHOLD)
-        log(f"  [SIM DIAG] rows_with_ref={_total_checked} no_ref={_rows_no_ref} "
-            f"identical={_rows_identical} avg={avg_sim:.0%} above_{SIM_THRESHOLD:.0%}={above_thresh}")
-        log(f"  [SIM DIAG] bands: " + " | ".join(f"{k}:{v}" for k, v in bands.items()))
-        top5 = sorted(_sim_scores, key=lambda x: x[3], reverse=True)[:5]
-        for sn, out_s, mt_s, sim_s in top5:
-            log(f"  [SIM DIAG] sort={sn} sim={sim_s:.0%}: out={out_s[:45]!r} ref={mt_s[:45]!r}")
-    else:
-        log(f"  [SIM DIAG] no rows with machineChapterContent \u2014 no_ref={_rows_no_ref} (guard blind!)")
-
-    # Exclude short rows (< 4 words) from similarity retry --
-    # single-word exclamations like "Emma!" cannot be rephrased and score 100%.
-    similar_rows = [
-        (sn, out, mt, sim) for sn, out, mt, sim in _sim_scores
-        if sim >= SIM_THRESHOLD and len(out.split()) >= 4
-        # Never rewrite dialogue rows — speech content is constrained by meaning;
-        # high similarity to the machine translation is expected and correct.
-        and not any(q in out for q in ('„', '“', '”'))
-        and sn != 0  # chapter title row — always verbatim by design
+    # English source (chapterConetnt) used as context only, not as content to rephrase
+    english_originals = [
+        r.get("chapterConetnt") or r.get("eContent") or r.get("eeContent") or ""
+        for r in rows
     ]
 
-    if similar_rows:
-        # Hard cap: if more than 15 rows need retrying something is systematically wrong
-        # (e.g. a bug caused mass MT restoration). Retry only the longest rows up to
-        # this cap rather than spinning off 50+ individual Gemini calls and timing out.
-        _SIM_MAX_RETRIES = 15
-        if len(similar_rows) > _SIM_MAX_RETRIES:
-            log(f"  ⚠️  Similarity guard: {len(similar_rows)} rows flagged — capped at {_SIM_MAX_RETRIES} "
-                f"(longest rows prioritised). High count likely indicates a systematic issue.")
-            similar_rows = sorted(similar_rows, key=lambda x: len(x[1].split()), reverse=True)[:_SIM_MAX_RETRIES]
-        log(f"  \U0001f504 Similarity guard: {len(similar_rows)} row(s) above {SIM_THRESHOLD:.0%} \u2014 re-requesting...")
-        rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
-
-        for sort_n, current_out, ref_text, sim in similar_rows:
-            log(f"    sort={sort_n} sim={sim:.0%}: {current_out[:70]!r}")
-
-            retry_row = [{"sort": sort_n, "reference": ref_text, "content": current_out}]
-            retry_prompt = (
-                BASE_PROMPT + "\n\n"
-                "SIMILARITY RE-REQUEST \u2014 ONE ROW ONLY\n"
-                "The row below was flagged: its current rephrasing is too similar to "
-                "the reference text (" + f"{sim:.0%}" + " similarity). "
-                "CDReader will reject the chapter if this is not improved. "
-                "Rewrite it with clearly different vocabulary and/or sentence structure "
-                "while preserving the exact same meaning. "
-                "Natural, idiomatic German is still the priority \u2014 do not produce "
-                "stilted language just to differ.\n\n"
-                "  - \"reference\": the text your output must clearly differ from\n"
-                "  - \"content\": the current phrasing to improve\n\n"
-                "Return ONLY a JSON array with one object: "
-                "{\"sort\": <number>, \"content\": \"<rewritten text>\"}\n"
-                + json.dumps(retry_row, ensure_ascii=False)
-            )
-
-            retry_result = None
-            try:
-                keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS
-                for api_key in keys_to_try:
-                    try:
-                        r_resp = requests.post(
-                            f"{GEMINI_URL}?key={api_key}",
-                            json={
-                                "contents": [{"parts": [{"text": retry_prompt}]}],
-                                "generationConfig": {"temperature": 0.9, "maxOutputTokens": 512},
-                            },
-                            timeout=45,
-                        )
-                        if r_resp.status_code == 429:
-                            continue
-                        r_resp.raise_for_status()
-                        r_body = r_resp.json()
-                        r_text = r_body["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        if r_text.startswith("```"):
-                            r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                        parsed = json.loads(r_text)
-                        if isinstance(parsed, list) and parsed:
-                            retry_result = parsed[0].get("content", "").strip()
-                        break
-                    except Exception:
-                        continue
-            except Exception as exc:
-                log(f"    \u26a0\ufe0f  Similarity retry exception: {exc}")
-
-            if retry_result and retry_result != current_out:
-                new_sim = _row_sim(retry_result, ref_text)
-                log(f"    \u2705 sort={sort_n} new sim={new_sim:.0%}: {retry_result[:70]!r}")
-                rephrased_by_sort[sort_n]["content"] = retry_result
+    # Determine quote roles using the ENGLISH source, not the German MT.
+    # German MT frequently has „ without closing ", which causes the state machine
+    # to get stuck in in_dialogue=True and misclassify all subsequent no-quote rows
+    # as "middle" when they are independent dialogue lines or narrative.
+    # English quote placement is self-consistent and reliable for open/close tracking.
+    quote_roles = []
+    in_dialogue = False
+    for i, eng_text in enumerate(english_originals):
+        role = _classify_quote_role(eng_text)
+        if role == "both":
+            in_dialogue = False
+            quote_roles.append("both")
+        elif role == "open":
+            in_dialogue = True
+            quote_roles.append("open")
+        elif role == "close":
+            in_dialogue = False
+            quote_roles.append("close")
+        elif role == "middle_or_none":
+            if in_dialogue:
+                quote_roles.append("middle")
             else:
-                log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged or failed, keeping original")
-            time.sleep(1)  # avoid RPM burnout across multiple similarity retries
+                quote_roles.append("none")
+        else:
+            in_dialogue = False
+            quote_roles.append("none")
 
-        all_rephrased = sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
-    else:
-        log(f"  \u2705 Similarity guard: all rows within threshold.")
+    input_data = [
+        {
+            "sort": r.get("sort", i),
+            "original": english_originals[i],   # English source — context for Gemini
+            "content": raw_contents[i],           # German machine translation — primary text to rephrase
+            "machine_translation": raw_contents[i],  # same German text used by similarity guard
+            "_quote_role": quote_roles[i],
+        }
+        for i, r in enumerate(rows)
+    ]
+    non_empty = sum(1 for r in input_data if r["content"].strip())
+    log(f"  Input data: {len(input_data)} rows, {non_empty} with non-empty content")
+    if rows:
+        r0 = rows[0]
+        fields = ["chapterConetnt","eContent","eeContent","modifChapterContent","machineChapterContent","languageContent","peContent","referenceContent"]
+        log("  Field presence: " + ", ".join(f"{f}={bool(r0.get(f))}" for f in fields))
 
-    # ── Truncation guard: re-request rows with severely shortened output ──────────
-    # Catches cases where Gemini truncated long rows (e.g. „Sie…" from a 25-word input).
-    # Threshold: output < 35% of input words, with input >= 6 words.
-    # Re-requests using same single-row Gemini pattern as mandatory change pass.
-    _trunc_input_by_sort = {r.get("sort", i): r.get("content", "")
-                             for i, r in enumerate(input_data)}
-    _trunc_candidates = []
-    for _tr_row in all_rephrased:
-        _tr_sort = _tr_row.get("sort")
-        _tr_out  = _tr_row.get("content", "")
-        _tr_inp  = _trunc_input_by_sort.get(_tr_sort, "")
-        if not _tr_inp or not _tr_out:
-            continue
-        _tr_inp_w = len(_tr_inp.split())
-        _tr_out_w = len(_tr_out.split())
-        if _tr_inp_w >= 6 and _tr_out_w < 0.35 * _tr_inp_w:
-            _trunc_candidates.append((_tr_sort, _tr_out, _tr_inp))
-            log(f"  \u26a0\ufe0f  Truncation detected sort={_tr_sort}: "
-                f"{_tr_inp_w} input words \u2192 {_tr_out_w} output words: {_tr_out[:60]!r}")
+    BATCH_SIZE = 40
+    MAX_RETRIES = 3
+    MAX_RETRIES_429 = 3    # If 429 persists beyond 3 tries, RPD is likely exhausted — fail fast
 
-    if _trunc_candidates:
-        log(f"  \U0001f504 Truncation re-request: {len(_trunc_candidates)} row(s)...")
-        _trunc_by_sort = {r.get("sort"): r for r in all_rephrased}
-        for _tr_sort, _tr_current, _tr_orig in _trunc_candidates:
-            _trunc_prompt = (
-                "Du bist ein erfahrener deutscher Lektor. "
-                "Die folgende Zeile wurde zu stark gek\u00fcrzt und ist unvollst\u00e4ndig. "
-                "Formuliere den VOLLST\u00c4NDIGEN deutschen Text um "
-                "\u2014 bewahre alle Inhalte und Bedeutungen. K\u00fcrze NICHT.\n"
-                "Antworte NUR mit: "
-                "[{\"sort\": " + str(_tr_sort) + ", \"content\": \"<vollst\u00e4ndig umformuliert>\"}]\n"
-                + json.dumps([{"sort": _tr_sort, "content": _tr_orig}], ensure_ascii=False)
+    def _fix_json_strings(s):
+        """Fix literal newlines/tabs inside JSON string values."""
+        result = []
+        in_string = False
+        escape_next = False
+        for ch in s:
+            if escape_next:
+                result.append(ch)
+                escape_next = False
+            elif ch == '\\':
+                result.append(ch)
+                escape_next = True
+            elif ch == '"' and not escape_next:
+                in_string = not in_string
+                result.append(ch)
+            elif in_string and ch == '\n':
+                result.append('\\n')
+            elif in_string and ch == '\r':
+                result.append('\\r')
+            elif in_string and ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        return ''.join(result)
+
+    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None):
+        """Build the prompt string and clean batch data, shared by both providers."""
+        lookahead_note = ""
+        if next_batch_first is not None:
+            lookahead_note = (
+                "\n\nLOOKAHEAD (do NOT rephrase, use ONLY to decide if last row needs a trailing comma):\n"
+                f"The row immediately following this batch starts with: {json.dumps(next_batch_first.get('content', ''), ensure_ascii=False)}"
             )
-            for _api_key in ([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS):
-                try:
-                    _tr_resp = requests.post(
-                        f"{GEMINI_URL}?key={_api_key}",
-                        json={"contents": [{"parts": [{"text": _trunc_prompt}]}],
-                              "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}},
-                        timeout=45,
-                    )
-                    if _tr_resp.status_code == 429:
-                        continue
-                    _tr_resp.raise_for_status()
-                    _tr_text = _tr_resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    if _tr_text.startswith("```"):
-                        _tr_text = _tr_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                    _tr_parsed = json.loads(_tr_text)
-                    if isinstance(_tr_parsed, list) and _tr_parsed:
-                        _tr_result = _tr_parsed[0].get("content", "").strip()
-                        _tr_result_w = len(_tr_result.split())
-                        if _tr_result and _tr_result_w >= 0.55 * len(_tr_orig.split()):
-                            log(f"    \u2705 sort={_tr_sort}: truncation fixed ({_tr_result_w} words): {_tr_result[:60]!r}")
-                            _trunc_by_sort[_tr_sort]["content"] = _tr_result
-                        elif _tr_result:
-                            log(f"    \u26a0\ufe0f  sort={_tr_sort}: still short ({_tr_result_w} words), using best result")
-                            _trunc_by_sort[_tr_sort]["content"] = _tr_result
-                    break
-                except Exception as _tr_exc:
-                    log(f"    \u26a0\ufe0f  sort={_tr_sort} truncation retry error: {_tr_exc}")
-                    continue
-        all_rephrased = sorted(_trunc_by_sort.values(), key=lambda r: r.get("sort", 0))
-    else:
-        log(f"  \u2705 Truncation guard: no truncated rows detected.")
+        clean_batch = [
+            {
+                "sort": r["sort"],
+                "original": r.get("original", ""),
+                "machine_translation": r.get("machine_translation", ""),
+                "content": r["content"],
+            }
+            for r in batch_data
+        ]
+        quote_hints = []
+        for r in batch_data:
+            role = r.get("_quote_role", "both")
+            sort_n = r['sort']
+            if role == "open":
+                quote_hints.append(f"  sort {sort_n}: OPENS a multi-row dialogue — use „ to open, NO closing “ at end")
+            elif role == "close":
+                quote_hints.append(f"  sort {sort_n}: CLOSES a multi-row dialogue — NO opening „, but add closing “ at end")
+            elif role == "middle":
+                quote_hints.append(f"  sort {sort_n}: MIDDLE of a multi-row dialogue — NO opening or closing quotes")
+        quote_hint_block = ""
+        if quote_hints:
+            quote_hint_block = "\n\nMULTI-ROW DIALOGUE STRUCTURE (follow exactly):\n" + "\n".join(quote_hints)
 
-    return all_rephrased
+        # Filter glossary to only terms present in this batch's text — reduces prompt
+        # size dramatically and keeps
+        # the model focused on only the relevant terms rather than all 200+ entries.
+        batch_text = " ".join(
+            (r.get("original", "") + " " + r.get("content", "")).lower()
+            for r in batch_data
+        )
+        if glossary_terms:
+            # Build a set of all English words present in the batch (lowercased)
+            # for efficient multi-word substring matching.
+            batch_text_lower = batch_text.lower()
+            def _term_in_batch(term):
+                key = (term.get("dictionaryKey") or "").strip().lower()
+                sur = (term.get("enSurname") or "").strip().lower()
+                return (key and key in batch_text_lower) or (sur and sur in batch_text_lower)
+
+            merged = [t for t in glossary_terms if _term_in_batch(t)]
+            # Fallback: if filter produces nothing (e.g. batch is all German already),
+            # send the full list so the model still has context.
+            if not merged:
+                merged = glossary_terms
+            batch_glossary_text = format_glossary_for_prompt(merged)
+        else:
+            merged = []
+            batch_glossary_text = glossary_text_full
+        log(f"  Glossary for batch {batch_num}: {len(merged)} relevant terms (of {len(glossary_terms or [])} total)")
+
+        prompt = (
+            f"{BASE_PROMPT}\n\n"
+            f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
+            f"{batch_glossary_text}\n\n"
+            f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
+            f"For each row:\n"
+            f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
+            f"  - \"content\": German machine translation — this is what you MUST rephrase. "
+            f"Rewrite it in natural, idiomatic German while preserving the exact meaning. "
+            f"Your output must differ from the input in vocabulary or sentence structure — "
+            f"returning a row IDENTICAL to the input is a hard validation error and will "
+            f"cause CDReader to reject the entire chapter. Even short rows must have "
+            f"at minimum a small synonym substitution or word-order change.\n"
+            f"Return ONLY a JSON array; each object must have \"sort\" and \"content\" only.\n"
+            f"{json.dumps(clean_batch, ensure_ascii=False)}{quote_hint_block}{lookahead_note}"
+        )
+        return prompt, clean_batch
+
+    def _parse_llm_response(text, batch_num):
+        """Parse JSON from LLM response text, with fallback fix."""
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            text = text.rsplit("```", 1)[0].strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return json.loads(_fix_json_strings(text))
+
+    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
+        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
+
+        # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
+        # RPD-exhausted keys (daily quota) are marked permanently and never retried.
+        # Max full RPM-reset rotations before giving up: MAX_RETRIES_429
+        resp = None  # safe before first request; allows Retry-After header read in wait block
+        full_rotations = 0
+        while full_rotations < MAX_RETRIES_429:
+            try:
+                # Fail fast if every key has hit its daily quota
+                if _all_keys_rpd_dead():
+                    log(f"❌ All Gemini keys have hit their daily quota (RPD). No point retrying.")
+                    return None
+                api_key = _next_gemini_key()
+                if not api_key:
+                    # All remaining (non-RPD) keys are RPM-exhausted — wait for reset
+                    full_rotations += 1
+                    if full_rotations >= MAX_RETRIES_429:
+                        log(f"❌ All Gemini keys RPM-exhausted after {MAX_RETRIES_429} rotation(s) on batch {batch_num}.")
+                        return None
+                    # Honour Retry-After header if present (more precise than flat 60s)
+                    retry_after = None
+                    try:
+                        retry_after = int(resp.headers.get("Retry-After", 0))
+                    except Exception:
+                        pass
+                    wait = retry_after if retry_after and retry_after > 0 else 60
+                    rpm_exhausted_count = len([k for k in GEMINI_KEYS if k in _exhausted_keys and k not in _rpd_exhausted_keys])
+                    log(f"  ⚠️ {rpm_exhausted_count} key(s) RPM-limited. Waiting {wait}s for reset (rotation {full_rotations}/{MAX_RETRIES_429})...")
+                    _exhausted_keys.clear()  # only clears RPM-exhausted, not RPD
+                    time.sleep(wait)
+                    continue
+                resp = requests.post(
+                    f"{GEMINI_URL}?key={api_key}",
+                    json={
+                        "contents": [{"parts": [{"text": batch_prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.3,
+                            "maxOutputTokens": 16384,
+                            "responseMimeType": "application/json",
+                        },
+                    },
+                    timeout=300,
+                )
+                if resp.status_code == 429:
+                    # Parse error body to distinguish RPD (daily) from RPM (per-minute)
+                    is_rpd = False
+                    try:
+                        err_body = resp.json()
+                        err_obj = err_body.get("error", {})
+                        err_msg = str(err_obj.get("message", "")).lower()
+                        err_status = str(err_obj.get("status", "")).upper()
+                        err_details = str(err_obj.get("details", "")).lower()
+                        combined = err_msg + err_details
+                        # RPD keywords: covers both "exceeded your current quota / billing"
+                        # messages AND classic "per day / daily" quota messages
+                        rpd_keywords = (
+                            "per day", "daily", "1 day", "per_day",
+                            "billing", "your current quota", "quota_exceeded",
+                            "check your plan",
+                        )
+                        is_rpd = (
+                            any(kw in combined for kw in rpd_keywords)
+                            or err_status == "RESOURCE_EXHAUSTED"
+                        )
+                        limit_hint = f" [{err_msg[:80]}]" if err_msg else ""
+                    except Exception:
+                        limit_hint = ""
+                    if is_rpd:
+                        _rpd_exhausted_keys.add(api_key)
+                        _exhausted_keys.add(api_key)
+                        remaining = len([k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys])
+                        log(f"  📵 Key daily quota (RPD) exhausted{limit_hint}, {remaining} key(s) left...")
+                    else:
+                        _exhausted_keys.add(api_key)
+                        remaining = len([k for k in GEMINI_KEYS if k not in _exhausted_keys])
+                        log(f"  🔄 Key RPM-limited{limit_hint}, {remaining} key(s) remaining...")
+                    continue
+                resp.raise_for_status()
+                body = resp.json()
+
+                # Log finish reason for diagnostics
+                finish_reason = (body.get("candidates", [{}])[0].get("finishReason", "?"))
+                if finish_reason not in ("STOP", ""):
+                    log(f"  ⚠️ Gemini finishReason={finish_reason} on batch {batch_num}")
+
+                text = (
+                    body.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                if not text:
+                    log(f"❌ Empty Gemini response on batch {batch_num}: {body}")
+                    return None
+                # Success — exit retry loop
+
+                parsed = _parse_llm_response(text, batch_num)
+                log(f"  Batch {batch_num}/{total_batches}: {len(parsed)} rows from Gemini.")
+                return parsed
+
+            except json.JSONDecodeError as e:
+                log(f"❌ Gemini JSON parse error on batch {batch_num}: {e}")
+                log(f"   Raw response (first 500 chars): {text[:500]}")
+                log(f"  Retrying in 15s...")
+                time.sleep(15)
+                continue
+            except Exception as e:
+                log(f"❌ Gemini error on batch {batch_num}: {e}")
+                log(f"  Retrying in 15s...")
+                time.sleep(15)
+                full_rotations += 1
+                continue
+        return None  # all rotations exhausted
+
+    # Sort=0 is always the chapter title row (e.g. "Kapitel 60 Auftauchen Und Das Rampenlicht Stehlen!").
+    # Gemini cannot return valid JSON for a 6-word title row reliably, and rephrasing it produces
+    # wrong output (all-lowercase, restructured titles). Bypass Gemini for sort=0 entirely —
+    # pass it through unchanged and let Rule G enforce correct title-case in post-processing.
+    _title_row = next((r for r in input_data if r.get("sort") == 0), None)
+    gemini_input_data = [r for r in input_data if r.get("sort") != 0]
+
+    # Split into batches and call Gemini for each
+    batches = [gemini_input_data[i:i+BATCH_SIZE] for i in range(0, len(gemini_input_data), BATCH_SIZE)]
+    total_batches = len(batches)
+    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
+
+    all_rephrased = []
+    key_count = len(GEMINI_KEYS)
+    log(f"  Using {key_count} Gemini key(s) (keys 1-{key_count}) with automatic rotation on 429.")
+    for i, batch in enumerate(batches, 1):
+        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
+        next_first = batches[i][0] if i < total_batches else None
+        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
+        if result is None:
+            # Fall back to MT content for this batch — the similarity guard will
+            # flag these rows for retry, converting a hard failure into degraded
+            # quality that can be partially recovered.
+            log(f"  ⚠️  Batch {i} failed — falling back to MT for {len(batch)} rows.")
+            result = [{"sort": r.get("sort"), "content": r.get("content", "")} for r in batch]
+        # ── Guard 1: Missing-sort reconciliation ────────────────────────────────
+        # Gemini occasionally returns fewer rows than were sent (output truncation,
+        # dropped rows under context pressure). Any missing sort number means that
+        # row would be absent from the final output — structural corruption.
+        # Detect and fill with the machine translation so no row is ever lost.
+        _result_sorts = {r.get("sort"): True for r in result}
+        _missing = [r for r in batch if r.get("sort") not in _result_sorts]
+        if _missing:
+            log(f"  ⚠️  Batch {i}: {len(_missing)} missing sort(s) from Gemini — restoring from MT: "
+                + ", ".join(str(r.get("sort")) for r in _missing))
+            for _mr in _missing:
+                result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
+        all_rephrased.extend(result)
+        # Clear RPM-exhausted state after each successful batch — keys that were
+        # rate-limited mid-chapter have likely recovered by the time the next batch starts.
+        # RPD-exhausted keys are preserved in _rpd_exhausted_keys and not affected.
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+        if i < total_batches:
+            time.sleep(5)
+
+    log(f"  Total rows rephrased: {len(all_rephrased)}")
+
+    # Re-inject the bypassed title row (sort=0) with its original content.
+    # Rule G (post-processing below) will enforce correct title-case formatting.
+    if _title_row is not None:
+        all_rephrased.append({"sort": 0, "content": _title_row.get("content", ""),
+                               "_quote_role": _title_row.get("_quote_role", "none")})
+        all_rephrased = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+
+
+    # ── Post-processing + unified retry loop ─────────────────────────────
+    # Run post-processing on initial Gemini output
+    sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+    _post_process(sorted_rows, input_data, glossary_terms)
+
+    # Unified retry: identify and re-request verbatim, similar, or truncated rows
+    all_rephrased = _unified_retry(sorted_rows, input_data, rows)
+
+    # Re-run post-processing on retry output to ensure retried rows get
+    # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
+    sorted_final = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
+    _post_process(sorted_final, input_data, glossary_terms)
+
+    return sorted_final
+
 
 
 
