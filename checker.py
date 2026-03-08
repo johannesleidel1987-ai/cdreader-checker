@@ -533,10 +533,6 @@ _QE_ANY_CLOSE_RE  = _re.compile(r'[“”"]')
 _QE_CLOSE_AT_END  = _re.compile(r'[“”"]\s*[,!?.]?\s*$')
 _QE_STARTS_OPEN   = _re.compile(r'^[„“”"]')
 
-_qe_role_by_sort  = {r.get("sort", i): r.get("_quote_role", "none")
-                     for i, r in enumerate(input_data)}
-_qe_eng_by_sort   = {r.get("sort", i): r.get("original", "")
-                     for i, r in enumerate(input_data)}
 _QE_ENG_OPEN_RE   = _re.compile(r'^[„“”‘\"«]')
 _QE_ENG_CLOSE_RE  = _re.compile(r'[“”\"]\s*[,!?.]?\s*$')
 
