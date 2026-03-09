@@ -753,9 +753,15 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
     for api_key in rpm_retry:
         try:
             result, is_rpd, is_rpm = _one_call(api_key)
-            if is_rpd or is_rpm:
-                # Still rate-limited after 15 s — treat as permanently exhausted for this run
+            if is_rpd:
+                # Confirmed daily quota exhausted — permanently dead for this run
                 _rpd_exhausted_keys.add(api_key)
+                continue
+            if is_rpm:
+                # Still temporarily RPM-limited after 15 s — skip without permanently killing.
+                # Key 28 (paid) must never be added to _rpd_exhausted_keys for an RPM hit;
+                # the next row's _call_gemini_simple call will find it alive again once the
+                # per-minute window has rolled over.
                 continue
             return result
         except Exception:
