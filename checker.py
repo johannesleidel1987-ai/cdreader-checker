@@ -44,6 +44,16 @@ _GEMINI_KEYS_RAW = [
     os.environ.get("GEMINI_API_KEY_16", ""),
     os.environ.get("GEMINI_API_KEY_17", ""),
     os.environ.get("GEMINI_API_KEY_18", ""),
+    os.environ.get("GEMINI_API_KEY_19", ""),
+    os.environ.get("GEMINI_API_KEY_20", ""),
+    os.environ.get("GEMINI_API_KEY_21", ""),
+    os.environ.get("GEMINI_API_KEY_22", ""),
+    os.environ.get("GEMINI_API_KEY_23", ""),
+    os.environ.get("GEMINI_API_KEY_24", ""),
+    os.environ.get("GEMINI_API_KEY_25", ""),
+    os.environ.get("GEMINI_API_KEY_26", ""),
+    os.environ.get("GEMINI_API_KEY_27", ""),
+    os.environ.get("GEMINI_API_KEY_28", ""),
 ]
 GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
@@ -6907,7 +6917,7 @@ def run_test():
         f"key {i+1}: {'✅' if k else '⚠️ not set'}"
         for i, k in enumerate(
             os.environ.get(f"GEMINI_API_KEY{'_' + str(i) if i > 0 else ''}", "")
-            for i in range(18)
+            for i in range(28)
         )
     )
     log(f"Gemini key status: {key_statuses}")
@@ -6993,7 +7003,7 @@ def run_test():
     msg = (
         f"{status_icon} <b>CDReader: TEST MODE result</b>\n\n"
         f"🔑 Gemini keys active: {key_count}\n"
-        f"🔑 Keys configured: {len(GEMINI_KEYS)}/{18}\n"
+        f"🔑 Keys configured: {len(GEMINI_KEYS)}/{28}\n"
         f"📝 Rows processed: {len(result)}/{len(TEST_ROWS)}\n"
         f"⚠️  Soft warnings: {len(soft)}\n"
         f"❌ Hard issues: {len(hard)}\n"
