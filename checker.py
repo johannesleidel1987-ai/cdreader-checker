@@ -67,6 +67,12 @@ def _all_keys_rpd_dead():
 DRY_RUN   = os.environ.get("DRY_RUN",   "false").lower() == "true"
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
+# Manual override: skip Task Center scan and claiming, process a specific chapter directly.
+# Use when re-processing a chapter that was finished but flagged for rework.
+# Both values are visible in every run log's Task Center output (taskUrl: "...|chapterId|bookId").
+OVERRIDE_CHAPTER_ID = os.environ.get("OVERRIDE_CHAPTER_ID", "").strip()
+OVERRIDE_BOOK_ID    = os.environ.get("OVERRIDE_BOOK_ID",    "").strip()
+
 HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "de,de-DE;q=0.9,en;q=0.8",
@@ -1939,85 +1945,111 @@ def run():
     claimed_chapters = []
     errors = []
 
+    # ── Override mode: process a specific chapter directly ──
+    if OVERRIDE_CHAPTER_ID:
+        proc_id = int(OVERRIDE_CHAPTER_ID)
+        log(f"🔧 OVERRIDE MODE: processing chapter_id={proc_id} directly (skipping Task Center + claiming)")
+
+        # Resolve book from override or scan
+        if OVERRIDE_BOOK_ID:
+            override_book_id = int(OVERRIDE_BOOK_ID)
+            matched_book = None
+            for b in books:
+                b_id = b.get("id") or b.get("objectBookId") or b.get("bookId")
+                if str(b_id) == str(override_book_id):
+                    matched_book = b
+                    break
+            if not matched_book:
+                matched_book = {"id": override_book_id, "objectBookId": override_book_id,
+                                "bookId": override_book_id, "toBookName": f"Book #{override_book_id}"}
+        else:
+            log("  ⚠️  No OVERRIDE_BOOK_ID — glossary will be skipped.")
+            matched_book = {"id": None, "toBookName": "Unknown Book"}
+
+        book_name_ovr = matched_book.get("toBookName") or matched_book.get("bookName") or ""
+        log(f"  Book: {book_name_ovr} (ID={OVERRIDE_BOOK_ID or 'none'}), Chapter proc_id={proc_id}")
+        claimed_chapters.append((matched_book, f"Override Chapter #{proc_id}", None, "override", proc_id, None))
+
     # ── Phase 0: Check for already active/claimed chapter ──
-    log("Checking for already active chapter across all books...")
-    active = find_active_chapter(token, books)
-    if active:
-        active_book, active_ch_name, active_proc_id, active_task_id = active
-        log(f"Found active chapter: {active_ch_name} (proc_id={active_proc_id})")
-        claimed_chapters.append((active_book, active_ch_name, None, "already-claimed", None, active_task_id))
-    else:
-        # ── Phase 1: Claim ──
-        for book in books:
-            if claimed_chapters:
-                break
-
-            book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
-            book_name = (
-                book.get("toBookName") or book.get("bookName") or
-                book.get("name") or f"Book #{book_id}"
-            )
-
-            if not book_id:
-                log(f"Could not find book ID in: {list(book.keys())}")
-                continue
-
-            log(f"Checking: {book_name} (ID: {book_id})")
-            chapters = get_available_chapters(token, book_id)
-
-            if not chapters:
-                log("  No available chapters.")
-                continue
-
-            log(f"  {len(chapters)} chapter(s) available!")
-
-            for ch in chapters:
-                ch_id   = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
-                ch_name = ch.get("chapterName") or ch.get("name") or f"Chapter #{ch_id}"
-
-                if DRY_RUN:
-                    log(f"  [DRY RUN] Would claim: {ch_name}")
-                    claimed_chapters.append((book, ch_name, ch_id, "dry-run", None, None))
+    if not claimed_chapters:
+        log("Checking for already active chapter across all books...")
+        active = find_active_chapter(token, books)
+        if active:
+            active_book, active_ch_name, active_proc_id, active_task_id = active
+            log(f"Found active chapter: {active_ch_name} (proc_id={active_proc_id})")
+            claimed_chapters.append((active_book, active_ch_name, None, "already-claimed", None, active_task_id))
+        else:
+            # ── Phase 1: Claim ──
+            for book in books:
+                if claimed_chapters:
                     break
 
-                result = claim_chapter(token, ch_id)
-                success = (
-                    result.get("status") is True
-                    or result.get("message") == "SaveSuccess"
-                    or result.get("code") == "311"
-                    or result.get("code") == 0
+                book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
+                book_name = (
+                    book.get("toBookName") or book.get("bookName") or
+                    book.get("name") or f"Book #{book_id}"
                 )
-                no_chapter = result.get("message") in ("NoChapterNumber", "submithint")
 
-                if success:
-                    log(f"  ✅ Claimed: {ch_name}")
-                    # Try to extract proc_id directly from claim response data
-                    claim_proc_id = None
-                    rdata = result.get("data")
-                    if isinstance(rdata, dict):
-                        claim_proc_id = (rdata.get("chapterId") or rdata.get("id")
-                                        or rdata.get("objectChapterId"))
-                    elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
-                        claim_proc_id = int(rdata)
-                    log(f"  Claim response data: {rdata} → proc_id={claim_proc_id}")
-                    claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id, None))
-                    break
-                elif no_chapter:
-                    # Log full response — data may contain the currently active chapter ID
-                    log(f"  ⏭  Not claimable right now: {ch_name} | full response: {result}")
-                    # If data field contains the active chapter's ID, capture it as orphaned
-                    rdata = result.get("data")
-                    orphan_id = None
-                    if isinstance(rdata, dict):
-                        orphan_id = (rdata.get("chapterId") or rdata.get("objectChapterId") or rdata.get("id"))
-                    elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
-                        orphan_id = int(rdata)
-                    if orphan_id:
-                        log(f"  Found orphaned active chapter ID={orphan_id} in submithint response")
-                        claimed_chapters.append((book, ch_name, orphan_id, "claimed", orphan_id, None))
+                if not book_id:
+                    log(f"Could not find book ID in: {list(book.keys())}")
+                    continue
+
+                log(f"Checking: {book_name} (ID: {book_id})")
+                chapters = get_available_chapters(token, book_id)
+
+                if not chapters:
+                    log("  No available chapters.")
+                    continue
+
+                log(f"  {len(chapters)} chapter(s) available!")
+
+                for ch in chapters:
+                    ch_id   = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
+                    ch_name = ch.get("chapterName") or ch.get("name") or f"Chapter #{ch_id}"
+
+                    if DRY_RUN:
+                        log(f"  [DRY RUN] Would claim: {ch_name}")
+                        claimed_chapters.append((book, ch_name, ch_id, "dry-run", None, None))
                         break
-                else:
-                    log(f"  ⚠️  Unexpected claim response: {result}")
+
+                    result = claim_chapter(token, ch_id)
+                    success = (
+                        result.get("status") is True
+                        or result.get("message") == "SaveSuccess"
+                        or result.get("code") == "311"
+                        or result.get("code") == 0
+                    )
+                    no_chapter = result.get("message") in ("NoChapterNumber", "submithint")
+
+                    if success:
+                        log(f"  ✅ Claimed: {ch_name}")
+                        # Try to extract proc_id directly from claim response data
+                        claim_proc_id = None
+                        rdata = result.get("data")
+                        if isinstance(rdata, dict):
+                            claim_proc_id = (rdata.get("chapterId") or rdata.get("id")
+                                            or rdata.get("objectChapterId"))
+                        elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
+                            claim_proc_id = int(rdata)
+                        log(f"  Claim response data: {rdata} → proc_id={claim_proc_id}")
+                        claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id, None))
+                        break
+                    elif no_chapter:
+                        # Log full response — data may contain the currently active chapter ID
+                        log(f"  ⏭  Not claimable right now: {ch_name} | full response: {result}")
+                        # If data field contains the active chapter's ID, capture it as orphaned
+                        rdata = result.get("data")
+                        orphan_id = None
+                        if isinstance(rdata, dict):
+                            orphan_id = (rdata.get("chapterId") or rdata.get("objectChapterId") or rdata.get("id"))
+                        elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
+                            orphan_id = int(rdata)
+                        if orphan_id:
+                            log(f"  Found orphaned active chapter ID={orphan_id} in submithint response")
+                            claimed_chapters.append((book, ch_name, orphan_id, "claimed", orphan_id, None))
+                            break
+                    else:
+                        log(f"  ⚠️  Unexpected claim response: {result}")
 
     if not claimed_chapters:
         log("No chapters claimed this run.")
