@@ -121,6 +121,7 @@ QUOTE ISOLATION (CRITICAL — dialogue is split across multiple rows by design):
 - If the English input row opens a quote „ but does NOT close it, your German output must also leave it open. Do NOT close the quote within that row.
 - If the English input row closes a quote but did not open it, your German output must also close without opening.
 - NEVER pull text from row N+1 into row N to close an open quote — the closing text belongs to the next row.
+- NEVER duplicate content from row N+1 into row N. If row N+1 opens with an echo phrase (e.g. „Gefühle entwickeln?“), that phrase must appear ONLY in row N+1's output — do NOT append it to row N as well. Each phrase belongs to exactly one output row.
 - Nested inner quotes within already-open speech use ‚ to open and ' to close — NEVER use „ inside an already-open „...".
 - When translating a narration+speech row (e.g. 'she said, "Do it."') into German colon style ('sie befahl: „Tu es."'), you MUST include „ before the speech text. Do not omit the opening quote mark.
 - A row ending with an unclosed „ is CORRECT and INTENTIONAL. Do not fix it.
@@ -2092,6 +2093,51 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     _bleed_count += 1
         if _bleed_count:
             log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
+        # ── Guard 3: Cross-row echo duplication guard ────────────────────────────
+        # Pattern: Gemini sees a literary echo in adjacent rows (Row N ends in '?"'
+        # and Row N+1 starts with the same phrase) and *copies* Row N+1's opening
+        # phrase onto the end of Row N — producing a duplicate that appears in BOTH
+        # rows simultaneously. Row N+1 is fully intact so Guard 2 (inflation) won't
+        # fire (only Row N is inflated, and by too few words for the 1.6x threshold).
+        #
+        # Detection: Row N output ends with a closed speech unit followed by a new
+        # short opening „..." fragment AND that fragment matches the start of Row N+1.
+        # Fix: strip everything from the second „ onward in Row N.
+        _sorted_result = sorted(result, key=lambda r: r.get("sort", 0))
+        _echo_count = 0
+        for _ei in range(len(_sorted_result) - 1):
+            _rN  = _sorted_result[_ei]
+            _rN1 = _sorted_result[_ei + 1]
+            _cN  = (_rN.get("content") or "").rstrip()
+            _cN1 = (_rN1.get("content") or "").lstrip()
+            if not _cN or not _cN1:
+                continue
+            # Look for: ends with closing quote, then whitespace, then new open „..." fragment
+            _echo_match = _re.search(
+                r'[“"]\s+„(.{3,60}?)[“"]\s*$', _cN
+            )
+            if not _echo_match:
+                continue
+            _echo_phrase = _echo_match.group(1).strip()
+            # Check if Row N+1 starts with the same phrase (after its opening „)
+            _n1_inner = _re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
+            if not _n1_inner:
+                continue
+            _n1_phrase = _n1_inner.group(1).strip()
+            # Allow minor variation: compare first 15 chars or full phrase if shorter
+            _cmp_len = min(15, len(_echo_phrase), len(_n1_phrase))
+            if _cmp_len >= 3 and _echo_phrase[:_cmp_len].lower() == _n1_phrase[:_cmp_len].lower():
+                # Strip the appended echo fragment from Row N
+                _stripped = _cN[:_echo_match.start()].rstrip()
+                # Ensure the stripped content still ends with a proper close quote
+                if not _stripped.endswith(('“', '"', '!', '?', '.')):
+                    continue  # Safety: don't strip if result would be malformed
+                _rN["content"] = _stripped
+                _echo_count += 1
+                log(f"  ⚠️  Echo guard: sort={_rN.get('sort')} — stripped appended "
+                    f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
+        if _echo_count:
+            log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -3687,6 +3733,51 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     _bleed_count += 1
         if _bleed_count:
             log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
+        # ── Guard 3: Cross-row echo duplication guard ────────────────────────────
+        # Pattern: Gemini sees a literary echo in adjacent rows (Row N ends in '?"'
+        # and Row N+1 starts with the same phrase) and *copies* Row N+1's opening
+        # phrase onto the end of Row N — producing a duplicate that appears in BOTH
+        # rows simultaneously. Row N+1 is fully intact so Guard 2 (inflation) won't
+        # fire (only Row N is inflated, and by too few words for the 1.6x threshold).
+        #
+        # Detection: Row N output ends with a closed speech unit followed by a new
+        # short opening „..." fragment AND that fragment matches the start of Row N+1.
+        # Fix: strip everything from the second „ onward in Row N.
+        _sorted_result = sorted(result, key=lambda r: r.get("sort", 0))
+        _echo_count = 0
+        for _ei in range(len(_sorted_result) - 1):
+            _rN  = _sorted_result[_ei]
+            _rN1 = _sorted_result[_ei + 1]
+            _cN  = (_rN.get("content") or "").rstrip()
+            _cN1 = (_rN1.get("content") or "").lstrip()
+            if not _cN or not _cN1:
+                continue
+            # Look for: ends with closing quote, then whitespace, then new open „..." fragment
+            _echo_match = _re.search(
+                r'[“"]\s+„(.{3,60}?)[“"]\s*$', _cN
+            )
+            if not _echo_match:
+                continue
+            _echo_phrase = _echo_match.group(1).strip()
+            # Check if Row N+1 starts with the same phrase (after its opening „)
+            _n1_inner = _re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
+            if not _n1_inner:
+                continue
+            _n1_phrase = _n1_inner.group(1).strip()
+            # Allow minor variation: compare first 15 chars or full phrase if shorter
+            _cmp_len = min(15, len(_echo_phrase), len(_n1_phrase))
+            if _cmp_len >= 3 and _echo_phrase[:_cmp_len].lower() == _n1_phrase[:_cmp_len].lower():
+                # Strip the appended echo fragment from Row N
+                _stripped = _cN[:_echo_match.start()].rstrip()
+                # Ensure the stripped content still ends with a proper close quote
+                if not _stripped.endswith(('“', '"', '!', '?', '.')):
+                    continue  # Safety: don't strip if result would be malformed
+                _rN["content"] = _stripped
+                _echo_count += 1
+                log(f"  ⚠️  Echo guard: sort={_rN.get('sort')} — stripped appended "
+                    f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
+        if _echo_count:
+            log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -5291,6 +5382,51 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     _bleed_count += 1
         if _bleed_count:
             log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
+        # ── Guard 3: Cross-row echo duplication guard ────────────────────────────
+        # Pattern: Gemini sees a literary echo in adjacent rows (Row N ends in '?"'
+        # and Row N+1 starts with the same phrase) and *copies* Row N+1's opening
+        # phrase onto the end of Row N — producing a duplicate that appears in BOTH
+        # rows simultaneously. Row N+1 is fully intact so Guard 2 (inflation) won't
+        # fire (only Row N is inflated, and by too few words for the 1.6x threshold).
+        #
+        # Detection: Row N output ends with a closed speech unit followed by a new
+        # short opening „..." fragment AND that fragment matches the start of Row N+1.
+        # Fix: strip everything from the second „ onward in Row N.
+        _sorted_result = sorted(result, key=lambda r: r.get("sort", 0))
+        _echo_count = 0
+        for _ei in range(len(_sorted_result) - 1):
+            _rN  = _sorted_result[_ei]
+            _rN1 = _sorted_result[_ei + 1]
+            _cN  = (_rN.get("content") or "").rstrip()
+            _cN1 = (_rN1.get("content") or "").lstrip()
+            if not _cN or not _cN1:
+                continue
+            # Look for: ends with closing quote, then whitespace, then new open „..." fragment
+            _echo_match = _re.search(
+                r'[“"]\s+„(.{3,60}?)[“"]\s*$', _cN
+            )
+            if not _echo_match:
+                continue
+            _echo_phrase = _echo_match.group(1).strip()
+            # Check if Row N+1 starts with the same phrase (after its opening „)
+            _n1_inner = _re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
+            if not _n1_inner:
+                continue
+            _n1_phrase = _n1_inner.group(1).strip()
+            # Allow minor variation: compare first 15 chars or full phrase if shorter
+            _cmp_len = min(15, len(_echo_phrase), len(_n1_phrase))
+            if _cmp_len >= 3 and _echo_phrase[:_cmp_len].lower() == _n1_phrase[:_cmp_len].lower():
+                # Strip the appended echo fragment from Row N
+                _stripped = _cN[:_echo_match.start()].rstrip()
+                # Ensure the stripped content still ends with a proper close quote
+                if not _stripped.endswith(('“', '"', '!', '?', '.')):
+                    continue  # Safety: don't strip if result would be malformed
+                _rN["content"] = _stripped
+                _echo_count += 1
+                log(f"  ⚠️  Echo guard: sort={_rN.get('sort')} — stripped appended "
+                    f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
+        if _echo_count:
+            log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -6886,6 +7022,51 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     _bleed_count += 1
         if _bleed_count:
             log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
+        # ── Guard 3: Cross-row echo duplication guard ────────────────────────────
+        # Pattern: Gemini sees a literary echo in adjacent rows (Row N ends in '?"'
+        # and Row N+1 starts with the same phrase) and *copies* Row N+1's opening
+        # phrase onto the end of Row N — producing a duplicate that appears in BOTH
+        # rows simultaneously. Row N+1 is fully intact so Guard 2 (inflation) won't
+        # fire (only Row N is inflated, and by too few words for the 1.6x threshold).
+        #
+        # Detection: Row N output ends with a closed speech unit followed by a new
+        # short opening „..." fragment AND that fragment matches the start of Row N+1.
+        # Fix: strip everything from the second „ onward in Row N.
+        _sorted_result = sorted(result, key=lambda r: r.get("sort", 0))
+        _echo_count = 0
+        for _ei in range(len(_sorted_result) - 1):
+            _rN  = _sorted_result[_ei]
+            _rN1 = _sorted_result[_ei + 1]
+            _cN  = (_rN.get("content") or "").rstrip()
+            _cN1 = (_rN1.get("content") or "").lstrip()
+            if not _cN or not _cN1:
+                continue
+            # Look for: ends with closing quote, then whitespace, then new open „..." fragment
+            _echo_match = _re.search(
+                r'[“"]\s+„(.{3,60}?)[“"]\s*$', _cN
+            )
+            if not _echo_match:
+                continue
+            _echo_phrase = _echo_match.group(1).strip()
+            # Check if Row N+1 starts with the same phrase (after its opening „)
+            _n1_inner = _re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
+            if not _n1_inner:
+                continue
+            _n1_phrase = _n1_inner.group(1).strip()
+            # Allow minor variation: compare first 15 chars or full phrase if shorter
+            _cmp_len = min(15, len(_echo_phrase), len(_n1_phrase))
+            if _cmp_len >= 3 and _echo_phrase[:_cmp_len].lower() == _n1_phrase[:_cmp_len].lower():
+                # Strip the appended echo fragment from Row N
+                _stripped = _cN[:_echo_match.start()].rstrip()
+                # Ensure the stripped content still ends with a proper close quote
+                if not _stripped.endswith(('“', '"', '!', '?', '.')):
+                    continue  # Safety: don't strip if result would be malformed
+                _rN["content"] = _stripped
+                _echo_count += 1
+                log(f"  ⚠️  Echo guard: sort={_rN.get('sort')} — stripped appended "
+                    f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
+        if _echo_count:
+            log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
