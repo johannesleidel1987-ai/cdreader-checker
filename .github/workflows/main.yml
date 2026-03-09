@@ -65,16 +65,6 @@ jobs:
           GEMINI_API_KEY_16: ${{ secrets.GEMINI_API_KEY_16 }}
           GEMINI_API_KEY_17: ${{ secrets.GEMINI_API_KEY_17 }}
           GEMINI_API_KEY_18: ${{ secrets.GEMINI_API_KEY_18 }}
-          GEMINI_API_KEY_19: ${{ secrets.GEMINI_API_KEY_19 }}
-          GEMINI_API_KEY_20: ${{ secrets.GEMINI_API_KEY_20 }}
-          GEMINI_API_KEY_21: ${{ secrets.GEMINI_API_KEY_21 }}
-          GEMINI_API_KEY_22: ${{ secrets.GEMINI_API_KEY_22 }}
-          GEMINI_API_KEY_23: ${{ secrets.GEMINI_API_KEY_23 }}
-          GEMINI_API_KEY_24: ${{ secrets.GEMINI_API_KEY_24 }}
-          GEMINI_API_KEY_25: ${{ secrets.GEMINI_API_KEY_25 }}
-          GEMINI_API_KEY_26: ${{ secrets.GEMINI_API_KEY_26 }}
-          GEMINI_API_KEY_27: ${{ secrets.GEMINI_API_KEY_27 }}
-          GEMINI_API_KEY_28: ${{ secrets.GEMINI_API_KEY_28 }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
           OVERRIDE_CHAPTER_ID: ${{ github.event.inputs.chapter_id || '' }}
           OVERRIDE_BOOK_ID: ${{ github.event.inputs.book_id || '' }}
