@@ -672,11 +672,9 @@ def _deterministic_change(text):
         result = _re.sub(pattern, replacement, text, count=1)
         if result != text:
             return result
-    # Absolute last resort: if no synonym matched (very short row),
-    # swap first comma for semicolon
-    if ',' in text:
-        return text.replace(',', ';', 1)
-    # If truly nothing can be changed (single word, no commas), return as-is
+    # No synonym matched (very short row, exclamation, single name, etc.) — return as-is.
+    # Comma→semicolon was removed: it frequently broke syntax where a comma is
+    # grammatically required (subordinate clauses, enumeration, inline attribution).
     return text
 
 
