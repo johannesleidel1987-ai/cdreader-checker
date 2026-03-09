@@ -117,6 +117,14 @@ Never merge content from two rows into one, and never split one row's content ac
 Never move a Begleitsatz (e.g. "sagte er", "flüsterte sie") from one row into an adjacent row.
 If a row contains only a short attribution clause, output exactly that — do not borrow from neighbours.
 
+QUOTE ISOLATION (CRITICAL — dialogue is split across multiple rows by design):
+- If the English input row opens a quote „ but does NOT close it, your German output must also leave it open. Do NOT close the quote within that row.
+- If the English input row closes a quote but did not open it, your German output must also close without opening.
+- NEVER pull text from row N+1 into row N to close an open quote — the closing text belongs to the next row.
+- Nested inner quotes within already-open speech use ‚ to open and ' to close — NEVER use „ inside an already-open „...".
+- When translating a narration+speech row (e.g. 'she said, "Do it."') into German colon style ('sie befahl: „Tu es."'), you MUST include „ before the speech text. Do not omit the opening quote mark.
+- A row ending with an unclosed „ is CORRECT and INTENTIONAL. Do not fix it.
+
 WHAT TO FIX (do these, nothing more):
 1. Grammar errors: wrong case, wrong verb conjugation, missing articles, broken syntax
 2. Logic errors: mistranslations where the German does not match the English meaning
@@ -1151,6 +1159,54 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
 
+    # ── Pre-Pass B: EN-source opening quote enforcement ──────────────────────
+    # Error pattern: Gemini converts 'she said, "Do it.' to 'sie befahl: Tu es.'
+    # (German colon style) but drops the „ opener before the speech text.
+    # Also catches rows where the English opens with " but the German doesn't open „.
+    #
+    # Detection uses the English source (chapterConetnt → input_data["original"]),
+    # which is 100% reliable for quote placement. Two cases handled:
+    #   Case 1: EN row starts with " → DE row must start with „
+    #   Case 2: EN row has ," or :" mid-row introducing speech → DE row must have „
+    #           after the corresponding German colon/comma introduction
+    _en_src_by_sort = {r.get("sort", i): r.get("original", "")
+                       for i, r in enumerate(input_data)}
+    _opener_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        out = row.get("content", "")
+        en  = _en_src_by_sort.get(sort_n, "")
+        if not out or not en:
+            continue
+
+        # Case 1: EN row starts with " (speech-open row), DE must start with „
+        _en_stripped = en.lstrip()
+        _out_stripped = out.lstrip()
+        if _en_stripped.startswith('"') and not _out_stripped.startswith('„'):
+            # Only inject if row isn't a BGS-only output (would be wrong there)
+            if not _is_begleitsatz(out):
+                row["content"] = '„' + out.lstrip('“„”"')
+                _opener_fixes += 1
+                log(f'  ⚠️  Quote opener: sort={sort_n} EN starts quote -- injected \u201e: ' + repr(row['content'][:60]))
+
+        # Case 2: EN introduces speech mid-row after comma/colon ('said, "...' or 'said: "...')
+        # and DE uses the colon style but missing „ after the colon
+        elif _re.search(r'[,:][ ]*"', en) and not _en_stripped.startswith('"'):
+            _out_cur = row.get("content", "")
+            # Check if DE has a colon or comma+speech introduction but no „ following it
+            _colon_match = _re.search(r'(?:[:,])\s+(?![„„])', _out_cur)
+            if _colon_match and '„' not in _out_cur and '“' not in _out_cur:
+                # Insert „ after the introduction punctuation
+                _inj_pos = _colon_match.end()
+                row["content"] = _out_cur[:_inj_pos] + '„' + _out_cur[_inj_pos:]
+                _opener_fixes += 1
+                log(f"  ⚠️  Quote opener: sort={sort_n} mid-row speech missing „ — injected: {row['content'][:60]!r}")
+
+    if _opener_fixes:
+        log(f"  💬 EN-source quote opener: fixed {_opener_fixes} row(s).")
+
     # ── Pass QE: Deterministic quote structure enforcement ────────────────────
     # Replaces the fragile Pass 0 + Rule H approach.
     # Root cause of all recurring quote errors: quote_role was computed on the
@@ -2014,6 +2070,28 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 + ", ".join(str(r.get("sort")) for r in _missing))
             for _mr in _missing:
                 result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
+        # ── Guard 2: Content-bleed inflation guard ───────────────────────────────
+        # Gemini occasionally pulls text from row N+1 into row N to close an open
+        # quote (dialogue split across rows). The signature is output significantly
+        # LONGER than input — the opposite of truncation. Restore from MT when the
+        # output word count exceeds 1.6× the input with a minimum delta of 4 words.
+        # The restored row will be caught by the similarity guard and retried in
+        # isolation via _unified_retry, without neighbour context to tempt bleed.
+        _inp_wc = {r.get("sort"): len((r.get("content") or "").split()) for r in batch}
+        _bleed_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)
+            _out_w = len((_r.get("content") or "").split())
+            if _inp_w >= 4 and _out_w > _inp_w * 1.6 and (_out_w - _inp_w) >= 4:
+                # look up original MT from batch
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Bleed guard: sort={_s} inflated ({_out_w}w vs {_inp_w}w input) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _bleed_count += 1
+        if _bleed_count:
+            log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -2036,6 +2114,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Run post-processing on initial Gemini output
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_rows, input_data, glossary_terms)
+
+    # Pre-retry RPM cooldown.
+    # Problem: after N batches complete, the keys used in those batches are still
+    # inside their 60s RPM window. _call_gemini_simple scans all keys serially looking
+    # for a non-429 one — when it finds all of them hot, it waits 15s and recovers
+    # exactly ONE key, which then serves one row and immediately gets re-limited.
+    # The result is a perpetual 1-row-per-15s trickle and massive deterministic fallback.
+    # Fix: sleep 65s before the retry loop when there were ≥2 batches, so ALL batch-used
+    # keys exit their RPM windows simultaneously and the retry loop gets a clean pool.
+    if total_batches >= 2 and not _all_keys_rpd_dead():
+        _cooldown = 65
+        log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
+        time.sleep(_cooldown)
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+        log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
     all_rephrased = _unified_retry(sorted_rows, input_data, rows)
@@ -2661,6 +2754,54 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
 
+    # ── Pre-Pass B: EN-source opening quote enforcement ──────────────────────
+    # Error pattern: Gemini converts 'she said, "Do it.' to 'sie befahl: Tu es.'
+    # (German colon style) but drops the „ opener before the speech text.
+    # Also catches rows where the English opens with " but the German doesn't open „.
+    #
+    # Detection uses the English source (chapterConetnt → input_data["original"]),
+    # which is 100% reliable for quote placement. Two cases handled:
+    #   Case 1: EN row starts with " → DE row must start with „
+    #   Case 2: EN row has ," or :" mid-row introducing speech → DE row must have „
+    #           after the corresponding German colon/comma introduction
+    _en_src_by_sort = {r.get("sort", i): r.get("original", "")
+                       for i, r in enumerate(input_data)}
+    _opener_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        out = row.get("content", "")
+        en  = _en_src_by_sort.get(sort_n, "")
+        if not out or not en:
+            continue
+
+        # Case 1: EN row starts with " (speech-open row), DE must start with „
+        _en_stripped = en.lstrip()
+        _out_stripped = out.lstrip()
+        if _en_stripped.startswith('"') and not _out_stripped.startswith('„'):
+            # Only inject if row isn't a BGS-only output (would be wrong there)
+            if not _is_begleitsatz(out):
+                row["content"] = '„' + out.lstrip('“„”"')
+                _opener_fixes += 1
+                log(f'  ⚠️  Quote opener: sort={sort_n} EN starts quote -- injected \u201e: ' + repr(row['content'][:60]))
+
+        # Case 2: EN introduces speech mid-row after comma/colon ('said, "...' or 'said: "...')
+        # and DE uses the colon style but missing „ after the colon
+        elif _re.search(r'[,:][ ]*"', en) and not _en_stripped.startswith('"'):
+            _out_cur = row.get("content", "")
+            # Check if DE has a colon or comma+speech introduction but no „ following it
+            _colon_match = _re.search(r'(?:[:,])\s+(?![„„])', _out_cur)
+            if _colon_match and '„' not in _out_cur and '“' not in _out_cur:
+                # Insert „ after the introduction punctuation
+                _inj_pos = _colon_match.end()
+                row["content"] = _out_cur[:_inj_pos] + '„' + _out_cur[_inj_pos:]
+                _opener_fixes += 1
+                log(f"  ⚠️  Quote opener: sort={sort_n} mid-row speech missing „ — injected: {row['content'][:60]!r}")
+
+    if _opener_fixes:
+        log(f"  💬 EN-source quote opener: fixed {_opener_fixes} row(s).")
+
     # ── Pass QE: Deterministic quote structure enforcement ────────────────────
     # Replaces the fragile Pass 0 + Rule H approach.
     # Root cause of all recurring quote errors: quote_role was computed on the
@@ -3524,6 +3665,28 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 + ", ".join(str(r.get("sort")) for r in _missing))
             for _mr in _missing:
                 result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
+        # ── Guard 2: Content-bleed inflation guard ───────────────────────────────
+        # Gemini occasionally pulls text from row N+1 into row N to close an open
+        # quote (dialogue split across rows). The signature is output significantly
+        # LONGER than input — the opposite of truncation. Restore from MT when the
+        # output word count exceeds 1.6× the input with a minimum delta of 4 words.
+        # The restored row will be caught by the similarity guard and retried in
+        # isolation via _unified_retry, without neighbour context to tempt bleed.
+        _inp_wc = {r.get("sort"): len((r.get("content") or "").split()) for r in batch}
+        _bleed_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)
+            _out_w = len((_r.get("content") or "").split())
+            if _inp_w >= 4 and _out_w > _inp_w * 1.6 and (_out_w - _inp_w) >= 4:
+                # look up original MT from batch
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Bleed guard: sort={_s} inflated ({_out_w}w vs {_inp_w}w input) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _bleed_count += 1
+        if _bleed_count:
+            log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -3546,6 +3709,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Run post-processing on initial Gemini output
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_rows, input_data, glossary_terms)
+
+    # Pre-retry RPM cooldown.
+    # Problem: after N batches complete, the keys used in those batches are still
+    # inside their 60s RPM window. _call_gemini_simple scans all keys serially looking
+    # for a non-429 one — when it finds all of them hot, it waits 15s and recovers
+    # exactly ONE key, which then serves one row and immediately gets re-limited.
+    # The result is a perpetual 1-row-per-15s trickle and massive deterministic fallback.
+    # Fix: sleep 65s before the retry loop when there were ≥2 batches, so ALL batch-used
+    # keys exit their RPM windows simultaneously and the retry loop gets a clean pool.
+    if total_batches >= 2 and not _all_keys_rpd_dead():
+        _cooldown = 65
+        log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
+        time.sleep(_cooldown)
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+        log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
     all_rephrased = _unified_retry(sorted_rows, input_data, rows)
@@ -4180,6 +4358,54 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
 
+    # ── Pre-Pass B: EN-source opening quote enforcement ──────────────────────
+    # Error pattern: Gemini converts 'she said, "Do it.' to 'sie befahl: Tu es.'
+    # (German colon style) but drops the „ opener before the speech text.
+    # Also catches rows where the English opens with " but the German doesn't open „.
+    #
+    # Detection uses the English source (chapterConetnt → input_data["original"]),
+    # which is 100% reliable for quote placement. Two cases handled:
+    #   Case 1: EN row starts with " → DE row must start with „
+    #   Case 2: EN row has ," or :" mid-row introducing speech → DE row must have „
+    #           after the corresponding German colon/comma introduction
+    _en_src_by_sort = {r.get("sort", i): r.get("original", "")
+                       for i, r in enumerate(input_data)}
+    _opener_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        out = row.get("content", "")
+        en  = _en_src_by_sort.get(sort_n, "")
+        if not out or not en:
+            continue
+
+        # Case 1: EN row starts with " (speech-open row), DE must start with „
+        _en_stripped = en.lstrip()
+        _out_stripped = out.lstrip()
+        if _en_stripped.startswith('"') and not _out_stripped.startswith('„'):
+            # Only inject if row isn't a BGS-only output (would be wrong there)
+            if not _is_begleitsatz(out):
+                row["content"] = '„' + out.lstrip('“„”"')
+                _opener_fixes += 1
+                log(f'  ⚠️  Quote opener: sort={sort_n} EN starts quote -- injected \u201e: ' + repr(row['content'][:60]))
+
+        # Case 2: EN introduces speech mid-row after comma/colon ('said, "...' or 'said: "...')
+        # and DE uses the colon style but missing „ after the colon
+        elif _re.search(r'[,:][ ]*"', en) and not _en_stripped.startswith('"'):
+            _out_cur = row.get("content", "")
+            # Check if DE has a colon or comma+speech introduction but no „ following it
+            _colon_match = _re.search(r'(?:[:,])\s+(?![„„])', _out_cur)
+            if _colon_match and '„' not in _out_cur and '“' not in _out_cur:
+                # Insert „ after the introduction punctuation
+                _inj_pos = _colon_match.end()
+                row["content"] = _out_cur[:_inj_pos] + '„' + _out_cur[_inj_pos:]
+                _opener_fixes += 1
+                log(f"  ⚠️  Quote opener: sort={sort_n} mid-row speech missing „ — injected: {row['content'][:60]!r}")
+
+    if _opener_fixes:
+        log(f"  💬 EN-source quote opener: fixed {_opener_fixes} row(s).")
+
     # ── Pass QE: Deterministic quote structure enforcement ────────────────────
     # Replaces the fragile Pass 0 + Rule H approach.
     # Root cause of all recurring quote errors: quote_role was computed on the
@@ -5043,6 +5269,28 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 + ", ".join(str(r.get("sort")) for r in _missing))
             for _mr in _missing:
                 result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
+        # ── Guard 2: Content-bleed inflation guard ───────────────────────────────
+        # Gemini occasionally pulls text from row N+1 into row N to close an open
+        # quote (dialogue split across rows). The signature is output significantly
+        # LONGER than input — the opposite of truncation. Restore from MT when the
+        # output word count exceeds 1.6× the input with a minimum delta of 4 words.
+        # The restored row will be caught by the similarity guard and retried in
+        # isolation via _unified_retry, without neighbour context to tempt bleed.
+        _inp_wc = {r.get("sort"): len((r.get("content") or "").split()) for r in batch}
+        _bleed_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)
+            _out_w = len((_r.get("content") or "").split())
+            if _inp_w >= 4 and _out_w > _inp_w * 1.6 and (_out_w - _inp_w) >= 4:
+                # look up original MT from batch
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Bleed guard: sort={_s} inflated ({_out_w}w vs {_inp_w}w input) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _bleed_count += 1
+        if _bleed_count:
+            log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -5065,6 +5313,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Run post-processing on initial Gemini output
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_rows, input_data, glossary_terms)
+
+    # Pre-retry RPM cooldown.
+    # Problem: after N batches complete, the keys used in those batches are still
+    # inside their 60s RPM window. _call_gemini_simple scans all keys serially looking
+    # for a non-429 one — when it finds all of them hot, it waits 15s and recovers
+    # exactly ONE key, which then serves one row and immediately gets re-limited.
+    # The result is a perpetual 1-row-per-15s trickle and massive deterministic fallback.
+    # Fix: sleep 65s before the retry loop when there were ≥2 batches, so ALL batch-used
+    # keys exit their RPM windows simultaneously and the retry loop gets a clean pool.
+    if total_batches >= 2 and not _all_keys_rpd_dead():
+        _cooldown = 65
+        log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
+        time.sleep(_cooldown)
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+        log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
     all_rephrased = _unified_retry(sorted_rows, input_data, rows)
@@ -5690,6 +5953,54 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
 
+    # ── Pre-Pass B: EN-source opening quote enforcement ──────────────────────
+    # Error pattern: Gemini converts 'she said, "Do it.' to 'sie befahl: Tu es.'
+    # (German colon style) but drops the „ opener before the speech text.
+    # Also catches rows where the English opens with " but the German doesn't open „.
+    #
+    # Detection uses the English source (chapterConetnt → input_data["original"]),
+    # which is 100% reliable for quote placement. Two cases handled:
+    #   Case 1: EN row starts with " → DE row must start with „
+    #   Case 2: EN row has ," or :" mid-row introducing speech → DE row must have „
+    #           after the corresponding German colon/comma introduction
+    _en_src_by_sort = {r.get("sort", i): r.get("original", "")
+                       for i, r in enumerate(input_data)}
+    _opener_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        out = row.get("content", "")
+        en  = _en_src_by_sort.get(sort_n, "")
+        if not out or not en:
+            continue
+
+        # Case 1: EN row starts with " (speech-open row), DE must start with „
+        _en_stripped = en.lstrip()
+        _out_stripped = out.lstrip()
+        if _en_stripped.startswith('"') and not _out_stripped.startswith('„'):
+            # Only inject if row isn't a BGS-only output (would be wrong there)
+            if not _is_begleitsatz(out):
+                row["content"] = '„' + out.lstrip('“„”"')
+                _opener_fixes += 1
+                log(f'  ⚠️  Quote opener: sort={sort_n} EN starts quote -- injected \u201e: ' + repr(row['content'][:60]))
+
+        # Case 2: EN introduces speech mid-row after comma/colon ('said, "...' or 'said: "...')
+        # and DE uses the colon style but missing „ after the colon
+        elif _re.search(r'[,:][ ]*"', en) and not _en_stripped.startswith('"'):
+            _out_cur = row.get("content", "")
+            # Check if DE has a colon or comma+speech introduction but no „ following it
+            _colon_match = _re.search(r'(?:[:,])\s+(?![„„])', _out_cur)
+            if _colon_match and '„' not in _out_cur and '“' not in _out_cur:
+                # Insert „ after the introduction punctuation
+                _inj_pos = _colon_match.end()
+                row["content"] = _out_cur[:_inj_pos] + '„' + _out_cur[_inj_pos:]
+                _opener_fixes += 1
+                log(f"  ⚠️  Quote opener: sort={sort_n} mid-row speech missing „ — injected: {row['content'][:60]!r}")
+
+    if _opener_fixes:
+        log(f"  💬 EN-source quote opener: fixed {_opener_fixes} row(s).")
+
     # ── Pass QE: Deterministic quote structure enforcement ────────────────────
     # Replaces the fragile Pass 0 + Rule H approach.
     # Root cause of all recurring quote errors: quote_role was computed on the
@@ -6553,6 +6864,28 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 + ", ".join(str(r.get("sort")) for r in _missing))
             for _mr in _missing:
                 result.append({"sort": _mr.get("sort"), "content": _mr.get("content", "")})
+        # ── Guard 2: Content-bleed inflation guard ───────────────────────────────
+        # Gemini occasionally pulls text from row N+1 into row N to close an open
+        # quote (dialogue split across rows). The signature is output significantly
+        # LONGER than input — the opposite of truncation. Restore from MT when the
+        # output word count exceeds 1.6× the input with a minimum delta of 4 words.
+        # The restored row will be caught by the similarity guard and retried in
+        # isolation via _unified_retry, without neighbour context to tempt bleed.
+        _inp_wc = {r.get("sort"): len((r.get("content") or "").split()) for r in batch}
+        _bleed_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)
+            _out_w = len((_r.get("content") or "").split())
+            if _inp_w >= 4 and _out_w > _inp_w * 1.6 and (_out_w - _inp_w) >= 4:
+                # look up original MT from batch
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Bleed guard: sort={_s} inflated ({_out_w}w vs {_inp_w}w input) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _bleed_count += 1
+        if _bleed_count:
+            log(f"  💬 Bleed guard: restored {_bleed_count} inflated row(s) from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -6575,6 +6908,21 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Run post-processing on initial Gemini output
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_rows, input_data, glossary_terms)
+
+    # Pre-retry RPM cooldown.
+    # Problem: after N batches complete, the keys used in those batches are still
+    # inside their 60s RPM window. _call_gemini_simple scans all keys serially looking
+    # for a non-429 one — when it finds all of them hot, it waits 15s and recovers
+    # exactly ONE key, which then serves one row and immediately gets re-limited.
+    # The result is a perpetual 1-row-per-15s trickle and massive deterministic fallback.
+    # Fix: sleep 65s before the retry loop when there were ≥2 batches, so ALL batch-used
+    # keys exit their RPM windows simultaneously and the retry loop gets a clean pool.
+    if total_batches >= 2 and not _all_keys_rpd_dead():
+        _cooldown = 65
+        log(f"  ⏳ Pre-retry RPM cooldown: {total_batches} batch(es) completed — waiting {_cooldown}s for RPM windows to expire...")
+        time.sleep(_cooldown)
+        _exhausted_keys.intersection_update(_rpd_exhausted_keys)
+        log(f"  ✅ RPM cooldown complete — retry loop starting with fresh key pool.")
 
     # Unified retry: identify and re-request verbatim, similar, or truncated rows
     all_rephrased = _unified_retry(sorted_rows, input_data, rows)
