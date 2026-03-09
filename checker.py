@@ -585,120 +585,182 @@ SIM_THRESHOLD = 0.88   # flag rows at or above this combined similarity
 # while keys are still alive pulls the average into the 72-77% finish zone.
 
 
+# Module-level synonym table — shared by _deterministic_change and _find_synonym_pair.
+# Ordered by word frequency so the highest-coverage substitutions are tried first.
+_SYNONYMS = [
+    # Conjunctions & particles (highest frequency)
+    (r'\bund\b', 'sowie'),
+    (r'\baber\b', 'jedoch'),
+    (r'\bauch\b', 'ebenfalls'),
+    (r'\bdoch\b', 'dennoch'),
+    (r'\balso\b', 'demnach'),
+    (r'\bdann\b', 'daraufhin'),
+    (r'\bnur\b', 'lediglich'),
+    (r'\bnoch\b', 'weiterhin'),
+    (r'\bschon\b', 'bereits'),
+    (r'\bjetzt\b', 'nun'),
+    (r'\bimmer\b', 'stets'),
+    (r'\bso\b', 'derart'),
+    (r'\bganz\b', 'völlig'),
+    (r'\bwieder\b', 'erneut'),
+    (r'\bwohl\b', 'vermutlich'),
+    (r'\berst\b', 'zunächst'),
+    # Adverbs
+    (r'\bsehr\b', 'äußerst'),
+    (r'\bschnell\b', 'rasch'),
+    (r'\bwirklich\b', 'tatsächlich'),
+    (r'\bgenau\b', 'exakt'),
+    (r'\bplötzlich\b', 'unvermittelt'),
+    (r'\bsofort\b', 'umgehend'),
+    (r'\bnatürlich\b', 'selbstverständlich'),
+    (r'\bvielleicht\b', 'möglicherweise'),
+    (r'\bleise\b', 'still'),
+    (r'\bgelassen\b', 'ruhig'),
+    (r'\bstolz\b', 'selbstbewusst'),
+    # Adjectives
+    (r'\bschwer\b', 'schwierig'),
+    (r'\bgroß\b', 'beträchtlich'),
+    (r'\bklein\b', 'gering'),
+    (r'\bgut\b', 'angemessen'),
+    (r'\balt\b', 'betagt'),
+    (r'\bkurz\b', 'knapp'),
+    (r'\bfroh\b', 'erfreut'),
+    # Common verbs
+    (r'\bsagte\b', 'meinte'),
+    (r'\bfragte\b', 'erkundigte sich'),
+    (r'\bantwortete\b', 'erwiderte'),
+    (r'\bnickte\b', 'stimmte zu'),
+    (r'\blächelte\b', 'schmunzelte'),
+    (r'\bging\b', 'begab sich'),
+    (r'\bkam\b', 'erschien'),
+    (r'\bsah\b', 'erblickte'),
+    (r'\bwollte\b', 'beabsichtigte'),
+    (r'\bkonnte\b', 'vermochte'),
+    (r'\bmusste\b', 'war gezwungen zu'),
+    (r'\bwusste\b', 'war sich bewusst'),
+    # Nouns & other
+    (r'\betwas\b', 'ein wenig'),
+    (r'\bWorte\b', 'Wörter'),
+    (r'\bnicht\b', 'keineswegs'),  # last resort — changes meaning slightly
+]
+
+
+def _find_synonym_pair(text):
+    """Return (matched_literal, replacement) for the first synonym that applies to text.
+
+    Used to inject a concrete mandatory word-swap into retry prompts, so the model
+    cannot return the same text. Returns None if no synonym matches (very short rows).
+    """
+    for pattern, replacement in _SYNONYMS:
+        m = _re.search(pattern, text)
+        if m:
+            return (m.group(0), replacement)
+    return None
+
+
 def _deterministic_change(text):
     """Make ONE guaranteed-small change to a German text without any API call.
-    
+
     Used as a last-resort fallback when all Gemini keys are exhausted and the
     similarity/verbatim retry cannot reach the API. Ensures every row differs
     from the MT by at least one word, preventing CDReader ErrMessage10 rejection.
-    
+
     Strategy: try synonym substitutions in priority order; apply the FIRST match only.
     These are common German words where the synonym is equally natural and correct.
     """
-    # Pairs: (original_word, replacement) — ordered by frequency in prose
-    # Must cover enough vocabulary that virtually any German sentence has at least one match.
-    _SYNONYMS = [
-        # Conjunctions & particles (highest frequency)
-        (r'\bund\b', 'sowie'),
-        (r'\baber\b', 'jedoch'),
-        (r'\bauch\b', 'ebenfalls'),
-        (r'\bdoch\b', 'dennoch'),
-        (r'\balso\b', 'demnach'),
-        (r'\bdann\b', 'daraufhin'),
-        (r'\bnur\b', 'lediglich'),
-        (r'\bnoch\b', 'weiterhin'),
-        (r'\bschon\b', 'bereits'),
-        (r'\bjetzt\b', 'nun'),
-        (r'\bimmer\b', 'stets'),
-        (r'\bso\b', 'derart'),
-        (r'\bganz\b', 'völlig'),
-        (r'\bwieder\b', 'erneut'),
-        (r'\bwohl\b', 'vermutlich'),
-        (r'\berst\b', 'zunächst'),
-        # Adverbs
-        (r'\bsehr\b', 'äußerst'),
-        (r'\bschnell\b', 'rasch'),
-        (r'\bwirklich\b', 'tatsächlich'),
-        (r'\bgenau\b', 'exakt'),
-        (r'\bplötzlich\b', 'unvermittelt'),
-        (r'\bsofort\b', 'umgehend'),
-        (r'\bnatürlich\b', 'selbstverständlich'),
-        (r'\bvielleicht\b', 'möglicherweise'),
-        (r'\bleise\b', 'still'),
-        (r'\bgelassen\b', 'ruhig'),
-        (r'\bstolz\b', 'selbstbewusst'),
-        # Adjectives
-        (r'\bschwer\b', 'schwierig'),
-        (r'\bgroß\b', 'beträchtlich'),
-        (r'\bklein\b', 'gering'),
-        (r'\bgut\b', 'angemessen'),
-        (r'\balt\b', 'betagt'),
-        (r'\bkurz\b', 'knapp'),
-        (r'\bfroh\b', 'erfreut'),
-        # Common verbs
-        (r'\bsagte\b', 'meinte'),
-        (r'\bfragte\b', 'erkundigte sich'),
-        (r'\bantwortete\b', 'erwiderte'),
-        (r'\bnickte\b', 'stimmte zu'),
-        (r'\blächelte\b', 'schmunzelte'),
-        (r'\bging\b', 'begab sich'),
-        (r'\bkam\b', 'erschien'),
-        (r'\bsah\b', 'erblickte'),
-        (r'\bwollte\b', 'beabsichtigte'),
-        (r'\bkonnte\b', 'vermochte'),
-        (r'\bmusste\b', 'war gezwungen zu'),
-        (r'\bwusste\b', 'war sich bewusst'),
-        # Nouns & other
-        (r'\betwas\b', 'ein wenig'),
-        (r'\bWorte\b', 'Wörter'),
-        (r'\bnicht\b', 'keineswegs'),  # last resort — changes meaning slightly
-    ]
     for pattern, replacement in _SYNONYMS:
         result = _re.sub(pattern, replacement, text, count=1)
         if result != text:
             return result
     # Absolute last resort: if no synonym matched (very short row),
-    # append a zero-width space equivalent: swap first comma for semicolon
+    # swap first comma for semicolon
     if ',' in text:
         return text.replace(',', ';', 1)
     # If truly nothing can be changed (single word, no commas), return as-is
     return text
 
 
-def _call_gemini_simple(prompt, temperature=0.9, max_tokens=512):
+def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
     """Simple Gemini call with key rotation for retries. Returns parsed JSON list or None.
-    
-    Skips RPD-exhausted keys entirely. The paid key (position 28) has no daily
-    limit and will never be in _rpd_exhausted_keys, so it's always reachable.
-    If no keys are available, returns None immediately (triggers deterministic fallback).
+
+    Skips RPD-exhausted keys. Distinguishes RPM (per-minute) from RPD (daily quota) 429s
+    using the same error-body logic as _call_gemini — so a rate-limited key 28 is NOT
+    permanently killed just because it hit its per-minute cap.
+
+    If RPM-limited keys remain after the first pass, waits 15 s and retries them once.
+    This handles the common end-of-chapter case where key 28 is the sole survivor and
+    was briefly rate-limited after processing the final batch.
     """
     keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys]
     if not keys_to_try:
-        return None  # All keys dead — deterministic fallback will handle this
+        return None  # All keys daily-dead — deterministic fallback will handle this
+
+    _rpm_skipped = set()  # RPM-limited this call; NOT permanently dead
+
+    def _one_call(api_key):
+        """Execute one Gemini request and return (parsed_list_or_None, is_429_rpd, is_429_rpm)."""
+        resp = requests.post(
+            f"{GEMINI_URL}?key={api_key}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+            },
+            timeout=45,
+        )
+        if resp.status_code == 429:
+            is_rpd = False
+            try:
+                err_obj = resp.json().get("error", {})
+                combined = (str(err_obj.get("message", "")) + str(err_obj.get("details", ""))).lower()
+                rpd_keywords = (
+                    "per day", "daily", "1 day", "per_day",
+                    "billing", "your current quota", "quota_exceeded", "check your plan",
+                )
+                is_rpd = any(kw in combined for kw in rpd_keywords)
+            except Exception:
+                pass
+            return None, is_rpd, not is_rpd
+        resp.raise_for_status()
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(text)
+        return (parsed if isinstance(parsed, list) and parsed else None), False, False
+
+    # ── First pass: try every non-RPD key ────────────────────────────────────
     for api_key in keys_to_try:
         try:
-            resp = requests.post(
-                f"{GEMINI_URL}?key={api_key}",
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
-                },
-                timeout=45,
-            )
-            if resp.status_code == 429:
-                # Mark as RPD-exhausted so subsequent retries skip this key instantly
+            result, is_rpd, is_rpm = _one_call(api_key)
+            if is_rpd:
                 _rpd_exhausted_keys.add(api_key)
                 continue
-            resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            parsed = json.loads(text)
-            if isinstance(parsed, list) and parsed:
-                return parsed
-            return None
+            if is_rpm:
+                _rpm_skipped.add(api_key)
+                continue
+            return result  # success (may be None if model returned non-list)
         except Exception:
             continue
+
+    # ── Second pass: retry RPM-skipped keys after a brief recovery window ────
+    # Only fires when all non-RPD keys were RPM-limited (typically: only key 28
+    # survived the day, just finished a batch, hit its per-minute cap on first retry).
+    rpm_retry = [k for k in _rpm_skipped if k not in _rpd_exhausted_keys]
+    if not rpm_retry:
+        return None
+
+    log(f"  ⏳ _call_gemini_simple: {len(rpm_retry)} key(s) RPM-limited — waiting 15 s for recovery...")
+    time.sleep(15)
+    for api_key in rpm_retry:
+        try:
+            result, is_rpd, is_rpm = _one_call(api_key)
+            if is_rpd or is_rpm:
+                # Still rate-limited after 15 s — treat as permanently exhausted for this run
+                _rpd_exhausted_keys.add(api_key)
+                continue
+            return result
+        except Exception:
+            continue
+
     return None
 
 
@@ -816,10 +878,25 @@ def _unified_retry(all_rephrased, input_data, rows):
             )
             temp = 0.5
         elif "similar" in reason:
+            # Pre-compute the required word swap so the model has a concrete, mandatory
+            # anchor. Without this, the model at low temperature sees a correct sentence
+            # and returns it unchanged despite the "make a small change" instruction.
+            _swap = _find_synonym_pair(current_out)
+            if _swap:
+                _swap_instruction = (
+                    f"PFLICHT: Ersetze in deiner Antwort \u00bbexakt\u00ab das Wort "
+                    f"\u00bb{_swap[0]}\u00ab durch \u00bb{_swap[1]}\u00ab. "
+                    f"Passe ggf. Artikel/Kasus an. Lass alles andere unver\u00e4ndert.\n"
+                )
+            else:
+                _swap_instruction = (
+                    "PFLICHT: Ver\u00e4ndere mindestens ein Wort — "
+                    "Gib NICHT denselben Satz zur\u00fcck.\n"
+                )
             prompt = (
-                "Du bist ein deutscher Korrektor. Der folgende Satz ist fast identisch zum "
-                "Referenztext. Mache eine KLEINE Änderung — ersetze ein Wort durch ein Synonym "
-                "oder passe die Wortstellung leicht an. Verändere NICHT die gesamte Satzstruktur.\n"
+                "Du bist ein deutscher Korrektor. Der folgende Satz ist zu \u00e4hnlich zum "
+                "Referenztext und muss ge\u00e4ndert werden.\n"
+                + _swap_instruction +
                 "Antworte NUR mit: "
                 "[{\"sort\": " + str(sort_n) + ", \"content\": \"<korrigiert>\"}]\n"
                 + json.dumps([{"sort": sort_n, "reference": ref_text, "content": current_out}],
@@ -827,10 +904,23 @@ def _unified_retry(all_rephrased, input_data, rows):
             )
             temp = 0.5
         else:  # verbatim
+            # Same approach: give the model a specific word to swap, not a vague instruction.
+            _swap = _find_synonym_pair(current_out)
+            if _swap:
+                _swap_instruction = (
+                    f"PFLICHT: Ersetze in deiner Antwort \u00bbexakt\u00ab das Wort "
+                    f"\u00bb{_swap[0]}\u00ab durch \u00bb{_swap[1]}\u00ab. "
+                    f"Passe ggf. Artikel/Kasus an. Lass alles andere unver\u00e4ndert.\n"
+                )
+            else:
+                _swap_instruction = (
+                    "PFLICHT: Ver\u00e4ndere mindestens ein Wort — "
+                    "Gib NICHT denselben Satz zur\u00fcck.\n"
+                )
             prompt = (
-                "Du bist ein deutscher Korrektor. Mache eine MINIMALE Änderung an diesem Satz — "
-                "ersetze ein einzelnes Wort durch ein Synonym oder passe einen Artikel an. "
-                "Verändere NICHT die Satzstruktur. Gib NICHT denselben Satz zurück.\n"
+                "Du bist ein deutscher Korrektor. Dieser Satz ist identisch zum Eingabetext "
+                "und muss ver\u00e4ndert werden.\n"
+                + _swap_instruction +
                 "Antworte NUR mit: [{\"sort\": " + str(sort_n) + ", \"content\": \"<korrigiert>\"}]\n"
                 + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
             )
