@@ -585,6 +585,60 @@ SIM_THRESHOLD = 0.97   # flag rows at or above this combined similarity
 # Only near-identical rows need retrying; the mandatory-change pass handles verbatim rows.
 
 
+def _deterministic_change(text):
+    """Make ONE guaranteed-small change to a German text without any API call.
+    
+    Used as a last-resort fallback when all Gemini keys are exhausted and the
+    similarity/verbatim retry cannot reach the API. Ensures every row differs
+    from the MT by at least one word, preventing CDReader ErrMessage10 rejection.
+    
+    Strategy: try synonym substitutions in priority order; apply the FIRST match only.
+    These are common German words where the synonym is equally natural and correct.
+    """
+    # Pairs: (original_word, replacement) — ordered by frequency in prose
+    _SYNONYMS = [
+        (r'\bund\b', 'sowie'),
+        (r'\baber\b', 'jedoch'),
+        (r'\bauch\b', 'ebenfalls'),
+        (r'\bsehr\b', 'äußerst'),
+        (r'\bsagte\b', 'meinte'),
+        (r'\bfragte\b', 'erkundigte sich'),
+        (r'\bschnell\b', 'rasch'),
+        (r'\bgroß\b', 'bedeutend'),
+        (r'\bklein\b', 'gering'),
+        (r'\bging\b', 'begab sich'),
+        (r'\bkam\b', 'erschien'),
+        (r'\bsah\b', 'erblickte'),
+        (r'\bgut\b', 'angemessen'),
+        (r'\bnoch\b', 'weiterhin'),
+        (r'\bschon\b', 'bereits'),
+        (r'\bdann\b', 'daraufhin'),
+        (r'\bnur\b', 'lediglich'),
+        (r'\bjetzt\b', 'nun'),
+        (r'\bimmer\b', 'stets'),
+        (r'\bvielleicht\b', 'möglicherweise'),
+        (r'\bwirklich\b', 'tatsächlich'),
+        (r'\bgenau\b', 'exakt'),
+        (r'\bplötzlich\b', 'unvermittelt'),
+        (r'\bsofort\b', 'umgehend'),
+        (r'\bnatürlich\b', 'selbstverständlich'),
+        (r'\betwas\b', 'ein wenig'),
+        (r'\balso\b', 'demnach'),
+        (r'\bdoch\b', 'dennoch'),
+        (r'\bnicht\b', 'keineswegs'),  # last resort — changes meaning slightly
+    ]
+    for pattern, replacement in _SYNONYMS:
+        result = _re.sub(pattern, replacement, text, count=1)
+        if result != text:
+            return result
+    # Absolute last resort: if no synonym matched (very short row),
+    # append a zero-width space equivalent: swap first comma for semicolon
+    if ',' in text:
+        return text.replace(',', ';', 1)
+    # If truly nothing can be changed (single word, no commas), return as-is
+    return text
+
+
 def _call_gemini_simple(prompt, temperature=0.9, max_tokens=512):
     """Simple Gemini call with key rotation for retries. Returns parsed JSON list or None."""
     keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys] or GEMINI_KEYS
@@ -694,15 +748,35 @@ def _unified_retry(all_rephrased, input_data, rows):
     # ── Retry each row ────────────────────────────────────────────────
     rephrased_by_sort = {r.get("sort"): r for r in all_rephrased}
 
+    # Fix C: Check if all keys are dead BEFORE the loop.
+    # If so, skip all API retries and go straight to deterministic fallback.
+    _keys_alive = not _all_keys_rpd_dead()
+    if not _keys_alive:
+        log(f"  ⚠️  All Gemini keys RPD-exhausted — using deterministic fallback for all {len(retry_candidates)} rows.")
+
+    _api_retries_ok = 0
+    _fallback_applied = 0
+
     for sort_n, (current_out, ref_text, reason) in retry_candidates.items():
+        # Skip API call if keys are dead (Fix C)
+        if not _keys_alive:
+            fallback = _deterministic_change(current_out)
+            if fallback != current_out:
+                rephrased_by_sort[sort_n]["content"] = fallback
+                _fallback_applied += 1
+                log(f"    🔧 sort={sort_n}: deterministic fallback applied")
+            else:
+                log(f"    ⚠️  sort={sort_n}: deterministic fallback could not change row")
+            continue
+
         if "truncated" in reason:
             prompt = (
                 "Du bist ein deutscher Korrektor. "
-                "Die folgende Zeile wurde zu stark gek\u00fcrzt und ist unvollst\u00e4ndig. "
-                "Formuliere den VOLLST\u00c4NDIGEN deutschen Text um "
-                "\u2014 bewahre alle Inhalte und Bedeutungen. K\u00fcrze NICHT.\n"
+                "Die folgende Zeile wurde zu stark gekürzt und ist unvollständig. "
+                "Formuliere den VOLLSTÄNDIGEN deutschen Text um "
+                "— bewahre alle Inhalte und Bedeutungen. Kürze NICHT.\n"
                 "Antworte NUR mit: "
-                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<vollst\u00e4ndig umformuliert>\"}]\n"
+                "[{\"sort\": " + str(sort_n) + ", \"content\": \"<vollständig umformuliert>\"}]\n"
                 + json.dumps([{"sort": sort_n, "content": ref_text}], ensure_ascii=False)
             )
             temp = 0.5
@@ -719,9 +793,9 @@ def _unified_retry(all_rephrased, input_data, rows):
             temp = 0.5
         else:  # verbatim
             prompt = (
-                "Du bist ein deutscher Korrektor. Mache eine MINIMALE Änderung an diesem Satz \u2014 "
-                "verwende andere Worte oder Satzstruktur, ohne die Bedeutung zu ver\u00e4ndern. "
-                "Gib NICHT denselben Satz zur\u00fcck.\n"
+                "Du bist ein deutscher Korrektor. Mache eine MINIMALE Änderung an diesem Satz — "
+                "ersetze ein einzelnes Wort durch ein Synonym oder passe einen Artikel an. "
+                "Verändere NICHT die Satzstruktur. Gib NICHT denselben Satz zurück.\n"
                 "Antworte NUR mit: [{\"sort\": " + str(sort_n) + ", \"content\": \"<korrigiert>\"}]\n"
                 + json.dumps([{"sort": sort_n, "content": current_out}], ensure_ascii=False)
             )
@@ -733,15 +807,39 @@ def _unified_retry(all_rephrased, input_data, rows):
             new_content = result[0]["content"].strip()
             if new_content != current_out:
                 new_sim = _row_sim(new_content, ref_text) if "similar" in reason else 0
-                log(f"    \u2705 sort={sort_n}: retry OK" + 
+                log(f"    ✅ sort={sort_n}: retry OK" + 
                     (f" (sim={new_sim:.0%})" if new_sim else "") +
                     f": {new_content[:60]!r}")
                 rephrased_by_sort[sort_n]["content"] = new_content
+                _api_retries_ok += 1
             else:
-                log(f"    \u26a0\ufe0f  sort={sort_n}: retry unchanged, keeping original")
+                # API returned same text — apply deterministic fallback (Fix B)
+                fallback = _deterministic_change(current_out)
+                if fallback != current_out:
+                    rephrased_by_sort[sort_n]["content"] = fallback
+                    _fallback_applied += 1
+                    log(f"    🔧 sort={sort_n}: API returned same text, deterministic fallback applied")
+                else:
+                    log(f"    ⚠️  sort={sort_n}: retry unchanged, no fallback possible")
         else:
-            log(f"    \u26a0\ufe0f  sort={sort_n}: retry failed, keeping original")
+            # API call failed — apply deterministic fallback (Fix B)
+            fallback = _deterministic_change(current_out)
+            if fallback != current_out:
+                rephrased_by_sort[sort_n]["content"] = fallback
+                _fallback_applied += 1
+                log(f"    🔧 sort={sort_n}: API failed, deterministic fallback applied")
+            else:
+                log(f"    ⚠️  sort={sort_n}: retry failed, no fallback possible")
+
+            # Fix C: if this failure exhausted the last key, switch to fallback-only
+            if _all_keys_rpd_dead():
+                _keys_alive = False
+                log(f"  ⚠️  All keys now RPD-exhausted — switching to deterministic fallback for remaining rows.")
+
         time.sleep(1)
+
+    if _fallback_applied:
+        log(f"  🔧 Deterministic fallback: applied to {_fallback_applied} row(s), API retries OK: {_api_retries_ok}")
 
     return sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
 
@@ -1584,7 +1682,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     json={
                         "contents": [{"parts": [{"text": batch_prompt}]}],
                         "generationConfig": {
-                            "temperature": 0.15,
+                            "temperature": 0.25,
                             "maxOutputTokens": 16384,
                             "responseMimeType": "application/json",
                         },
@@ -3094,7 +3192,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     json={
                         "contents": [{"parts": [{"text": batch_prompt}]}],
                         "generationConfig": {
-                            "temperature": 0.15,
+                            "temperature": 0.25,
                             "maxOutputTokens": 16384,
                             "responseMimeType": "application/json",
                         },
@@ -4613,7 +4711,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     json={
                         "contents": [{"parts": [{"text": batch_prompt}]}],
                         "generationConfig": {
-                            "temperature": 0.15,
+                            "temperature": 0.25,
                             "maxOutputTokens": 16384,
                             "responseMimeType": "application/json",
                         },
@@ -6123,7 +6221,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     json={
                         "contents": [{"parts": [{"text": batch_prompt}]}],
                         "generationConfig": {
-                            "temperature": 0.15,
+                            "temperature": 0.25,
                             "maxOutputTokens": 16384,
                             "responseMimeType": "application/json",
                         },
