@@ -11,6 +11,16 @@ on:
         options:
           - 'false'
           - 'true'
+      chapter_id:
+        description: 'Override: process this specific chapter ID (proc_id from Task Center log, e.g. 1139888). Leave empty for normal auto-detect.'
+        required: false
+        default: ''
+        type: string
+      book_id:
+        description: 'Override: book ID for the chapter above (from Task Center log, e.g. 8123). Needed for glossary. Leave empty to skip glossary.'
+        required: false
+        default: ''
+        type: string
   schedule:
     - cron: '*/8 * * * *'
 
@@ -56,4 +66,6 @@ jobs:
           GEMINI_API_KEY_17: ${{ secrets.GEMINI_API_KEY_17 }}
           GEMINI_API_KEY_18: ${{ secrets.GEMINI_API_KEY_18 }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+          OVERRIDE_CHAPTER_ID: ${{ github.event.inputs.chapter_id || '' }}
+          OVERRIDE_BOOK_ID: ${{ github.event.inputs.book_id || '' }}
         run: python checker.py
