@@ -81,6 +81,37 @@ _PAID_KEY_MIN_INTERVAL: float = 0.4   # seconds between calls on the paid key
 # position-independent and correct regardless of how many free keys are wired.
 _PAID_KEY: str = os.environ.get("GEMINI_API_KEY_28", "").strip()
 
+# ─── Account-group-aware key management ───────────────────────────────────────
+# Keys are spread across 3 distinct Google accounts (= 3 independent RPM/RPD pools):
+#   Account A: GEMINI_API_KEY   through GEMINI_API_KEY_9  (positions 0-8)
+#   Account B: GEMINI_API_KEY_10 through GEMINI_API_KEY_18 (positions 9-17)
+#   Account C: GEMINI_API_KEY_19 through GEMINI_API_KEY_28 (positions 18-27, includes paid)
+# When ONE key in an account returns 429-RPM, ALL keys in that account are blocked
+# (rate limits are per Google Cloud project). But OTHER accounts are still available.
+_ACCOUNT_GROUPS: list = []  # list of list[str], built from _GEMINI_KEYS_RAW
+_ACCOUNT_LABELS = ['A', 'B', 'C']
+for _ag_start, _ag_end in [(0, 9), (9, 18), (18, 28)]:
+    _ag_keys = [k for k in _GEMINI_KEYS_RAW[_ag_start:_ag_end] if k.strip()]
+    _ACCOUNT_GROUPS.append(_ag_keys)
+_ag_counts = [len(g) for g in _ACCOUNT_GROUPS]
+log_msg = ", ".join(f"Account {_ACCOUNT_LABELS[i]}: {_ag_counts[i]} keys" for i in range(len(_ACCOUNT_GROUPS)))
+# (logged at runtime, not import time)
+
+# Rotating counter: determines which account group gets tried first for each batch/retry.
+# Incremented after each batch call to spread RPD load evenly across accounts.
+_batch_account_offset: int = 0
+
+# Track which account groups are RPM-blocked within a single _call_gemini_simple invocation.
+# Reset at the start of each call. Maps group_index → True if blocked.
+# (Not module-level persistent — RPM blocks are transient, ~60s.)
+
+def _key_account_group(api_key):
+    """Return the account group index (0-2) for a given API key, or -1 if unknown."""
+    for gi, group in enumerate(_ACCOUNT_GROUPS):
+        if api_key in group:
+            return gi
+    return -1
+
 # Fallback chain — used when all Gemini keys hit their daily quota (RPD)
 # No automatic fallback is currently active; the run aborts and the next
 # scheduled run will retry with refreshed daily quotas.
@@ -98,8 +129,18 @@ _PRE_RETRY_COOLDOWN: int  = 65         # seconds to wait before retry loop when 
 
 
 
-def _next_gemini_key():
-    """Return the next non-exhausted Gemini API key, or None if all exhausted."""
+def _next_gemini_key(prefer_group=None):
+    """Return the next non-exhausted Gemini API key, or None if all exhausted.
+    
+    If prefer_group is specified (0=A, 1=B, 2=C), tries that account's keys first
+    before falling through to other accounts. This spreads RPD load across accounts.
+    """
+    if prefer_group is not None and 0 <= prefer_group < len(_ACCOUNT_GROUPS):
+        # Try preferred group first
+        for k in _ACCOUNT_GROUPS[prefer_group]:
+            if k in GEMINI_KEYS and k not in _exhausted_keys and k not in _rpd_exhausted_keys:
+                return k
+    # Fall through: try all groups in order
     available = [k for k in GEMINI_KEYS if k not in _exhausted_keys and k not in _rpd_exhausted_keys]
     return available[0] if available else None
 
@@ -808,18 +849,19 @@ def _deterministic_change(text):
     return text
 
 
-def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
-    """Simple Gemini call for single-row retries. Returns parsed JSON list or None.
-
-    Key design decisions (2026-03-10 rewrite):
-      1. PAID KEY FIRST: The paid key (key 28, separate project, 150 RPM) is tried
-         before any free key. This avoids the 60s waste of scanning 25 free keys that
-         all share project-level RPM and all return 429.
-      2. PROJECT-LEVEL RPM AWARENESS: When ONE free key returns 429, ALL free keys
-         from the same tier are skipped for that call. Rate limits are per Google Cloud
-         project, not per API key — hitting one proves the project is rate-limited.
-      3. EXPLICIT ERROR LOGGING: Parse failures and unexpected responses are logged
-         instead of silently swallowed by `except Exception: continue`.
+def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
+    """Account-group-aware Gemini call for single-row retries.
+    
+    Returns parsed JSON list or None.
+    
+    Key design (2026-03-10, 3-account rewrite):
+      1. ACCOUNT-GROUP ROTATION: Keys are in 3 Google accounts with independent RPM/RPD.
+         Try one key from each account group. When a group returns 429-RPM, skip only
+         that group — other accounts are unaffected.
+      2. 503 RETRY: Transient 5xx errors get one retry after a 3s wait.
+      3. INCREASED OUTPUT BUDGET: Default maxOutputTokens=2048 (was 512). gemini-2.5-flash
+         uses internal thinking tokens that consume the output budget, causing truncated
+         JSON responses at 512.
     """
     global _retry_scan_offset
 
@@ -837,17 +879,34 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
         return (time.time() - last) >= _min_interval(api_key)
 
     def _one_call(api_key):
-        """Execute one Gemini request. Returns (parsed_list_or_None, is_429_rpd, is_429_rpm).
-        Raises on non-429 HTTP errors or parse failures (caller decides how to handle)."""
-        _key_last_used[api_key] = time.time()
-        resp = requests.post(
-            f"{GEMINI_URL}?key={api_key}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
-            },
-            timeout=45,
-        )
+        """Execute one Gemini request with 503 retry.
+        Returns (parsed_list_or_None, is_429_rpd, is_429_rpm)."""
+        for _attempt in range(2):  # up to 2 attempts (1 original + 1 retry on 5xx)
+            _key_last_used[api_key] = time.time()
+            try:
+                resp = requests.post(
+                    f"{GEMINI_URL}?key={api_key}",
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+                    },
+                    timeout=45,
+                )
+            except requests.exceptions.RequestException as e:
+                if _attempt == 0:
+                    log(f"    ⚠️ Network error (will retry): {e}")
+                    time.sleep(3)
+                    continue
+                raise
+            if resp.status_code in (500, 502, 503, 504):
+                if _attempt == 0:
+                    log(f"    ⚠️ Gemini {resp.status_code} (will retry in 3s)")
+                    time.sleep(3)
+                    continue
+                else:
+                    resp.raise_for_status()  # give up on second 5xx
+            break  # non-5xx response, proceed to parse
+
         if resp.status_code == 429:
             is_rpd = False
             try:
@@ -865,7 +924,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
         body = resp.json()
         candidates = body.get("candidates", [])
         if not candidates:
-            log(f"    ⚠️ Gemini returned no candidates (finishReason={body.get('promptFeedback', {}).get('blockReason', '?')})")
+            log(f"    ⚠️ Gemini returned no candidates (blockReason={body.get('promptFeedback', {}).get('blockReason', '?')})")
             return None, False, False
         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
         if not text:
@@ -880,85 +939,76 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
             return None, False, False
         return (parsed if isinstance(parsed, list) and parsed else None), False, False
 
-    # ── Strategy: paid key first, then ONE free-key probe ──────────────────
-    # Paid key is on a separate/higher-tier project and has 150 RPM.
-    # Free keys share project-level RPM — if one returns 429, all will.
+    # ── Strategy: try one key from each account group ─────────────────────
+    # Round-robin starting group so consecutive retry rows don't always hit
+    # the same account first. Within each group, pick the first cooled key.
+    _rpm_blocked_groups = set()  # groups where 429-RPM was seen this call
+    n_groups = len(_ACCOUNT_GROUPS)
+    start_group = _retry_scan_offset % n_groups
+    _retry_scan_offset += 1
 
-    # Step 1: Try paid key if available and cooled
-    if _paid_key and _paid_key in keys_all and _is_cooled(_paid_key):
-        try:
-            result, is_rpd, is_rpm = _one_call(_paid_key)
-            if is_rpd:
-                _rpd_exhausted_keys.add(_paid_key)
-            elif not is_rpm and result is not None:
-                return result
-            # If paid key returned 429-RPM or empty result, fall through to free keys
-        except Exception as e:
-            log(f"    ⚠️ Paid key error: {e}")
+    for gi_offset in range(n_groups):
+        gi = (start_group + gi_offset) % n_groups
+        if gi in _rpm_blocked_groups:
+            continue
+        group_keys = [k for k in _ACCOUNT_GROUPS[gi]
+                      if k in keys_all and k not in _rpd_exhausted_keys]
+        if not group_keys:
+            continue
 
-    # Step 2: Try ONE free key as a project-RPM probe
-    # If it returns 429, skip ALL other free keys (same project quota).
-    free_keys = [k for k in keys_all if k != _paid_key and k not in _rpd_exhausted_keys]
-    _free_project_blocked = False
+        # Pick the first cooled key in this group
+        for api_key in group_keys:
+            if not _is_cooled(api_key):
+                continue
+            try:
+                result, is_rpd, is_rpm = _one_call(api_key)
+                if is_rpd:
+                    _rpd_exhausted_keys.add(api_key)
+                    continue  # try next key in same group (might be different project? unlikely but safe)
+                if is_rpm:
+                    _rpm_blocked_groups.add(gi)
+                    log(f"    ℹ️ Account {_ACCOUNT_LABELS[gi]} RPM-blocked — skipping group")
+                    break  # skip rest of this group, try next account
+                if result is not None:
+                    return result
+                # Empty/None result but no 429 — try next key in group
+            except Exception as e:
+                log(f"    ⚠️ Account {_ACCOUNT_LABELS[gi]} key error: {e}")
+            break  # only try ONE key per group (success or fail), then move to next group
 
-    if free_keys:
-        # Pick the next cooled free key using rotating offset
-        n = len(free_keys)
-        offset = _retry_scan_offset % n
-        _retry_scan_offset += 1
-        for i in range(n):
-            probe_key = free_keys[(offset + i) % n]
-            if _is_cooled(probe_key):
-                try:
-                    result, is_rpd, is_rpm = _one_call(probe_key)
-                    if is_rpd:
-                        _rpd_exhausted_keys.add(probe_key)
-                        continue  # try next free key (different project)
-                    if is_rpm:
-                        # Project-level RPM hit — all free keys on this project are blocked
-                        _free_project_blocked = True
-                        break
-                    if result is not None:
-                        return result
-                    # Empty result but no 429 — try next key
-                except Exception as e:
-                    log(f"    ⚠️ Free key probe error: {e}")
-                break  # only probe ONE free key (success or fail)
+    # ── Second pass: wait for soonest key across non-blocked groups ────────
+    available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys
+                      and _key_account_group(k) not in _rpm_blocked_groups]
+    if not available_keys:
+        # All groups either RPM-blocked or RPD-dead — try waiting for the soonest key
+        available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys]
 
-    # ── Fallback: wait for paid key and retry ──────────────────────────────
-    # If we're here, both paid key and free-key probe failed.
-    # Wait for the paid key to cool down and try once more.
-    if _paid_key and _paid_key in keys_all and _paid_key not in _rpd_exhausted_keys:
-        if not _is_cooled(_paid_key):
-            elapsed = time.time() - _key_last_used.get(_paid_key, 0.0)
-            wait_secs = max(0.5, _PAID_KEY_MIN_INTERVAL - elapsed + 0.3)
-            wait_secs = min(wait_secs, 5.0)
-            log(f"  \u23f3 _call_gemini_simple: waiting {wait_secs:.1f}s for paid key...")
+    if available_keys:
+        now = time.time()
+        wait_times = []
+        for k in available_keys:
+            elapsed = now - _key_last_used.get(k, 0.0)
+            needed = _min_interval(k) - elapsed
+            if needed > 0:
+                wait_times.append(needed)
+        if wait_times:
+            wait_secs = min(wait_times) + 0.5
+            wait_secs = max(1.0, min(wait_secs, 8.0))
             time.sleep(wait_secs)
-        try:
-            result, is_rpd, is_rpm = _one_call(_paid_key)
-            if is_rpd:
-                _rpd_exhausted_keys.add(_paid_key)
-            elif not is_rpm and result is not None:
-                return result
-        except Exception as e:
-            log(f"    ⚠️ Paid key retry error: {e}")
 
-    # If free keys weren't project-blocked, try remaining free keys as last resort
-    if not _free_project_blocked and free_keys:
-        for fk in free_keys:
-            if fk not in _rpd_exhausted_keys and _is_cooled(fk):
+        # Try the soonest-cooled key
+        for k in available_keys:
+            if _is_cooled(k):
                 try:
-                    result, is_rpd, is_rpm = _one_call(fk)
+                    result, is_rpd, is_rpm = _one_call(k)
                     if is_rpd:
-                        _rpd_exhausted_keys.add(fk)
+                        _rpd_exhausted_keys.add(k)
                         continue
-                    if is_rpm:
-                        break  # project blocked, stop trying
-                    if result is not None:
+                    if not is_rpm and result is not None:
                         return result
                 except Exception:
-                    continue
+                    pass
+                break  # one attempt only
 
     return None
 
@@ -1133,7 +1183,7 @@ def _unified_retry(all_rephrased, input_data, rows):
             temp = 0.5
 
         result = _call_gemini_simple(prompt, temperature=temp,
-                                     max_tokens=1024 if "truncated" in reason else 512)
+                                     max_tokens=4096 if "truncated" in reason else 2048)
         if result and result[0].get("content", "").strip():
             new_content = result[0]["content"].strip()
             if new_content != current_out:
@@ -1858,6 +1908,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
 
 # ─── Phase 4: Rephrase with Gemini ───────────────────────────────────────────
 def rephrase_with_gemini(rows, glossary_terms, book_name):
+    global _batch_account_offset
     if not GEMINI_KEYS:
         log("❌ No GEMINI_API_KEY configured.")
         return None
@@ -2075,7 +2126,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 if _all_keys_rpd_dead():
                     log(f"❌ All Gemini keys have hit their daily quota (RPD). No point retrying.")
                     return None
-                api_key = _next_gemini_key()
+                api_key = _next_gemini_key(prefer_group=_batch_account_offset % len(_ACCOUNT_GROUPS) if _ACCOUNT_GROUPS else None)
                 if not api_key:
                     # All remaining (non-RPD) keys are RPM-exhausted — wait for reset
                     full_rotations += 1
@@ -2191,11 +2242,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
 
     all_rephrased = []
     key_count = len(GEMINI_KEYS)
-    log(f"  Using {key_count} Gemini key(s) (keys 1-{key_count}) with automatic rotation on 429.")
+    _ag_info = ", ".join(f"{_ACCOUNT_LABELS[i]}:{len(g)}" for i, g in enumerate(_ACCOUNT_GROUPS) if g)
+    log(f"  Using {key_count} Gemini key(s) across {len(_ACCOUNT_GROUPS)} accounts ({_ag_info}) with group rotation.")
     for i, batch in enumerate(batches, 1):
-        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini...")
+        _preferred_group = _batch_account_offset % len(_ACCOUNT_GROUPS) if _ACCOUNT_GROUPS else 0
+        log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini (prefer Account {_ACCOUNT_LABELS[_preferred_group]})...")
         next_first = batches[i][0] if i < total_batches else None
         result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
+        _batch_account_offset += 1  # rotate to next account for next batch
         if result is None:
             # Fall back to MT content for this batch — the similarity guard will
             # flag these rows for retry, converting a hard failure into degraded
