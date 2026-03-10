@@ -1581,6 +1581,45 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                             fixed = fixed[:-1] + _QE_CLOSE + ','
                         else:
                             fixed = fixed + _QE_CLOSE
+            else:
+                # ── Fix: Name trapped inside closing quote ────────────
+                # Gemini sometimes includes the character name INSIDE the closing
+                # quote when it should be outside as part of the attribution:
+                #   Wrong:   „Geh tiefer Bruno“ schnappte.
+                #   Correct: „Geh tiefer“, schnappte Bruno.
+                # Detection: CapitalizedWord immediately before closing quote,
+                # AND an SV attribution verb immediately after the closing quote.
+                # Guard: word before the name must NOT be an article/preposition
+                # (which would indicate a normal noun phrase inside speech).
+                _trapped = _re.search(
+                    r'\s+([A-ZÄÖÜ][a-zäöüß]+)\s*'
+                    r'([""“])\s*,?\s*(' + _SV + r')\b',
+                    fixed
+                )
+                if _trapped and fixed.find('„') < _trapped.start():
+                    # Guard: check word before name is not an article/preposition
+                    _prefix = fixed[:_trapped.start()].rstrip()
+                    _last_word = _prefix.split()[-1].lower() if _prefix.split() else ""
+                    _articles = {
+                        'den', 'die', 'das', 'der', 'dem', 'des',
+                        'ein', 'eine', 'einem', 'einen', 'einer',
+                        'vom', 'zum', 'zur', 'im', 'am', 'ins', 'ans', 'aufs',
+                        'beim', 'nach', 'von', 'mit', 'für', 'auf', 'an',
+                        'in', 'über', 'unter', 'hinter', 'neben', 'zwischen',
+                    }
+                    if _last_word not in _articles:
+                        _before = _prefix  # speech content up to the trapped name
+                        _name = _trapped.group(1)
+                        _verb = _trapped.group(3)
+                        _after = fixed[_trapped.end():]  # everything after the SV verb
+                        # Construct: speech + close + [comma] + verb + name + rest
+                        if _before and _before[-1] in '?!…':
+                            # Question/exclamation/ellipsis: no comma needed
+                            fixed = _before + _QE_CLOSE + ' ' + _verb + ' ' + _name + _after
+                        else:
+                            # Declarative: add comma after close
+                            fixed = _before + _QE_CLOSE + ', ' + _verb + ' ' + _name + _after
+                        log(f"  ⚠️  QE trapped-name: sort={sort_n} — moved {_name!r} outside quote before {_verb!r}")
             # Orphan check: if the last „ has no closing " after it, append ".
             # Handles INLINE_SPLIT rows („a“, he said, „b? needs " on second segment).
             _last_open = fixed.rfind(_QE_OPEN)
@@ -2359,7 +2398,13 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             _en_w  = _en_wc.get(_s, 0)    # English source word count
             _out_w = len((_r.get("content") or "").split())
             _mt_trigger = _inp_w >= _TRUNCATION_MIN_WORDS and _out_w < _inp_w * _TRUNCATION_THRESHOLD
-            _en_trigger = _en_w  >= _TRUNCATION_MIN_WORDS and _out_w < _en_w  * _TRUNCATION_THRESHOLD
+            # EN trigger: only fire when MT is also >= 3 words. If MT is 1-2 words,
+            # the EN/MT length discrepancy is a CDReader source data issue (EN field
+            # sometimes contains concatenated text from adjacent rows), not Gemini truncation.
+            # Restoring from a 1-word MT would make things worse, not better.
+            _en_trigger = (_en_w >= _TRUNCATION_MIN_WORDS
+                           and _out_w < _en_w * _TRUNCATION_THRESHOLD
+                           and _inp_w >= 3)
             if _mt_trigger or _en_trigger:
                 _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
                 if _mt_orig:
