@@ -1411,16 +1411,24 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         role = _qe_role_by_sort.get(sort_n, "none")
         eng  = _eng_by_sort.get(sort_n, "")
 
-        # Upgrade "none" rows when English source has BOTH opening and closing quotes.
-        # Since the state machine now runs on English source, role="open" genuinely
-        # means English has only an opening quote (real multi-row opener) — no upgrade
-        # needed for that case. Only "none" rows need the upgrade when English confirms
-        # the row is dialogue that the state machine did not catch.
+        # Upgrade rows when English source has quotes the state machine missed.
+        # "none" → "both": EN has both opening and closing quotes
+        # "close" → "both": EN also has a mid-row opener (e.g. 'she said, "...')
         if role == "none" and eng:
             if _QE_ENG_OPEN_RE.match(eng.strip()) and _QE_ENG_CLOSE_RE.search(eng):
                 role = "both"
+        if role == "close" and eng:
+            # If EN has a mid-row opener (," or :") as well as the end-close,
+            # this row is self-contained dialogue, not a multi-row close.
+            if _re.search(r'[,:]\s*[""“„«]', eng):
+                role = "both"
 
         fixed = c
+
+        # Fix 0: Normalize French/angle quotes to German quotes.
+        # Gemini occasionally uses «» instead of „“. Replace before any structural check.
+        if '«' in fixed or '»' in fixed:
+            fixed = fixed.replace('«', '„').replace('»', '“')
 
         # Fix 1a (all roles): collapse accidental double closing-quotes.
         deduped = _re.sub(r'[“”"]{2,}', _QE_CLOSE, fixed)
@@ -1975,11 +1983,24 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         Classify whether a text row is an opening, closing, middle, or standalone
         dialogue line based on quote balance.
         Returns one of: "open", "close", "middle_or_none", "both"
+        
+        Checks both start/end positions AND mid-row patterns:
+        - Mid-row open: ,\u201c or :\u201c (narration introducing speech)
+        - Mid-row close: \u201c followed by space + lowercase (speech close before attribution)
         """
         t = text.strip()
-        # Use regex so the quote characters are explicit Unicode escapes, not invisible literals
-        opens  = bool(_re.match(r'^„|“|"|\xab', t))   # „ " " «
-        closes = bool(_re.search(r'[“”"\xbb]\s*[,!?.]?\s*$', t))  # " " " »
+        # Start-of-row opening: „ " “ «
+        opens  = bool(_re.match(r'^[„""«]', t))
+        # End-of-row closing: " ” " » at the very end
+        closes = bool(_re.search(r'["""»]\s*[,!?.]?\s*$', t))
+        
+        # Mid-row opening: attribution + comma/colon + quote (e.g. 'she said, "...')
+        if not opens:
+            opens = bool(_re.search(r'[,:]\s*["""«]', t))
+        
+        # Mid-row closing: quote + space + lowercase/attribution (e.g. '..." said Olivia.')
+        if not closes:
+            closes = bool(_re.search(r'["""»]\s+[a-z]', t))
 
         if opens and closes:
             return "both"
@@ -1989,7 +2010,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             return "close"
         else:
             return "middle_or_none"
-
     raw_contents = [
         # Use German machine translation as the text Gemini rephrases.
         # chapterConetnt is English — using it would make Gemini re-translate from
