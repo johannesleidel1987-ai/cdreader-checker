@@ -809,19 +809,17 @@ def _deterministic_change(text):
 
 
 def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
-    """Simple Gemini call with key rotation for retries. Returns parsed JSON list or None.
+    """Simple Gemini call for single-row retries. Returns parsed JSON list or None.
 
-    Skips RPD-exhausted keys. Distinguishes RPM (per-minute) from RPD (daily quota) 429s.
-
-    Option 1 — Per-key cooldown: tracks the timestamp of the last call per key and skips
-    any key whose last call was too recent for its token-bucket window to have refilled.
-    Free keys: min 6 s interval (10 RPM). Paid key 28: min 0.4 s interval (150 RPM).
-    Prevents the cascade where all keys are serially hit within seconds, all return 429,
-    and the 15 s wait only partially recovers them before the next row's scan restarts.
-
-    Option 2 — Rotating scan start: uses _retry_scan_offset (incremented after each call)
-    to begin the scan at a different key each time. Distributes load evenly across the
-    28-key pool instead of concentrating every first-pass hit on key 1.
+    Key design decisions (2026-03-10 rewrite):
+      1. PAID KEY FIRST: The paid key (key 28, separate project, 150 RPM) is tried
+         before any free key. This avoids the 60s waste of scanning 25 free keys that
+         all share project-level RPM and all return 429.
+      2. PROJECT-LEVEL RPM AWARENESS: When ONE free key returns 429, ALL free keys
+         from the same tier are skipped for that call. Rate limits are per Google Cloud
+         project, not per API key — hitting one proves the project is rate-limited.
+      3. EXPLICIT ERROR LOGGING: Parse failures and unexpected responses are logged
+         instead of silently swallowed by `except Exception: continue`.
     """
     global _retry_scan_offset
 
@@ -829,21 +827,18 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
     if not keys_all:
         return None  # All keys daily-dead
 
-    _paid_key = _PAID_KEY if _PAID_KEY else None  # identified by secret name, not list position
-    _rpm_skipped_tb = set()   # cooled-down by timestamp (token-bucket skip)
-    _rpm_skipped_429 = set()  # confirmed 429 from API
+    _paid_key = _PAID_KEY if _PAID_KEY else None
 
     def _min_interval(api_key):
-        """Minimum seconds between calls for this key based on its RPM tier."""
         return _PAID_KEY_MIN_INTERVAL if api_key == _paid_key else _FREE_KEY_MIN_INTERVAL
 
     def _is_cooled(api_key):
-        """True if enough time has passed since the last call on this key."""
         last = _key_last_used.get(api_key, 0.0)
         return (time.time() - last) >= _min_interval(api_key)
 
     def _one_call(api_key):
-        """Execute one Gemini request and return (parsed_list_or_None, is_429_rpd, is_429_rpm)."""
+        """Execute one Gemini request. Returns (parsed_list_or_None, is_429_rpd, is_429_rpm).
+        Raises on non-429 HTTP errors or parse failures (caller decides how to handle)."""
         _key_last_used[api_key] = time.time()
         resp = requests.post(
             f"{GEMINI_URL}?key={api_key}",
@@ -867,82 +862,103 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
                 pass
             return None, is_rpd, not is_rpd
         resp.raise_for_status()
-        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        body = resp.json()
+        candidates = body.get("candidates", [])
+        if not candidates:
+            log(f"    ⚠️ Gemini returned no candidates (finishReason={body.get('promptFeedback', {}).get('blockReason', '?')})")
+            return None, False, False
+        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        if not text:
+            log(f"    ⚠️ Gemini returned empty text (finishReason={candidates[0].get('finishReason', '?')})")
+            return None, False, False
         if text.startswith("```"):
             text = _re.sub(r"^```[^\n]*\n", "", text); text = text.rsplit("```", 1)[0].strip()
-        parsed = json.loads(text)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            log(f"    ⚠️ Gemini returned unparseable JSON: {text[:100]!r}")
+            return None, False, False
         return (parsed if isinstance(parsed, list) and parsed else None), False, False
 
-    # ── First pass: rotated scan, skip token-bucket-hot keys ─────────────────
-    # Option 2: start scan from rotating offset to distribute load across keys.
-    # Option 1: skip keys whose last call was too recent (token bucket not refilled).
-    n = len(keys_all)
-    offset = _retry_scan_offset % n
-    rotated_keys = keys_all[offset:] + keys_all[:offset]
-    _retry_scan_offset += 1  # advance for next call
+    # ── Strategy: paid key first, then ONE free-key probe ──────────────────
+    # Paid key is on a separate/higher-tier project and has 150 RPM.
+    # Free keys share project-level RPM — if one returns 429, all will.
 
-    for api_key in rotated_keys:
-        # Option 1: skip if this key is still within its cooldown window
-        if not _is_cooled(api_key):
-            _rpm_skipped_tb.add(api_key)
-            continue
+    # Step 1: Try paid key if available and cooled
+    if _paid_key and _paid_key in keys_all and _is_cooled(_paid_key):
         try:
-            result, is_rpd, is_rpm = _one_call(api_key)
+            result, is_rpd, is_rpm = _one_call(_paid_key)
             if is_rpd:
-                _rpd_exhausted_keys.add(api_key)
-                continue
-            if is_rpm:
-                _rpm_skipped_429.add(api_key)
-                continue
-            return result  # success
-        except Exception:
-            continue
+                _rpd_exhausted_keys.add(_paid_key)
+            elif not is_rpm and result is not None:
+                return result
+            # If paid key returned 429-RPM or empty result, fall through to free keys
+        except Exception as e:
+            log(f"    ⚠️ Paid key error: {e}")
 
-    # ── Second pass: wait for the soonest cooled key, then retry ─────────────
-    # Covers two cases:
-    #   A. All keys were token-bucket-hot (skipped in first pass by cooldown check)
-    #   B. Keys were tried but all returned 429 despite cooldown (burst overrun)
-    # Instead of a flat 15 s wait, calculate the minimum wait needed for at least
-    # one key to become available, then retry just the cooled-down subset.
-    remaining = [k for k in keys_all if k not in _rpd_exhausted_keys]
-    if not remaining:
-        return None
+    # Step 2: Try ONE free key as a project-RPM probe
+    # If it returns 429, skip ALL other free keys (same project quota).
+    free_keys = [k for k in keys_all if k != _paid_key and k not in _rpd_exhausted_keys]
+    _free_project_blocked = False
 
-    # Find minimum wait until the soonest key is cooled
-    now = time.time()
-    wait_times = []
-    for k in remaining:
-        elapsed = now - _key_last_used.get(k, 0.0)
-        needed = _min_interval(k) - elapsed
-        if needed > 0:
-            wait_times.append(needed)
+    if free_keys:
+        # Pick the next cooled free key using rotating offset
+        n = len(free_keys)
+        offset = _retry_scan_offset % n
+        _retry_scan_offset += 1
+        for i in range(n):
+            probe_key = free_keys[(offset + i) % n]
+            if _is_cooled(probe_key):
+                try:
+                    result, is_rpd, is_rpm = _one_call(probe_key)
+                    if is_rpd:
+                        _rpd_exhausted_keys.add(probe_key)
+                        continue  # try next free key (different project)
+                    if is_rpm:
+                        # Project-level RPM hit — all free keys on this project are blocked
+                        _free_project_blocked = True
+                        break
+                    if result is not None:
+                        return result
+                    # Empty result but no 429 — try next key
+                except Exception as e:
+                    log(f"    ⚠️ Free key probe error: {e}")
+                break  # only probe ONE free key (success or fail)
 
-    if wait_times:
-        wait_secs = min(wait_times) + 0.5  # +0.5 s safety margin
-        wait_secs = max(1.0, min(wait_secs, 15.0))  # clamp 1–15 s
-        log(f"  \u23f3 _call_gemini_simple: all keys on cooldown — waiting {wait_secs:.1f}s for soonest key...")
-        time.sleep(wait_secs)
-
-    # Retry the full remaining set with rotated offset (offset already advanced above)
-    n2 = len(remaining)
-    offset2 = _retry_scan_offset % n2
-    rotated2 = remaining[offset2:] + remaining[:offset2]
-    _retry_scan_offset += 1
-
-    for api_key in rotated2:
-        if not _is_cooled(api_key):
-            continue  # still not ready — skip, don't block entire retry
+    # ── Fallback: wait for paid key and retry ──────────────────────────────
+    # If we're here, both paid key and free-key probe failed.
+    # Wait for the paid key to cool down and try once more.
+    if _paid_key and _paid_key in keys_all and _paid_key not in _rpd_exhausted_keys:
+        if not _is_cooled(_paid_key):
+            elapsed = time.time() - _key_last_used.get(_paid_key, 0.0)
+            wait_secs = max(0.5, _PAID_KEY_MIN_INTERVAL - elapsed + 0.3)
+            wait_secs = min(wait_secs, 5.0)
+            log(f"  \u23f3 _call_gemini_simple: waiting {wait_secs:.1f}s for paid key...")
+            time.sleep(wait_secs)
         try:
-            result, is_rpd, is_rpm = _one_call(api_key)
+            result, is_rpd, is_rpm = _one_call(_paid_key)
             if is_rpd:
-                _rpd_exhausted_keys.add(api_key)
-                continue
-            if is_rpm:
-                # Still 429 after wait — skip without permanently killing
-                continue
-            return result
-        except Exception:
-            continue
+                _rpd_exhausted_keys.add(_paid_key)
+            elif not is_rpm and result is not None:
+                return result
+        except Exception as e:
+            log(f"    ⚠️ Paid key retry error: {e}")
+
+    # If free keys weren't project-blocked, try remaining free keys as last resort
+    if not _free_project_blocked and free_keys:
+        for fk in free_keys:
+            if fk not in _rpd_exhausted_keys and _is_cooled(fk):
+                try:
+                    result, is_rpd, is_rpm = _one_call(fk)
+                    if is_rpd:
+                        _rpd_exhausted_keys.add(fk)
+                        continue
+                    if is_rpm:
+                        break  # project blocked, stop trying
+                    if result is not None:
+                        return result
+                except Exception:
+                    continue
 
     return None
 
@@ -976,16 +992,16 @@ def _unified_retry(all_rephrased, input_data, rows):
         # Check 2: Too similar to MT
         # Concept D: skip rows ≤ 4 words — too short to meaningfully affect chapter
         # average, and the synonym table rarely matches them anyway.
-        # For dialogue rows (containing „/“/”), compare similarity on quote-stripped
-        # text so that quote-only changes don't cause false negatives.
+        # Dialogue rows (containing „/“/”) are exempt: post-processing adjusts quote
+        # marks which changes the text enough for CDReader acceptance, and retrying
+        # dialogue rows through the API or deterministic fallback is unreliable
+        # (quote-aware guard blocks most synonym substitutions inside speech).
         if mt and len(out.split()) >= 5:
-            _strip_q = lambda s: _re.sub(r'[„“”‟"\u0022]', '', s)
-            _sim_out = _strip_q(out)
-            _sim_mt  = _strip_q(mt)
-            sim = _row_sim(_sim_out, _sim_mt)
-            if sim >= SIM_THRESHOLD:
-                retry_candidates[sort_n] = (out, mt, f"similar ({sim:.0%})")
-                continue
+            if not any(q in out for q in ('„', '“', '”')):
+                sim = _row_sim(out, mt)
+                if sim >= SIM_THRESHOLD:
+                    retry_candidates[sort_n] = (out, mt, f"similar ({sim:.0%})")
+                    continue
 
         # Check 3: Truncated (output < 35% of input words, input >= 6 words)
         if inp:
