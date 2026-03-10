@@ -1492,6 +1492,41 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
     if qe_fixes:
         log(f"  💬 Quote reinject: placed quotes in {qe_fixes} row(s).")
 
+    # ── Final punctuation enforcement ─────────────────────────
+    # Gemini sometimes uses comma-continuation where the EN source ends a sentence
+    # with a period. Fix: compare final punctuation of DE output with EN source.
+    _punct_fixes = 0
+    for row in sorted_rows:
+        sort_n = row.get("sort")
+        if sort_n == 0:
+            continue
+        c = row.get("content", "")
+        eng = _eng_by_sort.get(sort_n, "")
+        if not c or not eng:
+            continue
+
+        # Determine EN final punctuation (ignoring trailing quotes)
+        _en_stripped_p = eng.rstrip().rstrip('"”“"»').rstrip()
+        _de_stripped_p = c.rstrip().rstrip('„“”""«»').rstrip()
+
+        if not _en_stripped_p or not _de_stripped_p:
+            continue
+
+        _en_end = _en_stripped_p[-1]
+        _de_end = _de_stripped_p[-1]
+
+        # If EN ends with sentence-final punct and DE ends with comma, fix it
+        if _en_end in '.!?' and _de_end == ',':
+            _last_part = c.rstrip('„“”""«»').rstrip()
+            _suffix = c[len(_last_part):]  # trailing quotes/whitespace
+            fixed_p = _last_part[:-1] + _en_end + _suffix
+            if fixed_p != c:
+                row["content"] = fixed_p
+                _punct_fixes += 1
+
+    if _punct_fixes:
+        log(f"  💬 Punctuation fix: corrected {_punct_fixes} trailing comma(s) to period/punct.")
+
 
 
     # ── Fix: remove duplicate content between adjacent rows ───────────────────
@@ -2197,16 +2232,28 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # The restored row will be caught by the similarity guard and retried in
         # isolation via _unified_retry, without neighbour context to tempt bleed.
         _inp_wc = {r.get("sort"): len((r.get("content") or "").split()) for r in batch}
+        _en_wc_g2 = {r.get("sort"): len((r.get("original") or "").split()) for r in batch}
         _bleed_count = 0
         for _r in result:
             _s = _r.get("sort")
             _inp_w = _inp_wc.get(_s, 0)
+            _en_w  = _en_wc_g2.get(_s, 0)
             _out_w = len((_r.get("content") or "").split())
-            if _inp_w >= _INFLATION_MIN_DELTA and _out_w > _inp_w * _INFLATION_THRESHOLD and (_out_w - _inp_w) >= _INFLATION_MIN_DELTA:
-                # look up original MT from batch
+            # Standard check: MT-based inflation (for rows where MT >= 4 words)
+            _mt_trigger = (_inp_w >= _INFLATION_MIN_DELTA
+                           and _out_w > _inp_w * _INFLATION_THRESHOLD
+                           and (_out_w - _inp_w) >= _INFLATION_MIN_DELTA)
+            # EN-based check: catches bleed on SHORT rows where MT < 4 words.
+            # If EN is short (< 8 words) but output is 3x+ EN words and 6+ words
+            # longer, Gemini almost certainly pulled content from an adjacent row.
+            _en_trigger = (_en_w >= 2 and _en_w < 8
+                           and _out_w > _en_w * 3
+                           and (_out_w - _en_w) >= 4)
+            if _mt_trigger or _en_trigger:
                 _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
                 if _mt_orig:
-                    log(f"  ⚠️  Bleed guard: sort={_s} inflated ({_out_w}w vs {_inp_w}w input) — restored from MT")
+                    _trigger_src = "MT" if _mt_trigger else "EN"
+                    log(f"  \u26a0\ufe0f  Bleed guard: sort={_s} inflated ({_out_w}w vs MT={_inp_w}w EN={_en_w}w, trigger={_trigger_src}) \u2014 restored from MT")
                     _r["content"] = _mt_orig
                     _bleed_count += 1
         if _bleed_count:
