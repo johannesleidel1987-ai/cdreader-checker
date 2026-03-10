@@ -138,7 +138,9 @@ QUOTE ISOLATION (CRITICAL — dialogue is split across multiple rows by design):
 - If the English input row closes a quote but did not open it, your German output must also close without opening.
 - NEVER pull text from row N+1 into row N to close an open quote — the closing text belongs to the next row.
 - CONVERSE RULE: If the English input row has NO closing quote character at all (it is a mid-speech continuation), do NOT add a closing “ to your German output for that row. The speech is not finished on that row — trust the English quote placement. Do NOT close the speech early just because it feels unresolved.
+- INLINE SPEECH-CLOSE: When a row ends with a phrase followed by ,\" and then a speaker tag (e.g. 'no problem,\" Jonathan teased'), the \" is the OUTER speech closer, NOT a signal to wrap the phrase in inner quotes. Translate the phrase as plain text and place “ BEFORE the speaker tag: „kein Problem,“ neckte Jonathan. Do NOT write „kein Problem, neckte Jonathan. (it is a mid-speech continuation), do NOT add a closing “ to your German output for that row. The speech is not finished on that row — trust the English quote placement. Do NOT close the speech early just because it feels unresolved.
 - NEVER duplicate content from row N+1 into row N. If row N+1 opens with an echo phrase (e.g. „Gefühle entwickeln?“), that phrase must appear ONLY in row N+1's output — do NOT append it to row N as well. Each phrase belongs to exactly one output row.
+- NEVER split a single row's translation across multiple sort numbers. The COMPLETE translation of sort=N must appear entirely within sort=N's output field — never partially in sort=N with the remainder pushed into sort=N+1. If the German translation of a row is long, output the full text in a single content field. Do not use adjacent rows as overflow or continuation slots.
 - Nested inner quotes within already-open speech use ‚ to open and ' to close — NEVER use „ inside an already-open „...".
 - When translating a narration+speech row (e.g. 'she said, "Do it."') into German colon style ('sie befahl: „Tu es."'), you MUST include „ before the speech text. Do not omit the opening quote mark.
 - A row ending with an unclosed „ is CORRECT and INTENTIONAL. Do not fix it.
@@ -1434,9 +1436,34 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 fixed = fixed + _QE_CLOSE
 
         elif role == "close":
-            # Ensure a closing " is present.
+            # Step A: strip any spurious „ opener.
+            # A role="close" row has no opener in the EN source (by definition —
+            # the role is derived from EN quote placement). Any „ in the DE output
+            # is a model artifact — typically the model wrapping an idiomatic phrase
+            # (e.g. "no problem") in inner quotes instead of treating it as plain
+            # speech content before the outer close. Safe to strip unconditionally.
+            if _QE_OPEN in fixed:
+                fixed = fixed.replace(_QE_OPEN, '')
+                fixed = _re.sub(r'  +', ' ', fixed).strip()
+            # Step B: ensure closing “ is present, placed BEFORE the BGS if detectable.
+            # Without BGS detection, the closer lands at end-of-string — after the
+            # attribution verb — which is structurally wrong ("... neckte Jonathan.")
+            # should be ("... neckte Jonathan.) with " before the verb.
             if not _QE_ANY_CLOSE_RE.search(fixed):
-                fixed = fixed + _QE_CLOSE
+                # Try to find attribution verb preceded by comma (comma already present)
+                _m_sv_c_a = _re.search(r',\s+(' + _SV + r')', fixed, _re.IGNORECASE)
+                if _m_sv_c_a:
+                    fixed = fixed[:_m_sv_c_a.start()] + _QE_CLOSE + fixed[_m_sv_c_a.start():]
+                else:
+                    # Try attribution verb without preceding comma (insert ", ")
+                    _m_sv_c_b = _re.search(
+                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')',
+                        fixed, _re.IGNORECASE
+                    )
+                    if _m_sv_c_b:
+                        fixed = fixed[:_m_sv_c_b.start()] + _QE_CLOSE + ',' + fixed[_m_sv_c_b.start():]
+                    else:
+                        fixed = fixed + _QE_CLOSE
 
         elif role == "both":
             if not _QE_STARTS_OPEN.match(fixed):
@@ -2221,6 +2248,52 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
         if _echo_count:
             log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
+        # ── Guard 4: Severe truncation + cascade unwind ──────────────────────────
+        # Root cause: Gemini splits a single row's translation across two sort slots,
+        # pushing Row N's content into Row N+1, Row N+1 into Row N+2, etc.
+        # Signature: Row N output is drastically shorter than both its MT and EN source
+        # (< 35% of input words). Row N+1 then contains Row N's displaced content.
+        #
+        # Two-step fix:
+        #   Step 1 — detect severely truncated rows and restore from MT.
+        #   Step 2 — cascade unwind: also restore the immediately following row (N+1)
+        #            from MT, since it almost certainly received the displaced content
+        #            of Row N. Both rows are then retried in isolation by _unified_retry.
+        #
+        # EN source word count (from batch["original"]) is used as a secondary signal
+        # so the guard fires even when the MT itself is unusually short.
+        _en_wc = {r.get("sort"): len((r.get("original") or "").split()) for r in batch}
+        _truncated_sorts = set()
+        _result_by_sort_g4 = {_r.get("sort"): _r for _r in result}
+        _trunc_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)   # German MT word count (already built for Guard 2)
+            _en_w  = _en_wc.get(_s, 0)    # English source word count
+            _out_w = len((_r.get("content") or "").split())
+            _mt_trigger = _inp_w >= 5 and _out_w < _inp_w * 0.35
+            _en_trigger = _en_w  >= 5 and _out_w < _en_w  * 0.35
+            if _mt_trigger or _en_trigger:
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _truncated_sorts.add(_s)
+                    _trunc_count += 1
+        # Cascade unwind: restore the row immediately following each truncated row.
+        # It almost certainly received the displaced content of the truncated row.
+        _cascade_count = 0
+        for _ts in sorted(_truncated_sorts):
+            _next_s = _ts + 1
+            _next_r = _result_by_sort_g4.get(_next_s)
+            if _next_r and _next_s not in _truncated_sorts:
+                _next_mt = next((r.get("content", "") for r in batch if r.get("sort") == _next_s), "")
+                if _next_mt:
+                    log(f"  ⚠️  Trunc cascade: sort={_next_s} — restored neighbour of truncated sort={_ts}")
+                    _next_r["content"] = _next_mt
+                    _cascade_count += 1
+        if _trunc_count or _cascade_count:
+            log(f"  💬 Trunc guard: {_trunc_count} truncated + {_cascade_count} cascade neighbour(s) restored from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -3087,9 +3160,34 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 fixed = fixed + _QE_CLOSE
 
         elif role == "close":
-            # Ensure a closing " is present.
+            # Step A: strip any spurious „ opener.
+            # A role="close" row has no opener in the EN source (by definition —
+            # the role is derived from EN quote placement). Any „ in the DE output
+            # is a model artifact — typically the model wrapping an idiomatic phrase
+            # (e.g. "no problem") in inner quotes instead of treating it as plain
+            # speech content before the outer close. Safe to strip unconditionally.
+            if _QE_OPEN in fixed:
+                fixed = fixed.replace(_QE_OPEN, '')
+                fixed = _re.sub(r'  +', ' ', fixed).strip()
+            # Step B: ensure closing “ is present, placed BEFORE the BGS if detectable.
+            # Without BGS detection, the closer lands at end-of-string — after the
+            # attribution verb — which is structurally wrong ("... neckte Jonathan.")
+            # should be ("... neckte Jonathan.) with " before the verb.
             if not _QE_ANY_CLOSE_RE.search(fixed):
-                fixed = fixed + _QE_CLOSE
+                # Try to find attribution verb preceded by comma (comma already present)
+                _m_sv_c_a = _re.search(r',\s+(' + _SV + r')', fixed, _re.IGNORECASE)
+                if _m_sv_c_a:
+                    fixed = fixed[:_m_sv_c_a.start()] + _QE_CLOSE + fixed[_m_sv_c_a.start():]
+                else:
+                    # Try attribution verb without preceding comma (insert ", ")
+                    _m_sv_c_b = _re.search(
+                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')',
+                        fixed, _re.IGNORECASE
+                    )
+                    if _m_sv_c_b:
+                        fixed = fixed[:_m_sv_c_b.start()] + _QE_CLOSE + ',' + fixed[_m_sv_c_b.start():]
+                    else:
+                        fixed = fixed + _QE_CLOSE
 
         elif role == "both":
             if not _QE_STARTS_OPEN.match(fixed):
@@ -3874,6 +3972,52 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
         if _echo_count:
             log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
+        # ── Guard 4: Severe truncation + cascade unwind ──────────────────────────
+        # Root cause: Gemini splits a single row's translation across two sort slots,
+        # pushing Row N's content into Row N+1, Row N+1 into Row N+2, etc.
+        # Signature: Row N output is drastically shorter than both its MT and EN source
+        # (< 35% of input words). Row N+1 then contains Row N's displaced content.
+        #
+        # Two-step fix:
+        #   Step 1 — detect severely truncated rows and restore from MT.
+        #   Step 2 — cascade unwind: also restore the immediately following row (N+1)
+        #            from MT, since it almost certainly received the displaced content
+        #            of Row N. Both rows are then retried in isolation by _unified_retry.
+        #
+        # EN source word count (from batch["original"]) is used as a secondary signal
+        # so the guard fires even when the MT itself is unusually short.
+        _en_wc = {r.get("sort"): len((r.get("original") or "").split()) for r in batch}
+        _truncated_sorts = set()
+        _result_by_sort_g4 = {_r.get("sort"): _r for _r in result}
+        _trunc_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)   # German MT word count (already built for Guard 2)
+            _en_w  = _en_wc.get(_s, 0)    # English source word count
+            _out_w = len((_r.get("content") or "").split())
+            _mt_trigger = _inp_w >= 5 and _out_w < _inp_w * 0.35
+            _en_trigger = _en_w  >= 5 and _out_w < _en_w  * 0.35
+            if _mt_trigger or _en_trigger:
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _truncated_sorts.add(_s)
+                    _trunc_count += 1
+        # Cascade unwind: restore the row immediately following each truncated row.
+        # It almost certainly received the displaced content of the truncated row.
+        _cascade_count = 0
+        for _ts in sorted(_truncated_sorts):
+            _next_s = _ts + 1
+            _next_r = _result_by_sort_g4.get(_next_s)
+            if _next_r and _next_s not in _truncated_sorts:
+                _next_mt = next((r.get("content", "") for r in batch if r.get("sort") == _next_s), "")
+                if _next_mt:
+                    log(f"  ⚠️  Trunc cascade: sort={_next_s} — restored neighbour of truncated sort={_ts}")
+                    _next_r["content"] = _next_mt
+                    _cascade_count += 1
+        if _trunc_count or _cascade_count:
+            log(f"  💬 Trunc guard: {_trunc_count} truncated + {_cascade_count} cascade neighbour(s) restored from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -4749,9 +4893,34 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 fixed = fixed + _QE_CLOSE
 
         elif role == "close":
-            # Ensure a closing " is present.
+            # Step A: strip any spurious „ opener.
+            # A role="close" row has no opener in the EN source (by definition —
+            # the role is derived from EN quote placement). Any „ in the DE output
+            # is a model artifact — typically the model wrapping an idiomatic phrase
+            # (e.g. "no problem") in inner quotes instead of treating it as plain
+            # speech content before the outer close. Safe to strip unconditionally.
+            if _QE_OPEN in fixed:
+                fixed = fixed.replace(_QE_OPEN, '')
+                fixed = _re.sub(r'  +', ' ', fixed).strip()
+            # Step B: ensure closing “ is present, placed BEFORE the BGS if detectable.
+            # Without BGS detection, the closer lands at end-of-string — after the
+            # attribution verb — which is structurally wrong ("... neckte Jonathan.")
+            # should be ("... neckte Jonathan.) with " before the verb.
             if not _QE_ANY_CLOSE_RE.search(fixed):
-                fixed = fixed + _QE_CLOSE
+                # Try to find attribution verb preceded by comma (comma already present)
+                _m_sv_c_a = _re.search(r',\s+(' + _SV + r')', fixed, _re.IGNORECASE)
+                if _m_sv_c_a:
+                    fixed = fixed[:_m_sv_c_a.start()] + _QE_CLOSE + fixed[_m_sv_c_a.start():]
+                else:
+                    # Try attribution verb without preceding comma (insert ", ")
+                    _m_sv_c_b = _re.search(
+                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')',
+                        fixed, _re.IGNORECASE
+                    )
+                    if _m_sv_c_b:
+                        fixed = fixed[:_m_sv_c_b.start()] + _QE_CLOSE + ',' + fixed[_m_sv_c_b.start():]
+                    else:
+                        fixed = fixed + _QE_CLOSE
 
         elif role == "both":
             if not _QE_STARTS_OPEN.match(fixed):
@@ -5536,6 +5705,52 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
         if _echo_count:
             log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
+        # ── Guard 4: Severe truncation + cascade unwind ──────────────────────────
+        # Root cause: Gemini splits a single row's translation across two sort slots,
+        # pushing Row N's content into Row N+1, Row N+1 into Row N+2, etc.
+        # Signature: Row N output is drastically shorter than both its MT and EN source
+        # (< 35% of input words). Row N+1 then contains Row N's displaced content.
+        #
+        # Two-step fix:
+        #   Step 1 — detect severely truncated rows and restore from MT.
+        #   Step 2 — cascade unwind: also restore the immediately following row (N+1)
+        #            from MT, since it almost certainly received the displaced content
+        #            of Row N. Both rows are then retried in isolation by _unified_retry.
+        #
+        # EN source word count (from batch["original"]) is used as a secondary signal
+        # so the guard fires even when the MT itself is unusually short.
+        _en_wc = {r.get("sort"): len((r.get("original") or "").split()) for r in batch}
+        _truncated_sorts = set()
+        _result_by_sort_g4 = {_r.get("sort"): _r for _r in result}
+        _trunc_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)   # German MT word count (already built for Guard 2)
+            _en_w  = _en_wc.get(_s, 0)    # English source word count
+            _out_w = len((_r.get("content") or "").split())
+            _mt_trigger = _inp_w >= 5 and _out_w < _inp_w * 0.35
+            _en_trigger = _en_w  >= 5 and _out_w < _en_w  * 0.35
+            if _mt_trigger or _en_trigger:
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _truncated_sorts.add(_s)
+                    _trunc_count += 1
+        # Cascade unwind: restore the row immediately following each truncated row.
+        # It almost certainly received the displaced content of the truncated row.
+        _cascade_count = 0
+        for _ts in sorted(_truncated_sorts):
+            _next_s = _ts + 1
+            _next_r = _result_by_sort_g4.get(_next_s)
+            if _next_r and _next_s not in _truncated_sorts:
+                _next_mt = next((r.get("content", "") for r in batch if r.get("sort") == _next_s), "")
+                if _next_mt:
+                    log(f"  ⚠️  Trunc cascade: sort={_next_s} — restored neighbour of truncated sort={_ts}")
+                    _next_r["content"] = _next_mt
+                    _cascade_count += 1
+        if _trunc_count or _cascade_count:
+            log(f"  💬 Trunc guard: {_trunc_count} truncated + {_cascade_count} cascade neighbour(s) restored from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
@@ -6402,9 +6617,34 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 fixed = fixed + _QE_CLOSE
 
         elif role == "close":
-            # Ensure a closing " is present.
+            # Step A: strip any spurious „ opener.
+            # A role="close" row has no opener in the EN source (by definition —
+            # the role is derived from EN quote placement). Any „ in the DE output
+            # is a model artifact — typically the model wrapping an idiomatic phrase
+            # (e.g. "no problem") in inner quotes instead of treating it as plain
+            # speech content before the outer close. Safe to strip unconditionally.
+            if _QE_OPEN in fixed:
+                fixed = fixed.replace(_QE_OPEN, '')
+                fixed = _re.sub(r'  +', ' ', fixed).strip()
+            # Step B: ensure closing “ is present, placed BEFORE the BGS if detectable.
+            # Without BGS detection, the closer lands at end-of-string — after the
+            # attribution verb — which is structurally wrong ("... neckte Jonathan.")
+            # should be ("... neckte Jonathan.) with " before the verb.
             if not _QE_ANY_CLOSE_RE.search(fixed):
-                fixed = fixed + _QE_CLOSE
+                # Try to find attribution verb preceded by comma (comma already present)
+                _m_sv_c_a = _re.search(r',\s+(' + _SV + r')', fixed, _re.IGNORECASE)
+                if _m_sv_c_a:
+                    fixed = fixed[:_m_sv_c_a.start()] + _QE_CLOSE + fixed[_m_sv_c_a.start():]
+                else:
+                    # Try attribution verb without preceding comma (insert ", ")
+                    _m_sv_c_b = _re.search(
+                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')',
+                        fixed, _re.IGNORECASE
+                    )
+                    if _m_sv_c_b:
+                        fixed = fixed[:_m_sv_c_b.start()] + _QE_CLOSE + ',' + fixed[_m_sv_c_b.start():]
+                    else:
+                        fixed = fixed + _QE_CLOSE
 
         elif role == "both":
             if not _QE_STARTS_OPEN.match(fixed):
@@ -7189,6 +7429,52 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     f"{_echo_phrase[:30]!r} (matches start of sort={_rN1.get('sort')})")
         if _echo_count:
             log(f"  💬 Echo guard: removed {_echo_count} duplicated echo fragment(s).")
+        # ── Guard 4: Severe truncation + cascade unwind ──────────────────────────
+        # Root cause: Gemini splits a single row's translation across two sort slots,
+        # pushing Row N's content into Row N+1, Row N+1 into Row N+2, etc.
+        # Signature: Row N output is drastically shorter than both its MT and EN source
+        # (< 35% of input words). Row N+1 then contains Row N's displaced content.
+        #
+        # Two-step fix:
+        #   Step 1 — detect severely truncated rows and restore from MT.
+        #   Step 2 — cascade unwind: also restore the immediately following row (N+1)
+        #            from MT, since it almost certainly received the displaced content
+        #            of Row N. Both rows are then retried in isolation by _unified_retry.
+        #
+        # EN source word count (from batch["original"]) is used as a secondary signal
+        # so the guard fires even when the MT itself is unusually short.
+        _en_wc = {r.get("sort"): len((r.get("original") or "").split()) for r in batch}
+        _truncated_sorts = set()
+        _result_by_sort_g4 = {_r.get("sort"): _r for _r in result}
+        _trunc_count = 0
+        for _r in result:
+            _s = _r.get("sort")
+            _inp_w = _inp_wc.get(_s, 0)   # German MT word count (already built for Guard 2)
+            _en_w  = _en_wc.get(_s, 0)    # English source word count
+            _out_w = len((_r.get("content") or "").split())
+            _mt_trigger = _inp_w >= 5 and _out_w < _inp_w * 0.35
+            _en_trigger = _en_w  >= 5 and _out_w < _en_w  * 0.35
+            if _mt_trigger or _en_trigger:
+                _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
+                if _mt_orig:
+                    log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
+                    _r["content"] = _mt_orig
+                    _truncated_sorts.add(_s)
+                    _trunc_count += 1
+        # Cascade unwind: restore the row immediately following each truncated row.
+        # It almost certainly received the displaced content of the truncated row.
+        _cascade_count = 0
+        for _ts in sorted(_truncated_sorts):
+            _next_s = _ts + 1
+            _next_r = _result_by_sort_g4.get(_next_s)
+            if _next_r and _next_s not in _truncated_sorts:
+                _next_mt = next((r.get("content", "") for r in batch if r.get("sort") == _next_s), "")
+                if _next_mt:
+                    log(f"  ⚠️  Trunc cascade: sort={_next_s} — restored neighbour of truncated sort={_ts}")
+                    _next_r["content"] = _next_mt
+                    _cascade_count += 1
+        if _trunc_count or _cascade_count:
+            log(f"  💬 Trunc guard: {_trunc_count} truncated + {_cascade_count} cascade neighbour(s) restored from MT (will retry).")
         all_rephrased.extend(result)
         # Clear RPM-exhausted state after each successful batch — keys that were
         # rate-limited mid-chapter have likely recovered by the time the next batch starts.
