@@ -1809,13 +1809,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 is_opener = True  # first char = opener
             else:
                 prev = t[i - 1]
-                # Opener: preceded by whitespace, opening bracket, colon, or dash
-                # Closer: preceded by letter, digit, punctuation (.!?,;)
-                is_opener = prev in ' \t\n(:;\u2014\u2013-'
-                # Forward-looking override: if prev is sentence-ending punct (.!?)
+                # Opener: preceded by whitespace, opening bracket, or colon
+                # Closer: preceded by letter, digit, punctuation (.!?,;), or dash
+                # Note: em/en dashes (—–) are NOT openers — they typically indicate
+                # speech interruption (Bethany—"). Handled via forward-look below.
+                is_opener = prev in ' \t\n(:;'
+                # Forward-looking override: if prev is sentence-ending punct or dash
                 # but the character AFTER the quote is uppercase, this is a new speech
-                # opening, not a close. CDReader source sometimes omits spaces: room."What
-                if not is_opener and prev in '.!?' and i + 1 < len(t) and t[i + 1].isupper():
+                # opening, not a close. Handles both spaceless joins (room."What) and
+                # dash-introduced speech (—"What are you doing?").
+                if not is_opener and prev in '.!?\u2014\u2013-' and i + 1 < len(t) and t[i + 1].isupper():
                     is_opener = True
             
             if is_opener:
