@@ -59,6 +59,22 @@ GEMINI_KEYS = [k for k in _GEMINI_KEYS_RAW if k.strip()]
 _exhausted_keys: set = set()      # RPM-exhausted (clears after 60s wait)
 _rpd_exhausted_keys: set = set()  # RPD-exhausted (daily quota — permanent for this run)
 
+# Per-key last-used timestamps for cooldown tracking (Option 1).
+# Maps api_key → float (time.time() of last attempted call).
+# Prevents hammering recently-used keys before their token-bucket window has refilled.
+_key_last_used: dict = {}
+
+# Rotating scan start offset for _call_gemini_simple (Option 2).
+# Incremented after each call to distribute load evenly across keys instead of
+# always starting from key 1 and concentrating heat at the top of the rotation.
+_retry_scan_offset: int = 0
+
+# RPM limits by key tier (used to compute minimum per-key call interval).
+# Free-tier keys: 10 RPM → must space calls >= 6 s apart per key.
+# Paid key (last key / key 28): 150 RPM → effectively no constraint (0.4 s).
+_FREE_KEY_MIN_INTERVAL: float = 6.0   # seconds between calls on the same free key
+_PAID_KEY_MIN_INTERVAL: float = 0.4   # seconds between calls on the paid key
+
 # Fallback chain — used when all Gemini keys hit their daily quota (RPD)
 # No automatic fallback is currently active; the run aborts and the next
 # scheduled run will retry with refreshed daily quotas.
@@ -764,22 +780,40 @@ def _deterministic_change(text):
 def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
     """Simple Gemini call with key rotation for retries. Returns parsed JSON list or None.
 
-    Skips RPD-exhausted keys. Distinguishes RPM (per-minute) from RPD (daily quota) 429s
-    using the same error-body logic as _call_gemini — so a rate-limited key 28 is NOT
-    permanently killed just because it hit its per-minute cap.
+    Skips RPD-exhausted keys. Distinguishes RPM (per-minute) from RPD (daily quota) 429s.
 
-    If RPM-limited keys remain after the first pass, waits 15 s and retries them once.
-    This handles the common end-of-chapter case where key 28 is the sole survivor and
-    was briefly rate-limited after processing the final batch.
+    Option 1 — Per-key cooldown: tracks the timestamp of the last call per key and skips
+    any key whose last call was too recent for its token-bucket window to have refilled.
+    Free keys: min 6 s interval (10 RPM). Paid key 28: min 0.4 s interval (150 RPM).
+    Prevents the cascade where all keys are serially hit within seconds, all return 429,
+    and the 15 s wait only partially recovers them before the next row's scan restarts.
+
+    Option 2 — Rotating scan start: uses _retry_scan_offset (incremented after each call)
+    to begin the scan at a different key each time. Distributes load evenly across the
+    28-key pool instead of concentrating every first-pass hit on key 1.
     """
-    keys_to_try = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys]
-    if not keys_to_try:
-        return None  # All keys daily-dead — deterministic fallback will handle this
+    global _retry_scan_offset
 
-    _rpm_skipped = set()  # RPM-limited this call; NOT permanently dead
+    keys_all = [k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys]
+    if not keys_all:
+        return None  # All keys daily-dead
+
+    _paid_key = GEMINI_KEYS[-1] if GEMINI_KEYS else None  # key 28 = last in list
+    _rpm_skipped_tb = set()   # cooled-down by timestamp (token-bucket skip)
+    _rpm_skipped_429 = set()  # confirmed 429 from API
+
+    def _min_interval(api_key):
+        """Minimum seconds between calls for this key based on its RPM tier."""
+        return _PAID_KEY_MIN_INTERVAL if api_key == _paid_key else _FREE_KEY_MIN_INTERVAL
+
+    def _is_cooled(api_key):
+        """True if enough time has passed since the last call on this key."""
+        last = _key_last_used.get(api_key, 0.0)
+        return (time.time() - last) >= _min_interval(api_key)
 
     def _one_call(api_key):
         """Execute one Gemini request and return (parsed_list_or_None, is_429_rpd, is_429_rpm)."""
+        _key_last_used[api_key] = time.time()
         resp = requests.post(
             f"{GEMINI_URL}?key={api_key}",
             json={
@@ -804,52 +838,82 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=512):
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         if text.startswith("```"):
-            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            text = _re.sub(r"^```[^\n]*\n", "", text); text = text.rsplit("```", 1)[0].strip()
         parsed = json.loads(text)
         return (parsed if isinstance(parsed, list) and parsed else None), False, False
 
-    # ── First pass: try every non-RPD key ────────────────────────────────────
-    for api_key in keys_to_try:
+    # ── First pass: rotated scan, skip token-bucket-hot keys ─────────────────
+    # Option 2: start scan from rotating offset to distribute load across keys.
+    # Option 1: skip keys whose last call was too recent (token bucket not refilled).
+    n = len(keys_all)
+    offset = _retry_scan_offset % n
+    rotated_keys = keys_all[offset:] + keys_all[:offset]
+    _retry_scan_offset += 1  # advance for next call
+
+    for api_key in rotated_keys:
+        # Option 1: skip if this key is still within its cooldown window
+        if not _is_cooled(api_key):
+            _rpm_skipped_tb.add(api_key)
+            continue
         try:
             result, is_rpd, is_rpm = _one_call(api_key)
             if is_rpd:
                 _rpd_exhausted_keys.add(api_key)
                 continue
             if is_rpm:
-                _rpm_skipped.add(api_key)
+                _rpm_skipped_429.add(api_key)
                 continue
-            return result  # success (may be None if model returned non-list)
+            return result  # success
         except Exception:
             continue
 
-    # ── Second pass: retry RPM-skipped keys after a brief recovery window ────
-    # Only fires when all non-RPD keys were RPM-limited (typically: only key 28
-    # survived the day, just finished a batch, hit its per-minute cap on first retry).
-    rpm_retry = [k for k in _rpm_skipped if k not in _rpd_exhausted_keys]
-    if not rpm_retry:
+    # ── Second pass: wait for the soonest cooled key, then retry ─────────────
+    # Covers two cases:
+    #   A. All keys were token-bucket-hot (skipped in first pass by cooldown check)
+    #   B. Keys were tried but all returned 429 despite cooldown (burst overrun)
+    # Instead of a flat 15 s wait, calculate the minimum wait needed for at least
+    # one key to become available, then retry just the cooled-down subset.
+    remaining = [k for k in keys_all if k not in _rpd_exhausted_keys]
+    if not remaining:
         return None
 
-    log(f"  ⏳ _call_gemini_simple: {len(rpm_retry)} key(s) RPM-limited — waiting 15 s for recovery...")
-    time.sleep(15)
-    for api_key in rpm_retry:
+    # Find minimum wait until the soonest key is cooled
+    now = time.time()
+    wait_times = []
+    for k in remaining:
+        elapsed = now - _key_last_used.get(k, 0.0)
+        needed = _min_interval(k) - elapsed
+        if needed > 0:
+            wait_times.append(needed)
+
+    if wait_times:
+        wait_secs = min(wait_times) + 0.5  # +0.5 s safety margin
+        wait_secs = max(1.0, min(wait_secs, 15.0))  # clamp 1–15 s
+        log(f"  \u23f3 _call_gemini_simple: all keys on cooldown — waiting {wait_secs:.1f}s for soonest key...")
+        time.sleep(wait_secs)
+
+    # Retry the full remaining set with rotated offset (offset already advanced above)
+    n2 = len(remaining)
+    offset2 = _retry_scan_offset % n2
+    rotated2 = remaining[offset2:] + remaining[:offset2]
+    _retry_scan_offset += 1
+
+    for api_key in rotated2:
+        if not _is_cooled(api_key):
+            continue  # still not ready — skip, don't block entire retry
         try:
             result, is_rpd, is_rpm = _one_call(api_key)
             if is_rpd:
-                # Confirmed daily quota exhausted — permanently dead for this run
                 _rpd_exhausted_keys.add(api_key)
                 continue
             if is_rpm:
-                # Still temporarily RPM-limited after 15 s — skip without permanently killing.
-                # Key 28 (paid) must never be added to _rpd_exhausted_keys for an RPM hit;
-                # the next row's _call_gemini_simple call will find it alive again once the
-                # per-minute window has rolled over.
+                # Still 429 after wait — skip without permanently killing
                 continue
             return result
         except Exception:
             continue
 
     return None
-
 
 def _unified_retry(all_rephrased, input_data, rows):
     """Identify and retry rows that are verbatim, too similar to MT, or truncated.
