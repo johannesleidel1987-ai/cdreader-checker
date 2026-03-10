@@ -1328,389 +1328,137 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
 
 
-    # ── Pre-Pass B: EN-source opening quote enforcement ──────────────────────
-    # Error pattern: Gemini converts 'she said, "Do it.' to 'sie befahl: Tu es.'
-    # (German colon style) but drops the „ opener before the speech text.
-    # Also catches rows where the English opens with " but the German doesn't open „.
-    #
-    # Detection uses the English source (chapterConetnt → input_data["original"]),
-    # which is 100% reliable for quote placement. Two cases handled:
-    #   Case 1: EN row starts with " → DE row must start with „
-    #   Case 2: EN row has ," or :" mid-row introducing speech → DE row must have „
-    #           after the corresponding German colon/comma introduction
-    # (using _eng_by_sort built above)
-    _opener_fixes = 0
-    for row in sorted_rows:
-        sort_n = row.get("sort")
-        if sort_n == 0:
-            continue
-        out = row.get("content", "")
-        en  = _eng_by_sort.get(sort_n, "")
-        if not out or not en:
-            continue
 
-        # Case 1: EN row starts with " (speech-open row), DE must start with „
-        _en_stripped = en.lstrip()
-        _out_stripped = out.lstrip()
-        if _en_stripped.startswith('"') and not _out_stripped.startswith('„'):
-            # Only inject if row isn't a BGS-only output (would be wrong there)
-            if not _is_begleitsatz(out):
-                row["content"] = '„' + out.lstrip('“„”"')
-                _opener_fixes += 1
-                log(f'  ⚠️  Quote opener: sort={sort_n} EN starts quote -- injected \u201e: ' + repr(row['content'][:60]))
+    # ── Quote Reinject: Strip all quotes, place deterministically ──────────
+    # Paradigm: do NOT try to fix Gemini's quote placement. Instead, strip ALL
+    # outer quote characters from the German output and reinject „/“ at
+    # computed positions based on the English source structure.
+    # The English source is the ground truth for WHERE speech starts and ends.
+    # The German text structure (colons, SV verbs) tells us where to place them.
 
-        # Case 2: EN introduces speech mid-row after comma/colon ('said, "...' or 'said: "...')
-        # and DE uses the colon style but missing „ after the colon
-        elif _re.search(r'[,:][ ]*"', en) and not _en_stripped.startswith('"'):
-            _out_cur = row.get("content", "")
-            # Check if DE has a colon or comma+speech introduction but no „ following it
-            _colon_match = _re.search(r'(?:[:,])\s+(?![„„])', _out_cur)
-            if _colon_match and '„' not in _out_cur and '“' not in _out_cur:
-                # Insert „ after the introduction punctuation
-                _inj_pos = _colon_match.end()
-                row["content"] = _out_cur[:_inj_pos] + '„' + _out_cur[_inj_pos:]
-                _opener_fixes += 1
-                log(f"  ⚠️  Quote opener: sort={sort_n} mid-row speech missing „ — injected: {row['content'][:60]!r}")
+    _qe_role_by_sort = {r.get("sort", i): r.get("_quote_role", "none")
+                        for i, r in enumerate(input_data)}
 
-    if _opener_fixes:
-        log(f"  💬 EN-source quote opener: fixed {_opener_fixes} row(s).")
+    def _strip_outer_quotes(text):
+        """Remove all outer German/French quote characters. Preserve inner ‚...‘."""
+        for qc in ('„', '“', '”', '"', '«', '»'):
+            text = text.replace(qc, '')
+        return text
 
-    # ── Pass QE: Deterministic quote structure enforcement ────────────────────
-    # Replaces the fragile Pass 0 + Rule H approach.
-    # Root cause of all recurring quote errors: quote_role was computed on the
-    # German machine translation (unreliable), then used to HINT Gemini (ignored),
-    # then repaired after-the-fact with guards that conflicted with each other.
-    #
-    # New approach:
-    #   1. Determine required_role from German MT classification (in_dialogue tracking).
-    #   2. Upgrade "none" rows to "both" when the English source has dialogue quotes
-    #      (English quote placement is reliable, but cannot determine open/close split).
-    #   3. After getting Gemini output, ENFORCE the correct structure unconditionally.
-    #      No inferences, no next-row guards, no out_opens_now guards.
-    #
-    # Roles:
-    #   "open"   → ensure starts with „, strip any spurious trailing “
-    #   "close"  → ensure ends with “ (add if absent), do not add opening „
-    #   "both"   → ensure starts with „ AND has a closing “ somewhere
-    #   "none"   → only run Fix 1a (dedup double-quotes), no structural changes
-    #
-    # German quote chars: „ = U+201E (opening), “ = U+201C (closing)
+    def _find_speech_start(text):
+        """Find where direct speech begins in German narration+speech text.
+        Returns index where „ should go, or -1 if not detectable."""
+        # Primary: colon + space + uppercase (standard German direct speech)
+        m = _re.search(r':\s+([A-ZÄÖÜ])', text)
+        if m:
+            return m.start(1)
+        # Secondary: colon + space (even if next char not uppercase)
+        m2 = _re.search(r':\s+', text)
+        if m2:
+            return m2.end()
+        return -1
 
+    def _find_speech_end(text):
+        """Find where closing “ should be inserted in German text.
+        Returns (insert_pos, needs_comma).
+        insert_pos = position in text; needs_comma = True if \u201c, should be inserted."""
+        # Primary: comma + space + SV verb (e.g. \u2018, sagte er\u2019)
+        m = _re.search(r',\s+(' + _SV + r')\b', text, _re.IGNORECASE)
+        if m:
+            return m.start(), False  # insert “ before the comma
+        # Secondary: space + SV verb without comma
+        m2 = _re.search(r'(?<=[a-zäöüß!?.\u2026])\s+(' + _SV + r')\b', text, _re.IGNORECASE)
+        if m2:
+            return m2.start(), True  # insert “, (add comma)
+        # Fallback: end of text
+        return len(text), False
 
-    _qe_role_by_sort  = {r.get("sort", i): r.get("_quote_role", "none")
-                         for i, r in enumerate(input_data)}
-    # (using _eng_by_sort built above)
-
+    _QE_OPEN  = '„'
+    _QE_CLOSE = '“'
     qe_fixes = 0
+
     for row in sorted_rows:
         sort_n = row.get("sort")
         c = row.get("content", "")
-        if not c:
+        if not c or sort_n == 0:
             continue
 
         role = _qe_role_by_sort.get(sort_n, "none")
         eng  = _eng_by_sort.get(sort_n, "")
 
-        # Safety-net upgrade: "none" → "both" when EN starts with quote + has end-close.
-        # The balance tracker should already classify these correctly, but the
-        # state machine's in_dialogue state can override the classifier.
+        # Safety-net upgrade: "none" → "both" when EN has opening+closing quotes
         if role == "none" and eng:
             if _QE_ENG_OPEN_RE.match(eng.strip()) and _QE_ENG_CLOSE_RE.search(eng):
                 role = "both"
-        # Note: "close"→"both" upgrade removed — the balance-tracking classifier
-        # now correctly handles mid-row openers. The old regex [,:] \s*[""] couldn't
-        # distinguish speech-close (hours,") from speech-open (voice, "Grandma).
 
-        fixed = c
+        # Normalize French/angle quotes before stripping
+        fixed = c.replace('«', '„').replace('»', '“')
+        original = fixed
 
-        # Fix 0: Normalize French/angle quotes to German quotes.
-        # Gemini occasionally uses «» instead of „“. Replace before any structural check.
-        if '«' in fixed or '»' in fixed:
-            fixed = fixed.replace('«', '„').replace('»', '“')
+        en_starts_quote = bool(eng and _re.match(r'^[""„“«]', eng.strip()))
+        stripped = _strip_outer_quotes(fixed)
 
-        # Fix 1a (all roles): collapse accidental double closing-quotes.
-        deduped = _re.sub(r'[“”"]{2,}', _QE_CLOSE, fixed)
-        if deduped != fixed:
-            fixed = deduped
-
-        # Fix 1b (none-role only): strip spurious trailing closing-quote.
-        # Root cause: Gemini sees an open „ from a preceding row still "unresolved"
-        # in batch context and closes it on the first continuation row it can.
-        # A role="none" row (EN source has zero quote chars) must NEVER carry a
-        # trailing " — if it does, the closer was injected by the model, not the source.
-        # Safe: a legitimate inner „..." mid-sentence always precedes further words;
-        # only an injected closer sits as the very last character (after all content).
-        if role == "none":
-            _none_stripped = fixed.rstrip()
-            if _none_stripped and _none_stripped[-1] in ('“', '"'):
-                fixed = _none_stripped[:-1].rstrip()
-                log(f"  ⚠️  QE none-trailer: sort={sort_n} — stripped spurious trailing “ from continuation row")
-
-        # Fix: Strip spurious leading „ on continuation rows (none/middle).
-        # Role "middle" = confirmed inside multi-row dialogue (state machine in_dialogue=True).
-        # Role "none" = state machine says not in dialogue — but mid-row openers (e.g.
-        #   'he said, "I know...') don't set in_dialogue because _classify_quote_role
-        #   only checks START/END of text. These rows still have continuation rows.
-        # In both cases: if the EN source has NO opening quote character at all,
-        # a leading „ in the German output is a Gemini artifact — strip it.
         if role in ("middle", "none"):
-            if fixed.lstrip().startswith('„'):
-                _en_has_any_open = bool(_re.search(r'[\u201e""\u00ab]', eng)) if eng else False
-                if not _en_has_any_open:
-                    fixed = fixed.lstrip()
-                    if fixed.startswith('„'):
-                        fixed = fixed[1:]  # strip the „
-                    log(f"  ⚠️  QE strip leading „: sort={sort_n} role={role} — EN has no quotes")
+            # No quotes at all — pure continuation or narrative
+            fixed = stripped
 
-        if role == "open":
-            # Determine if EN starts with a quote or opens mid-row.
-            _en_starts_quote_open = bool(eng and _re.match(r'^["""\u201e\u00ab]', eng.strip()))
-            if _en_starts_quote_open:
-                # Standard: ensure „ at position 0
-                if not _QE_STARTS_OPEN.match(fixed):
-                    fixed = _QE_OPEN + fixed
+        elif role == "open":
+            if en_starts_quote:
+                # Start-of-row opener
+                fixed = _QE_OPEN + stripped
             else:
-                # Mid-row open: narration + speech opening (e.g. 'he said, "I...')
-                # DO NOT prepend „ at position 0 — it wraps narration in quotes.
-                if fixed.startswith('\u201e') and '\u201e' in fixed[1:]:
-                    fixed = fixed[1:]  # strip spurious leading „
-                    log(f"  \u26a0\ufe0f  QE mid-row-open: sort={sort_n} \u2014 stripped spurious leading \u201e (narration+speech row)")
-                elif '\u201e' not in fixed:
-                    # No „ at all — try to inject after colon introduction
-                    _inj_open = _re.search(r'(:\s+)(?!\u201e)', fixed)
-                    if _inj_open:
-                        fixed = fixed[:_inj_open.end()] + '\u201e' + fixed[_inj_open.end():]
-                        log(f"  \u26a0\ufe0f  QE mid-row-open: sort={sort_n} \u2014 injected \u201e after colon")
-            if not _QE_ANY_CLOSE_RE.search(fixed[1:]):
-                # No closing quote in German output. Only insert one if the English
-                # source ALSO has a closing quote after the opening one (INLINE_BGS).
-                # If English is a genuine multi-row opener like "I shot his leg.
-                # (no second quote at all), do NOT insert — the dialogue continues below.
-                # This guards against _SV false-positives such as "schoss" (fired a shot)
-                # being mistaken for an attribution verb.
-                # Strip the leading quote from English, then check if ANY further quote
-                # character remains anywhere in the rest of the line.
-                # Note: _QE_ENG_CLOSE_RE only matches at end-of-string — wrong for
-                # INLINE_BGS where the close is mid-sentence ("Speech," she said.).
-                # Using _QE_ANY_CLOSE_RE (matches anywhere) is the correct check.
-                _eng_rest = _re.sub(r'^[„“”\'"\u00ab]+', '', eng.lstrip())
-                _eng_has_inline_close = bool(_QE_ANY_CLOSE_RE.search(_eng_rest))
-                if _eng_has_inline_close:
-                    # INLINE_BGS confirmed — insert " before attribution verb.
-                    _m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
-                    if _m_sv_a:
-                        fixed = fixed[:_m_sv_a.start()] + _QE_CLOSE + fixed[_m_sv_a.start():]
-                    else:
-                        _m_sv_b = _re.search(
-                            r'(?<=[a-z\u00e4\u00f6\u00fc\u00df!?. ])\s+('+ _SV + r')\b',
-                            fixed, _re.IGNORECASE
-                        )
-                        if _m_sv_b:
-                            fixed = fixed[:_m_sv_b.start()] + _QE_CLOSE + fixed[_m_sv_b.start():]
-                        else:
-                            # Fix 4: English-guided close insertion.
-                            # Root cause (SS2/SS5): row has inline dialogue + pure narrative
-                            # ('"Yes," Henry\'s voice was barely a whisper.').  No attribution
-                            # verb exists in the German, so both SV searches above fail.
-                            # The English closing-quote position encodes WHERE the speech
-                            # ends: the char immediately before the English close is the
-                            # sentence-level separator (comma or period/!/?).
-                            # Rule: find that separator's Nth occurrence in the German
-                            # (same occurrence count as in the English speech segment)
-                            # and place the German closing quote there.
-                            _eng_close_i = max(
-                                eng.rfind('"'), eng.rfind('”'), eng.rfind('“')
-                            )
-                            _eng_open_i = max(
-                                eng.find('"'), eng.find('„'), eng.find('“')
-                            )
-                            if _eng_close_i > _eng_open_i >= 0:
-                                _sep = eng[_eng_close_i - 1]  # char before English close
-                                _speech_en = eng[_eng_open_i + 1 : _eng_close_i]
-                                _de_body = fixed[1:]  # German after opening „
-                                if _sep == ',':
-                                    # Count commas in English speech, find Nth in German
-                                    _n = _speech_en.count(',')
-                                    _pos = -1
-                                    for _ in range(max(_n, 1)):
-                                        _pos = _de_body.find(',', _pos + 1)
-                                        if _pos < 0: break
-                                    if _pos >= 0:
-                                        fixed = fixed[:1 + _pos] + _QE_CLOSE + fixed[1 + _pos:]
-                                elif _sep in '.?!':
-                                    # Place close after first matching punctuation in German
-                                    _pm = _re.search(rf'[{_re.escape(_sep)}]', _de_body)
-                                    if _pm:
-                                        _ppos = _pm.start() + 1  # after the punct
-                                        fixed = fixed[:1 + _ppos] + _QE_CLOSE + fixed[1 + _ppos:]
-                # else: genuine multi-row opener — no closing quote needed here
-            else:
-                # Has a closing quote. For role="open", the speech ALWAYS continues
-                # to the next row, so any trailing close is wrong — strip it.
-                # For single-segment openers: strips the only close.
-                # For INLINE_SPLIT (2+ „): strips trailing close from the last
-                # segment (continuation) while keeping the first close (correctly
-                # placed after the first speech segment, e.g. after „Sag mir, Bruno").
-                stripped = _re.sub(r'[\u201c\u201d"]([,!?.\u2026])?\s*$',
-                                    lambda m: (m.group(1) or ''),
-                                    fixed).rstrip()
-                if stripped != fixed:
-                    fixed = stripped
-            # Orphan check: DISABLED for role="open". The last „ always opens a
-            # continuation segment extending to the next row. Appending " would
-            # close it prematurely (caused INLINE_SPLIT bug where the second
-            # speech segment should remain open for multi-row continuation).
-            # Note: orphan check IS still active for role="both" below.
-        elif role == "close":
-            # Step A: strip any spurious „ opener.
-            # A role="close" row has no opener in the EN source (by definition —
-            # the role is derived from EN quote placement). Any „ in the DE output
-            # is a model artifact — typically the model wrapping an idiomatic phrase
-            # (e.g. "no problem") in inner quotes instead of treating it as plain
-            # speech content before the outer close. Safe to strip unconditionally.
-            if _QE_OPEN in fixed:
-                fixed = fixed.replace(_QE_OPEN, '')
-                fixed = _re.sub(r'  +', ' ', fixed).strip()
-            # Step B: ensure closing “ is present, placed BEFORE the BGS if detectable.
-            # Without BGS detection, the closer lands at end-of-string — after the
-            # attribution verb — which is structurally wrong ("... neckte Jonathan.")
-            # should be ("... neckte Jonathan.) with " before the verb.
-            if not _QE_ANY_CLOSE_RE.search(fixed):
-                # Try to find attribution verb preceded by comma (comma already present)
-                _m_sv_c_a = _re.search(r',\s+(' + _SV + r')', fixed, _re.IGNORECASE)
-                if _m_sv_c_a:
-                    fixed = fixed[:_m_sv_c_a.start()] + _QE_CLOSE + fixed[_m_sv_c_a.start():]
+                # Mid-row open: narration + speech
+                pos = _find_speech_start(stripped)
+                if pos >= 0:
+                    fixed = stripped[:pos] + _QE_OPEN + stripped[pos:]
                 else:
-                    # Try attribution verb without preceding comma (insert ", ")
-                    _m_sv_c_b = _re.search(
-                        r'(?<=[a-zäöüß!?.])\s+(' + _SV + r')',
-                        fixed, _re.IGNORECASE
-                    )
-                    if _m_sv_c_b:
-                        fixed = fixed[:_m_sv_c_b.start()] + _QE_CLOSE + ',' + fixed[_m_sv_c_b.start():]
-                    else:
-                        fixed = fixed + _QE_CLOSE
+                    # Fallback: keep original (Gemini’s placement, imperfect but better than none)
+                    pass
+
+        elif role == "close":
+            pos, needs_comma = _find_speech_end(stripped)
+            if needs_comma:
+                fixed = stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
+            elif pos < len(stripped):
+                fixed = stripped[:pos] + _QE_CLOSE + stripped[pos:]
+            else:
+                fixed = stripped + _QE_CLOSE
 
         elif role == "both":
-            # Determine if this is a start-of-row or mid-row opener.
-            # EN source tells us: if EN starts with a quote char, the „ belongs at pos 0.
-            # If EN does NOT start with a quote (narration+speech), the „ belongs mid-row.
-            _en_starts_quote = bool(eng and _re.match(r'^[""„“«]', eng.strip()))
-            
-            if _en_starts_quote:
-                # Standard: ensure „ at position 0
-                if not _QE_STARTS_OPEN.match(fixed):
-                    fixed = _QE_OPEN + fixed
-            else:
-                # Mid-row open: narration + speech in same row.
-                # DO NOT prepend „ at position 0 — it would wrap narration in quotes.
-                # If Gemini already placed a „ mid-row, leave it.
-                # If there's a spurious leading „ (wrapping entire row), strip it
-                # when a second „ exists mid-row.
-                if fixed.startswith('„') and '„' in fixed[1:]:
-                    fixed = fixed[1:]  # strip spurious leading „
-                    log(f"  ⚠️  QE mid-row-both: sort={sort_n} — stripped spurious leading „ (narration+speech row)")
-                elif '„' not in fixed:
-                    # No „ at all — try to inject after colon/comma introduction
-                    _inj = _re.search(r'(:\s+)(?!„)', fixed)
-                    if _inj:
-                        fixed = fixed[:_inj.end()] + '„' + fixed[_inj.end():]
-                        log(f"  ⚠️  QE mid-row-both: sort={sort_n} — injected „ after colon")
-            has_close = bool(_QE_ANY_CLOSE_RE.search(fixed[1:]))
-            if not has_close:
-                # Fix 1b-a: comma already before attribution verb.
-                m_sv_a = _re.search(r',\s+(' + _SV + r')\b', fixed, _re.IGNORECASE)
-                if m_sv_a:
-                    fixed = fixed[:m_sv_a.start()] + _QE_CLOSE + fixed[m_sv_a.start():]
+            if en_starts_quote:
+                # Start-of-row both: „ at start, “ before SV or at end
+                pos, needs_comma = _find_speech_end(stripped)
+                if needs_comma:
+                    fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
+                elif pos < len(stripped):
+                    fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + stripped[pos:]
                 else:
-                    # Fix 1b-b: no comma yet — insert “, before attribution verb.
-                    m_sv_b = _re.search(
-                        r'(?<=[a-z\u00e4\u00f6\u00fc\u00df!?.])\s+(' + _SV + r')\b',
-                        fixed, _re.IGNORECASE
-                    )
-                    if m_sv_b:
-                        fixed = fixed[:m_sv_b.start()] + _QE_CLOSE + ',' + fixed[m_sv_b.start():]
-                    else:
-                        if fixed.endswith(','):
-                            fixed = fixed[:-1] + _QE_CLOSE + ','
-                        else:
-                            fixed = fixed + _QE_CLOSE
+                    fixed = _QE_OPEN + stripped + _QE_CLOSE
             else:
-                # ── Fix: Name trapped inside closing quote ────────────
-                # Gemini sometimes includes the character name INSIDE the closing
-                # quote when it should be outside as part of the attribution:
-                #   Wrong:   „Geh tiefer Bruno“ schnappte.
-                #   Correct: „Geh tiefer“, schnappte Bruno.
-                # Detection: CapitalizedWord immediately before closing quote,
-                # AND an SV attribution verb immediately after the closing quote.
-                # Guard: word before the name must NOT be an article/preposition
-                # (which would indicate a normal noun phrase inside speech).
-                _trapped = _re.search(
-                    r'\s+([A-ZÄÖÜ][a-zäöüß]+)\s*'
-                    r'([""“])\s*,?\s*(' + _SV + r')\b',
-                    fixed
-                )
-                if _trapped and fixed.find('„') < _trapped.start():
-                    # Guard: check word before name is not an article/preposition
-                    _prefix = fixed[:_trapped.start()].rstrip()
-                    _last_word = _prefix.split()[-1].lower() if _prefix.split() else ""
-                    _articles = {
-                        'den', 'die', 'das', 'der', 'dem', 'des',
-                        'ein', 'eine', 'einem', 'einen', 'einer',
-                        'vom', 'zum', 'zur', 'im', 'am', 'ins', 'ans', 'aufs',
-                        'beim', 'nach', 'von', 'mit', 'für', 'auf', 'an',
-                        'in', 'über', 'unter', 'hinter', 'neben', 'zwischen',
-                    }
-                    if _last_word not in _articles:
-                        _before = _prefix  # speech content up to the trapped name
-                        _name = _trapped.group(1)
-                        _verb = _trapped.group(3)
-                        _after = fixed[_trapped.end():]  # everything after the SV verb
-                        # Construct: speech + close + [comma] + verb + name + rest
-                        if _before and _before[-1] in '?!…':
-                            # Question/exclamation/ellipsis: no comma needed
-                            fixed = _before + _QE_CLOSE + ' ' + _verb + ' ' + _name + _after
-                        else:
-                            # Declarative: add comma after close
-                            fixed = _before + _QE_CLOSE + ', ' + _verb + ' ' + _name + _after
-                        log(f"  ⚠️  QE trapped-name: sort={sort_n} — moved {_name!r} outside quote before {_verb!r}")
-            # Orphan check: if the last „ has no closing " after it, append ".
-            # Handles INLINE_SPLIT rows („a“, he said, „b? needs " on second segment).
-            _last_open = fixed.rfind(_QE_OPEN)
-            if _last_open >= 0 and not _QE_ANY_CLOSE_RE.search(fixed[_last_open + 1:]):
-                fixed = fixed + _QE_CLOSE
+                # Mid-row both: narration + „speech“ + possible attribution
+                start_pos = _find_speech_start(stripped)
+                if start_pos >= 0:
+                    narration = stripped[:start_pos]
+                    speech_part = stripped[start_pos:]
+                    end_pos, needs_comma = _find_speech_end(speech_part)
+                    if needs_comma:
+                        fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + ',' + speech_part[end_pos:]
+                    elif end_pos < len(speech_part):
+                        fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + speech_part[end_pos:]
+                    else:
+                        fixed = narration + _QE_OPEN + speech_part + _QE_CLOSE
+                else:
+                    # Fallback: keep original
+                    pass
 
-            # ── Inline-attribution-dropped guard (Screenshot 2) ────────────────────
-            # Root cause: Gemini drops the inline attribution entirely.
-            # English: "Liz being Liz," he mocked.  -> after closing " comes ' he mocked.'
-            # German:  „Liz ist eben Liz, wie immer“, -> closing " placed but nothing after
-            # Detection:
-            #   1. English has meaningful content after its closing quote (>= 2 words)
-            #   2. German fixed has a closing quote but NO word follows it
-            # Fix: restore from MT which preserves the full sentence incl. attribution.
-            _eng_close_pos = max(eng.rfind('"'), eng.rfind('”'), eng.rfind('“'))
-            _eng_after_close = eng[_eng_close_pos + 1:].strip().lstrip(',').strip() if _eng_close_pos >= 0 else ""
-            _eng_has_inline_attr = len(_eng_after_close.split()) >= 2
-            _de_close_pos = max(fixed.rfind('"'), fixed.rfind('”'), fixed.rfind('“'))
-            _de_after_close = fixed[_de_close_pos + 1:].strip().lstrip(',').strip() if _de_close_pos >= 0 else ""
-            _de_has_inline_attr = len(_de_after_close.split()) >= 1
-            # Refinement: if German already contains an attribution verb, the
-            # attribution was NOT dropped — just the closing quote is missing.
-            # That is Pass QE territory. Only restore from MT when the attribution
-            # verb is genuinely absent from the German output.
-            _de_has_sv_inline = bool(_re.search(r'\b(?:' + _SV + r')\b', fixed, _re.IGNORECASE))
-            if _eng_has_inline_attr and not _de_has_inline_attr and not _de_has_sv_inline:
-                _mt_fallback = _mt_by_sort.get(sort_n, "")
-                if _mt_fallback:
-                    fixed = _mt_fallback
-                    log(f"  ⚠️  Inline attr dropped: sort={sort_n} restored from MT {_mt_fallback[:60]!r}")
-
-        if fixed != c:
+        if fixed != original:
             row["content"] = fixed
             qe_fixes += 1
 
     if qe_fixes:
-        log(f"  \U0001f4ac Post-processing: enforced quote structure in {qe_fixes} row(s) (Pass QE).")
+        log(f"  💬 Quote reinject: placed quotes in {qe_fixes} row(s).")
+
+
 
     # ── Fix: remove duplicate content between adjacent rows ───────────────────
     # Type A: Row N ends with  „...“, begleitsatz  AND row N+1 = begleitsatz
@@ -1903,62 +1651,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 titled = f"Kapitel {_num_g} {_rest_titled}" if _rest_titled else f"Kapitel {_num_g}"
                 if titled != c:
                     row['content'] = titled
-        # Rule H2: Insert missing closing “ after ?/! when dialogue is followed by
-        # a new sentence in the same row (opening „ present, closing “ absent).
-        # e.g. „Wo bist du? Emmas Sorge vertiefte sich.“ → „Wo bist du?“ Emmas ...
-        c_h2 = row.get("content", "")
-        _OPEN_Q = ('„', '“', '"')
-        if c_h2.startswith(_OPEN_Q) and not _re.search(r'[“”"]', c_h2[1:]):
-            _cq = '“'  # German closing quotation mark
-            fixed_h2 = _re.sub(
-                r'([?!])(\s+[A-Z\u00c4\u00d6\u00dc])',
-                lambda m: m.group(1) + _cq + m.group(2),
-                c_h2, count=1
-            )
-            if fixed_h2 != c_h2:
-                row["content"] = fixed_h2
-                comma_adds += 1
+        # Rules H2, J, I removed — quote placement now handled entirely by
+        # the Quote Reinject system above, which strips ALL quotes and places
+        # them deterministically from English source structure.
+        pass
 
-        # Rule J: Insert missing opening „ after colon when direct speech follows without one.
-        # e.g. „erwiderte sie: Du hast...“  →  „erwiderte sie: „Du hast...“
-        # Guard: only trigger when a speech verb immediately precedes the colon —
-        # avoids false positives on narrative colons ("Er hatte drei Ziele: Stärke..."),
-        # Kapitel headers, and time expressions ("18:30 Uhr").
-        c_j = row.get("content", "")
-        # Check: is there a speech verb anywhere BEFORE the colon?
-        # Handles "fragte er mit leiser Stimme: Hat..." where verb is not adjacent to colon.
-        _j_colon_m = _re.search(r':\s+[A-ZÄÖÜ]', c_j)
-        _j_has_sv_before_colon = (
-            _j_colon_m and
-            bool(_re.search(rf'(?:{_SV_CORE})', c_j[:_j_colon_m.start()], _re.IGNORECASE))
-        )
-        if _j_has_sv_before_colon and not _re.search(r':\s*[„“"]', c_j):
-            fixed_j = _re.sub(
-                r'(:\s+)([A-ZÄÖÜ])',
-                lambda m: m.group(1) + '„' + m.group(2),
-                c_j, count=1
-            )
-            if fixed_j != c_j:
-                row["content"] = fixed_j
-                comma_adds += 1
-
-                # Rule I: Strip spurious trailing closing quote when speech already closed mid-sentence.
-        # Pattern: „Text“, attribution verb.“  ← trailing “ is wrong.
-        # Happens when LLM copies source quote position onto a restructured German sentence.
-        # GUARD 1: never strip when trailing “ follows ?/! — that closes genuine speech content
-        # (e.g. INLINE_SPLIT rows: „Und“, fragte sie, „was?“  → trailing “ is valid).
-        # GUARD 2: never strip on role=both/open rows — Pass QE placed those quotes deliberately.
-        c = row.get("content", "")
-        _rule_i_role = _qe_role_by_sort.get(row.get("sort"), "none")
-        if _rule_i_role not in ("both", "open") and (c.endswith('“') or c.endswith('”')) and _re.search(r'[“”"]\s*,\s*\w', c):
-            if not _re.search(r'[?!][“”"]\s*$', c):  # safe: not closing genuine speech
-                stripped = c.rstrip('“”')
-                if stripped != c:
-                    row["content"] = stripped
-
-    # Rule H removed: quote enforcement is now handled entirely by Pass QE above.
-    # Pass QE enforces opening/closing quote structure deterministically from
-    # the required_role computed at input time, eliminating guard conflicts.
 
     # ── Post-process: deterministic glossary enforcement ────────────────────
     # The LLM sometimes ignores glossary entries in the prompt.
