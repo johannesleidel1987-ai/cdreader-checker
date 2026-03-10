@@ -1463,9 +1463,24 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                     log(f"  ⚠️  QE strip leading „: sort={sort_n} role={role} — EN has no quotes")
 
         if role == "open":
-            # Ensure opening „ is present.
-            if not _QE_STARTS_OPEN.match(fixed):
-                fixed = _QE_OPEN + fixed
+            # Determine if EN starts with a quote or opens mid-row.
+            _en_starts_quote_open = bool(eng and _re.match(r'^["""\u201e\u00ab]', eng.strip()))
+            if _en_starts_quote_open:
+                # Standard: ensure „ at position 0
+                if not _QE_STARTS_OPEN.match(fixed):
+                    fixed = _QE_OPEN + fixed
+            else:
+                # Mid-row open: narration + speech opening (e.g. 'he said, "I...')
+                # DO NOT prepend „ at position 0 — it wraps narration in quotes.
+                if fixed.startswith('\u201e') and '\u201e' in fixed[1:]:
+                    fixed = fixed[1:]  # strip spurious leading „
+                    log(f"  \u26a0\ufe0f  QE mid-row-open: sort={sort_n} \u2014 stripped spurious leading \u201e (narration+speech row)")
+                elif '\u201e' not in fixed:
+                    # No „ at all — try to inject after colon introduction
+                    _inj_open = _re.search(r'(:\s+)(?!\u201e)', fixed)
+                    if _inj_open:
+                        fixed = fixed[:_inj_open.end()] + '\u201e' + fixed[_inj_open.end():]
+                        log(f"  \u26a0\ufe0f  QE mid-row-open: sort={sort_n} \u2014 injected \u201e after colon")
             if not _QE_ANY_CLOSE_RE.search(fixed[1:]):
                 # No closing quote in German output. Only insert one if the English
                 # source ALSO has a closing quote after the opening one (INLINE_BGS).
@@ -2031,6 +2046,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 # Opener: preceded by whitespace, opening bracket, colon, or dash
                 # Closer: preceded by letter, digit, punctuation (.!?,;)
                 is_opener = prev in ' \t\n(:;\u2014\u2013-'
+                # Forward-looking override: if prev is sentence-ending punct (.!?)
+                # but the character AFTER the quote is uppercase, this is a new speech
+                # opening, not a close. CDReader source sometimes omits spaces: room."What
+                if not is_opener and prev in '.!?' and i + 1 < len(t) and t[i + 1].isupper():
+                    is_opener = True
             
             if is_opener:
                 balance += 1
