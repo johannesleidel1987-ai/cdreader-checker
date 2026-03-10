@@ -1411,17 +1411,15 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         role = _qe_role_by_sort.get(sort_n, "none")
         eng  = _eng_by_sort.get(sort_n, "")
 
-        # Upgrade rows when English source has quotes the state machine missed.
-        # "none" → "both": EN has both opening and closing quotes
-        # "close" → "both": EN also has a mid-row opener (e.g. 'she said, "...')
+        # Safety-net upgrade: "none" → "both" when EN starts with quote + has end-close.
+        # The balance tracker should already classify these correctly, but the
+        # state machine's in_dialogue state can override the classifier.
         if role == "none" and eng:
             if _QE_ENG_OPEN_RE.match(eng.strip()) and _QE_ENG_CLOSE_RE.search(eng):
                 role = "both"
-        if role == "close" and eng:
-            # If EN has a mid-row opener (," or :") as well as the end-close,
-            # this row is self-contained dialogue, not a multi-row close.
-            if _re.search(r'[,:]\s*[""“„«]', eng):
-                role = "both"
+        # Note: "close"→"both" upgrade removed — the balance-tracking classifier
+        # now correctly handles mid-row openers. The old regex [,:] \s*[""] couldn't
+        # distinguish speech-close (hours,") from speech-open (voice, "Grandma).
 
         fixed = c
 
@@ -1579,8 +1577,30 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                         fixed = fixed + _QE_CLOSE
 
         elif role == "both":
-            if not _QE_STARTS_OPEN.match(fixed):
-                fixed = _QE_OPEN + fixed
+            # Determine if this is a start-of-row or mid-row opener.
+            # EN source tells us: if EN starts with a quote char, the „ belongs at pos 0.
+            # If EN does NOT start with a quote (narration+speech), the „ belongs mid-row.
+            _en_starts_quote = bool(eng and _re.match(r'^[""„“«]', eng.strip()))
+            
+            if _en_starts_quote:
+                # Standard: ensure „ at position 0
+                if not _QE_STARTS_OPEN.match(fixed):
+                    fixed = _QE_OPEN + fixed
+            else:
+                # Mid-row open: narration + speech in same row.
+                # DO NOT prepend „ at position 0 — it would wrap narration in quotes.
+                # If Gemini already placed a „ mid-row, leave it.
+                # If there's a spurious leading „ (wrapping entire row), strip it
+                # when a second „ exists mid-row.
+                if fixed.startswith('„') and '„' in fixed[1:]:
+                    fixed = fixed[1:]  # strip spurious leading „
+                    log(f"  ⚠️  QE mid-row-both: sort={sort_n} — stripped spurious leading „ (narration+speech row)")
+                elif '„' not in fixed:
+                    # No „ at all — try to inject after colon/comma introduction
+                    _inj = _re.search(r'(:\s+)(?!„)', fixed)
+                    if _inj:
+                        fixed = fixed[:_inj.end()] + '„' + fixed[_inj.end():]
+                        log(f"  ⚠️  QE mid-row-both: sort={sort_n} — injected „ after colon")
             has_close = bool(_QE_ANY_CLOSE_RE.search(fixed[1:]))
             if not has_close:
                 # Fix 1b-a: comma already before attribution verb.
@@ -1979,37 +1999,68 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Gemini must rephrase the German machine translation, NOT re-translate from English.
 
     def _classify_quote_role(text):
-        """
-        Classify whether a text row is an opening, closing, middle, or standalone
-        dialogue line based on quote balance.
+        """Classify a text row's dialogue role using quote-balance tracking.
+        
         Returns one of: "open", "close", "middle_or_none", "both"
         
-        Checks both start/end positions AND mid-row patterns:
-        - Mid-row open: ,\u201c or :\u201c (narration introducing speech)
-        - Mid-row close: \u201c followed by space + lowercase (speech close before attribution)
+        Uses character-by-character analysis to distinguish openers from closers:
+          - Opener: " at position 0, or preceded by whitespace/start-of-line
+          - Closer: " preceded by letter, digit, or sentence punctuation
+        Then tracks running balance to determine the row's structural role.
         """
         t = text.strip()
-        # Start-of-row opening: „ " “ «
-        opens  = bool(_re.match(r'^[„""«]', t))
-        # End-of-row closing: " ” " » at the very end
-        closes = bool(_re.search(r'["""»]\s*[,!?.]?\s*$', t))
+        if not t:
+            return "middle_or_none"
         
-        # Mid-row opening: attribution + comma/colon + quote (e.g. 'she said, "...')
-        if not opens:
-            opens = bool(_re.search(r'[,:]\s*["""«]', t))
+        # Find all quote characters and classify each as opener or closer
+        _q_chars = set('\u201e\u201c\u201d""\u00ab\u00bb')
+        balance = 0
+        lowest = 0
+        any_open = False
+        any_close = False
         
-        # Mid-row closing: quote + space + lowercase/attribution (e.g. '..." said Olivia.')
-        if not closes:
-            closes = bool(_re.search(r'["""»]\s+[a-z]', t))
-
-        if opens and closes:
-            return "both"
-        elif opens:
+        for i, ch in enumerate(t):
+            if ch not in _q_chars:
+                continue
+            # Determine if this quote character is an opener or closer
+            # by examining the character immediately before it.
+            if i == 0:
+                is_opener = True  # first char = opener
+            else:
+                prev = t[i - 1]
+                # Opener: preceded by whitespace, opening bracket, colon, or dash
+                # Closer: preceded by letter, digit, punctuation (.!?,;)
+                is_opener = prev in ' \t\n(:;\u2014\u2013-'
+            
+            if is_opener:
+                balance += 1
+                any_open = True
+            else:
+                balance -= 1
+                any_close = True
+            lowest = min(lowest, balance)
+        
+        if not any_open and not any_close:
+            return "middle_or_none"
+        
+        # Interpret the balance:
+        #   balance > 0:  unmatched open at end of row → speech continues to next row
+        #   lowest < 0:   unmatched close from previous row's speech
+        #   both:         row both closes previous speech AND opens new speech
+        has_unmatched_open = balance > 0
+        has_unmatched_close = lowest < 0
+        
+        if has_unmatched_open and has_unmatched_close:
+            return "both"  # rare: closes one speech, opens another
+        elif has_unmatched_open:
             return "open"
-        elif closes:
+        elif has_unmatched_close:
             return "close"
+        elif any_open and any_close:
+            return "both"  # self-contained dialogue (balanced open+close)
         else:
             return "middle_or_none"
+
     raw_contents = [
         # Use German machine translation as the text Gemini rephrases.
         # chapterConetnt is English — using it would make Gemini re-translate from
@@ -2669,7 +2720,9 @@ def find_active_chapter(token, books):
         for task in tasks:
             t_status = task.get("status")
             t_finish = task.get("finishTime")
-            log(f"  Evaluating task status={t_status} finishTime={t_finish}")
+            t_chapter_type = task.get("chapterType")
+            t_task_type = task.get("taskType", "")
+            log(f"  Evaluating task status={t_status} finishTime={t_finish} chapterType={t_chapter_type} taskType={t_task_type}")
             # Accept status=0 (in-progress) AND status=1 (to-be-edited / claimed-not-started).
             # CDReader uses different codes: 0=in-progress, 1=to-be-edited, 2+=completed/closed.
             # Only skip tasks that are explicitly finished.
@@ -2678,6 +2731,16 @@ def find_active_chapter(token, books):
                 continue
             if t_status in (2, 3, 4):
                 log(f"  Skipping task — status={t_status} indicates completed")
+                continue
+            # Skip recheck and spot-check tasks to prevent infinite reprocessing loops.
+            # chapterType=2: regular first proofreading → PROCESS
+            # chapterType=4: spot-check (一校抽查未修改章节) → SKIP
+            # chapterType=6: low-score recheck (低分重校章节) → SKIP
+            # The loop: pipeline processes → CDReader scores low → creates chapterType=6 task
+            # → pipeline picks it up → reprocesses with same approach → same low score → repeat.
+            if t_chapter_type in (4, 6):
+                log(f"  Skipping task — chapterType={t_chapter_type} is a recheck/spot-check (not first proofreading). "
+                    f"These require manual attention.")
                 continue
 
             # Extract chapter ID — the proc_id
