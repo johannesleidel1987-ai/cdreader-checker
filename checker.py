@@ -121,6 +121,7 @@ QUOTE ISOLATION (CRITICAL — dialogue is split across multiple rows by design):
 - If the English input row opens a quote „ but does NOT close it, your German output must also leave it open. Do NOT close the quote within that row.
 - If the English input row closes a quote but did not open it, your German output must also close without opening.
 - NEVER pull text from row N+1 into row N to close an open quote — the closing text belongs to the next row.
+- CONVERSE RULE: If the English input row has NO closing quote character at all (it is a mid-speech continuation), do NOT add a closing “ to your German output for that row. The speech is not finished on that row — trust the English quote placement. Do NOT close the speech early just because it feels unresolved.
 - NEVER duplicate content from row N+1 into row N. If row N+1 opens with an echo phrase (e.g. „Gefühle entwickeln?“), that phrase must appear ONLY in row N+1's output — do NOT append it to row N as well. Each phrase belongs to exactly one output row.
 - Nested inner quotes within already-open speech use ‚ to open and ' to close — NEVER use „ inside an already-open „...".
 - When translating a narration+speech row (e.g. 'she said, "Do it."') into German colon style ('sie befahl: „Tu es."'), you MUST include „ before the speech text. Do not omit the opening quote mark.
@@ -598,7 +599,12 @@ SIM_THRESHOLD = 0.88   # flag rows at or above this combined similarity
 # Ordered by word frequency so the highest-coverage substitutions are tried first.
 _SYNONYMS = [
     # Conjunctions & particles (highest frequency)
-    (r'\bund\b', 'sowie'),
+    # NOTE: und→sowie intentionally removed. "sowie" only fits nominal/noun-phrase
+    # conjunctions ("Männer sowie Frauen"), not verbal, clausal, or adjectival "und"
+    # (the vast majority in fiction MT). It caused _deterministic_change to produce
+    # grammatically wrong output on nearly every sentence, and caused _find_synonym_pair
+    # to inject an unenforceable mandatory swap into retry prompts, triggering the
+    # model to return the sentence unchanged (100% similarity regression).
     (r'\baber\b', 'jedoch'),
     (r'\bauch\b', 'ebenfalls'),
     (r'\bdoch\b', 'dennoch'),
@@ -1260,6 +1266,19 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         deduped = _re.sub(r'[“”"]{2,}', _QE_CLOSE, fixed)
         if deduped != fixed:
             fixed = deduped
+
+        # Fix 1b (none-role only): strip spurious trailing closing-quote.
+        # Root cause: Gemini sees an open „ from a preceding row still "unresolved"
+        # in batch context and closes it on the first continuation row it can.
+        # A role="none" row (EN source has zero quote chars) must NEVER carry a
+        # trailing " — if it does, the closer was injected by the model, not the source.
+        # Safe: a legitimate inner „..." mid-sentence always precedes further words;
+        # only an injected closer sits as the very last character (after all content).
+        if role == "none":
+            _none_stripped = fixed.rstrip()
+            if _none_stripped and _none_stripped[-1] in ('“', '"'):
+                fixed = _none_stripped[:-1].rstrip()
+                log(f"  ⚠️  QE none-trailer: sort={sort_n} — stripped spurious trailing “ from continuation row")
 
         if role == "open":
             # Ensure opening „ is present.
@@ -2900,6 +2919,19 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         deduped = _re.sub(r'[“”"]{2,}', _QE_CLOSE, fixed)
         if deduped != fixed:
             fixed = deduped
+
+        # Fix 1b (none-role only): strip spurious trailing closing-quote.
+        # Root cause: Gemini sees an open „ from a preceding row still "unresolved"
+        # in batch context and closes it on the first continuation row it can.
+        # A role="none" row (EN source has zero quote chars) must NEVER carry a
+        # trailing " — if it does, the closer was injected by the model, not the source.
+        # Safe: a legitimate inner „..." mid-sentence always precedes further words;
+        # only an injected closer sits as the very last character (after all content).
+        if role == "none":
+            _none_stripped = fixed.rstrip()
+            if _none_stripped and _none_stripped[-1] in ('“', '"'):
+                fixed = _none_stripped[:-1].rstrip()
+                log(f"  ⚠️  QE none-trailer: sort={sort_n} — stripped spurious trailing “ from continuation row")
 
         if role == "open":
             # Ensure opening „ is present.
@@ -4550,6 +4582,19 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         if deduped != fixed:
             fixed = deduped
 
+        # Fix 1b (none-role only): strip spurious trailing closing-quote.
+        # Root cause: Gemini sees an open „ from a preceding row still "unresolved"
+        # in batch context and closes it on the first continuation row it can.
+        # A role="none" row (EN source has zero quote chars) must NEVER carry a
+        # trailing " — if it does, the closer was injected by the model, not the source.
+        # Safe: a legitimate inner „..." mid-sentence always precedes further words;
+        # only an injected closer sits as the very last character (after all content).
+        if role == "none":
+            _none_stripped = fixed.rstrip()
+            if _none_stripped and _none_stripped[-1] in ('“', '"'):
+                fixed = _none_stripped[:-1].rstrip()
+                log(f"  ⚠️  QE none-trailer: sort={sort_n} — stripped spurious trailing “ from continuation row")
+
         if role == "open":
             # Ensure opening „ is present.
             if not _QE_STARTS_OPEN.match(fixed):
@@ -6189,6 +6234,19 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         deduped = _re.sub(r'[“”"]{2,}', _QE_CLOSE, fixed)
         if deduped != fixed:
             fixed = deduped
+
+        # Fix 1b (none-role only): strip spurious trailing closing-quote.
+        # Root cause: Gemini sees an open „ from a preceding row still "unresolved"
+        # in batch context and closes it on the first continuation row it can.
+        # A role="none" row (EN source has zero quote chars) must NEVER carry a
+        # trailing " — if it does, the closer was injected by the model, not the source.
+        # Safe: a legitimate inner „..." mid-sentence always precedes further words;
+        # only an injected closer sits as the very last character (after all content).
+        if role == "none":
+            _none_stripped = fixed.rstrip()
+            if _none_stripped and _none_stripped[-1] in ('“', '"'):
+                fixed = _none_stripped[:-1].rstrip()
+                log(f"  ⚠️  QE none-trailer: sort={sort_n} — stripped spurious trailing “ from continuation row")
 
         if role == "open":
             # Ensure opening „ is present.
