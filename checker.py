@@ -1358,6 +1358,27 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
             return m2.end()
         return -1
 
+    def _en_has_post_close_attribution(eng):
+        """Check if English source has meaningful text after the last closing quote.
+        Returns True if attribution exists (e.g. '..." she said.'), False if the
+        quote closes at end of row (e.g. '...at all!"').
+        This tells us whether to search for an SV verb or just place " at end."""
+        if not eng:
+            return False
+        # Find last closing quote in EN
+        _q_close_chars = set('""\u201d\u201c\u00bb')
+        last_close = -1
+        for i in range(len(eng) - 1, -1, -1):
+            if eng[i] in _q_close_chars:
+                last_close = i
+                break
+        if last_close < 0:
+            return False
+        # Check what follows the last closing quote
+        after = eng[last_close + 1:].strip().rstrip('.,!?;:')
+        # If 2+ words follow, there's attribution
+        return len(after.split()) >= 2
+
     def _find_speech_end(text):
         """Find where closing “ should be inserted in German text.
         Returns (insert_pos, needs_comma).
@@ -1416,23 +1437,32 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                     pass
 
         elif role == "close":
-            pos, needs_comma = _find_speech_end(stripped)
-            if needs_comma:
-                fixed = stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
-            elif pos < len(stripped):
-                fixed = stripped[:pos] + _QE_CLOSE + stripped[pos:]
+            if _en_has_post_close_attribution(eng):
+                # EN has attribution after close → find SV verb in German
+                pos, needs_comma = _find_speech_end(stripped)
+                if needs_comma:
+                    fixed = stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
+                elif pos < len(stripped):
+                    fixed = stripped[:pos] + _QE_CLOSE + stripped[pos:]
+                else:
+                    fixed = stripped + _QE_CLOSE
             else:
+                # EN closes at end of row (no attribution) → " at end
                 fixed = stripped + _QE_CLOSE
 
         elif role == "both":
             if en_starts_quote:
-                # Start-of-row both: „ at start, “ before SV or at end
-                pos, needs_comma = _find_speech_end(stripped)
-                if needs_comma:
-                    fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
-                elif pos < len(stripped):
-                    fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + stripped[pos:]
+                # Start-of-row both: „ at start, “ guided by EN attribution
+                if _en_has_post_close_attribution(eng):
+                    pos, needs_comma = _find_speech_end(stripped)
+                    if needs_comma:
+                        fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
+                    elif pos < len(stripped):
+                        fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + stripped[pos:]
+                    else:
+                        fixed = _QE_OPEN + stripped + _QE_CLOSE
                 else:
+                    # No attribution after close → „ at start, “ at end
                     fixed = _QE_OPEN + stripped + _QE_CLOSE
             else:
                 # Mid-row both: narration + „speech“ + possible attribution
@@ -1440,12 +1470,16 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 if start_pos >= 0:
                     narration = stripped[:start_pos]
                     speech_part = stripped[start_pos:]
-                    end_pos, needs_comma = _find_speech_end(speech_part)
-                    if needs_comma:
-                        fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + ',' + speech_part[end_pos:]
-                    elif end_pos < len(speech_part):
-                        fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + speech_part[end_pos:]
+                    if _en_has_post_close_attribution(eng):
+                        end_pos, needs_comma = _find_speech_end(speech_part)
+                        if needs_comma:
+                            fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + ',' + speech_part[end_pos:]
+                        elif end_pos < len(speech_part):
+                            fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + speech_part[end_pos:]
+                        else:
+                            fixed = narration + _QE_OPEN + speech_part + _QE_CLOSE
                     else:
+                        # No attribution → “ at end of speech
                         fixed = narration + _QE_OPEN + speech_part + _QE_CLOSE
                 else:
                     # Fallback: keep original
@@ -1817,6 +1851,55 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         else:
             in_dialogue = False
             quote_roles.append("none")
+
+    # ── Orphan-close repair: find missing openers ────────────────────────────
+    # CDReader EN source sometimes omits the opening " while the closing " exists
+    # rows later. Example:
+    #   Row N EN:   'Let's settle this: hand over the research rights...'  (no ")
+    #   Row N+1 EN: 'We can both walk away without regrets.'               (no ")
+    #   Row N+2 EN: 'Isn't that better for both of us?"'                   (closing ")
+    # The state machine assigns: none, none, close — but row N should be "open"
+    # and row N+1 should be "middle".
+    #
+    # Repair: for each "close" without a preceding "open", walk backwards to find
+    # the row where speech started. Heuristics for the opener:
+    #   1. EN text contains ': ' followed by content (colon introducing speech)
+    #   2. German MT contains '„' (MT correctly placed the opening quote)
+    # Then retroactively assign "open" + mark intermediates as "middle".
+    _in_speech = False
+    for i in range(len(quote_roles)):
+        if quote_roles[i] in ("open", "both"):
+            _in_speech = True
+        elif quote_roles[i] == "close":
+            if not _in_speech:
+                # Orphan close — walk backwards to find opener
+                _found_opener = -1
+                for j in range(i - 1, max(i - 15, -1), -1):  # look back up to 15 rows
+                    if quote_roles[j] in ("open", "both", "close"):
+                        break  # hit another dialogue block, stop
+                    en_j = english_originals[j] if j < len(english_originals) else ""
+                    mt_j = raw_contents[j] if j < len(raw_contents) else ""
+                    # Check if EN has colon + content (speech introduction)
+                    has_colon_speech = bool(_re.search(r':\s+[a-zA-Z]', en_j))
+                    # Check if German MT has „ (MT detected speech start)
+                    mt_has_open = '\u201e' in mt_j
+                    if has_colon_speech or mt_has_open:
+                        _found_opener = j
+                        break
+                if _found_opener >= 0:
+                    quote_roles[_found_opener] = "open"
+                    for k in range(_found_opener + 1, i):
+                        if quote_roles[k] == "none":
+                            quote_roles[k] = "middle"
+                    log(f"  \u26a0\ufe0f  Orphan-close repair: row {i} has close but no open \u2014 "
+                        f"retroactively set row {_found_opener} as open, "
+                        f"{i - _found_opener - 1} middle row(s)")
+            _in_speech = False
+        elif quote_roles[i] in ("middle",):
+            pass  # already in speech
+        else:
+            if not _in_speech:
+                pass  # none, stay none
 
     input_data = [
         {
