@@ -1440,6 +1440,22 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 fixed = _none_stripped[:-1].rstrip()
                 log(f"  ⚠️  QE none-trailer: sort={sort_n} — stripped spurious trailing “ from continuation row")
 
+        # Fix: Strip spurious leading „ on continuation rows (none/middle).
+        # Role "middle" = confirmed inside multi-row dialogue (state machine in_dialogue=True).
+        # Role "none" = state machine says not in dialogue — but mid-row openers (e.g.
+        #   'he said, "I know...') don't set in_dialogue because _classify_quote_role
+        #   only checks START/END of text. These rows still have continuation rows.
+        # In both cases: if the EN source has NO opening quote character at all,
+        # a leading „ in the German output is a Gemini artifact — strip it.
+        if role in ("middle", "none"):
+            if fixed.lstrip().startswith('„'):
+                _en_has_any_open = bool(_re.search(r'[\u201e""\u00ab]', eng)) if eng else False
+                if not _en_has_any_open:
+                    fixed = fixed.lstrip()
+                    if fixed.startswith('„'):
+                        fixed = fixed[1:]  # strip the „
+                    log(f"  ⚠️  QE strip leading „: sort={sort_n} role={role} — EN has no quotes")
+
         if role == "open":
             # Ensure opening „ is present.
             if not _QE_STARTS_OPEN.match(fixed):
@@ -1508,27 +1524,22 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                                         fixed = fixed[:1 + _ppos] + _QE_CLOSE + fixed[1 + _ppos:]
                 # else: genuine multi-row opener — no closing quote needed here
             else:
-                # Has a closing quote: only strip if spuriously at the very end,
-                # AND only for genuine single-segment openers.
-                # INLINE_SPLIT rows (two „ openers, e.g. „first“, attr, „second.“) are
-                # misclassified as "open" when the English chapterConetnt field is missing
-                # its final closing ". For those rows the trailing “ is correct — do NOT strip.
-                # Guard: if there are 2+ „ chars this is an INLINE_SPLIT; preserve trailing close.
-                if fixed.count(_QE_OPEN) < 2:
-                    # Genuine single-segment opener — strip spurious trailing close.
-                    # e.g. „Ricky!" → „Ricky!   (Gemini added close to a genuine opener)
-                    stripped = _re.sub(r'[\u201c\u201d"]([,!?.])?\s*$',
-                                        lambda m: (m.group(1) or ''),
-                                        fixed).rstrip()
-                    if _QE_STARTS_OPEN.match(stripped):
-                        fixed = stripped
-            # Orphan check for INLINE_SPLIT rows: if the last „ has no closing " after
-            # it, append one. Only fires when _last_open_o > 0 (second „, not position 0)
-            # so genuine single-segment openers are left untouched.
-            _last_open_o = fixed.rfind(_QE_OPEN)
-            if _last_open_o > 0 and not _QE_ANY_CLOSE_RE.search(fixed[_last_open_o + 1:]):
-                fixed = fixed + _QE_CLOSE
-
+                # Has a closing quote. For role="open", the speech ALWAYS continues
+                # to the next row, so any trailing close is wrong — strip it.
+                # For single-segment openers: strips the only close.
+                # For INLINE_SPLIT (2+ „): strips trailing close from the last
+                # segment (continuation) while keeping the first close (correctly
+                # placed after the first speech segment, e.g. after „Sag mir, Bruno").
+                stripped = _re.sub(r'[\u201c\u201d"]([,!?.\u2026])?\s*$',
+                                    lambda m: (m.group(1) or ''),
+                                    fixed).rstrip()
+                if stripped != fixed:
+                    fixed = stripped
+            # Orphan check: DISABLED for role="open". The last „ always opens a
+            # continuation segment extending to the next row. Appending " would
+            # close it prematurely (caused INLINE_SPLIT bug where the second
+            # speech segment should remain open for multi-row continuation).
+            # Note: orphan check IS still active for role="both" below.
         elif role == "close":
             # Step A: strip any spurious „ opener.
             # A role="close" row has no opener in the EN source (by definition —
