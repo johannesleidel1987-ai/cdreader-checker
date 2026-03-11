@@ -2536,6 +2536,58 @@ def close_task(token, task_id):
         return False
 
 
+def is_recheck_chapter(token, chapter_id):
+    """Check Task Center for recent recheck tasks (chapterType=4 or 6) for this chapter.
+    Returns True if the chapter is a recheck/spot-check that should be skipped.
+    
+    This catches the case where:
+    1. Pipeline processes a chapter → CDReader scores it low → creates chapterType=6 task
+    2. Next cron run: find_active_chapter correctly skips the chapterType=6 task
+    3. But the book chapter API still lists the chapter as "available"
+    4. Pipeline claims it again → processes duplicate
+    
+    By checking Task Center after claiming, we detect this and abort before processing.
+    """
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
+            headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
+            json={"PageIndex": 1, "PageSize": 10,
+                  "status": "", "optUsers": "",
+                  "taskType": [], "taskTitle": ""},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        data = body.get("data", {})
+        tasks = (
+            data.get("dtolist") or data.get("list") or
+            data.get("items") or (data if isinstance(data, list) else [])
+        )
+
+        for task in tasks:
+            t_chapter_id = task.get("chapterId") or task.get("objectChapterId")
+            t_chapter_type = task.get("chapterType")
+            t_finish = task.get("finishTime")
+            t_task_type = task.get("taskType", "")
+
+            if str(t_chapter_id) != str(chapter_id):
+                continue
+
+            # Found a task for this chapter
+            if t_chapter_type in (4, 6):
+                # Recheck or spot-check task exists for this chapter
+                log(f"  ⚠️  Post-claim recheck guard: chapter {chapter_id} has "
+                    f"chapterType={t_chapter_type} task ({t_task_type}), "
+                    f"finishTime={t_finish} — skipping to avoid duplicate processing.")
+                return True
+
+    except Exception as e:
+        log(f"  Post-claim recheck check error: {e}")
+
+    return False
+
+
 # ─── Phase 0: Find already active chapter ────────────────────────────────────
 def find_active_chapter(token, books):
     """
@@ -2819,6 +2871,15 @@ def _run_inner(token):
             send_telegram(msg)
             log("Could not find processing chapter ID — stopping.")
             return
+
+    # ── Post-claim recheck guard ──────────────────────────────────────────────
+    # After claiming, check Task Center for chapterType=6 (low-score recheck) or
+    # chapterType=4 (spot-check) tasks for this chapter. If found, this chapter
+    # was already processed and CDReader flagged it — skip to avoid duplicate work.
+    if status == "claimed" and is_recheck_chapter(token, proc_id):
+        log(f"  Skipping chapter {proc_id} — recheck detected after claim.")
+        log("  The chapter was already processed in a previous run. Skipping to save API quota.")
+        return
 
     # Start chapter (unlock for editing)
     start_chapter(token, proc_id)
