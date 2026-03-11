@@ -2892,11 +2892,40 @@ def _run_inner(token):
         send_telegram(msg)
         return
 
-    # Note: modifChapterContent is pre-populated by CDReader with machine translations
-    # on ALL chapters — it cannot be used to detect whether WE already processed a chapter.
-    # The task center finishTime is the sole ground truth for completion status.
-    # Any chapter we reach here either (a) has an open task or (b) was just freshly claimed,
-    # so we always proceed to process it.
+    # ── Already-processed detection ─────────────────────────────────────────
+    # Compare modifChapterContent vs machineChapterContent across rows.
+    # On a fresh chapter, these are identical (CDReader pre-populates modif with MT).
+    # After our pipeline submits, modifChapterContent is updated with our edits.
+    # If a significant fraction already differs, the chapter was already processed
+    # by a previous run — skip to avoid duplicate work and API waste.
+    _edited_count = 0
+    _total_check = 0
+    for r in rows:
+        if r.get("sort", 0) == 0:
+            continue
+        _mt = (r.get("machineChapterContent") or "").strip()
+        _mod = (r.get("modifChapterContent") or "").strip()
+        if _mt and _mod:
+            _total_check += 1
+            if _mt != _mod:
+                _edited_count += 1
+    _edit_pct = (_edited_count / _total_check * 100) if _total_check > 0 else 0
+    if _total_check > 0 and _edit_pct > 30:
+        log(f"  ⚠️  Already-processed guard: {_edited_count}/{_total_check} rows ({_edit_pct:.0f}%) "
+            f"already differ from MT — chapter was edited by a previous run. Skipping.")
+        log(f"  Finishing chapter {proc_id} without re-submitting...")
+        # Finish the chapter to clear the Task Center entry
+        try:
+            finish_chapter(token, proc_id)
+        except Exception:
+            pass
+        if task_id:
+            try:
+                close_task(token, task_id)
+            except Exception:
+                pass
+        return
+
     content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
     if not content_rows:
         log(f"  ⚠️  No content rows found — proceeding anyway.")
