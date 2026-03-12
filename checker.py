@@ -1391,6 +1391,17 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         m2 = _re.search(r'(?<=[a-zäöüß!?.\u2026])\s+(' + _SV + r')\b', text, _re.IGNORECASE)
         if m2:
             return m2.start(), True  # insert “, (add comma)
+        # Tertiary: sentence boundary — punct + space + uppercase name/word.
+        # Catches non-SV attribution: "anrufen? Kristina hob die Augenbrauen"
+        # The closing “ goes after the sentence-ending punctuation.
+        m3 = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
+        if m3:
+            return m3.start() + 1, False  # “ after the punctuation mark
+        # Quaternary: comma + uppercase name when speech portion is very short (<=4 words).
+        # Catches: "Nein, Deannas Antwort..." where Gemini converted period to comma.
+        m4 = _re.search(r',\s+([A-ZÄÖÜ][a-zäöüß])', text)
+        if m4 and len(text[:m4.start()].split()) <= 4:
+            return m4.start(), False  # “ before the comma
         # Fallback: end of text
         return len(text), False
 
