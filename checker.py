@@ -1379,10 +1379,36 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # If 2+ words follow, there's attribution
         return len(after.split()) >= 2
 
-    def _find_speech_end(text):
+    def _en_speech_word_count(eng):
+        """Count words in the EN speech portion (between first opener and last closer)."""
+        _q_open = set('„“""«')
+        _q_close = set('“”""»')
+        first_open = -1
+        last_close = -1
+        for i, ch in enumerate(eng):
+            if ch in _q_open and first_open < 0:
+                first_open = i
+            if ch in _q_close:
+                last_close = i
+        if first_open >= 0 and last_close > first_open:
+            speech = eng[first_open + 1:last_close].strip()
+            return len(speech.split())
+        return 999  # unknown — treat as long speech
+
+    def _find_speech_end(text, eng=""):
         """Find where closing “ should be inserted in German text.
         Returns (insert_pos, needs_comma).
-        insert_pos = position in text; needs_comma = True if \u201c, should be inserted."""
+        insert_pos = position in text; needs_comma = True if “, should be inserted."""
+        # Short-speech early boundary: when EN speech is very short (≤2 words),
+        # check for a sentence boundary in the first few German words BEFORE SV
+        # detection. Short speech like "Good." or "No." almost always ends at
+        # the first sentence boundary — any SV verb found later is narration.
+        if eng:
+            _esw = _en_speech_word_count(eng)
+            if _esw <= 2:
+                m_early = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
+                if m_early and len(text[:m_early.start()].split()) <= 3:
+                    return m_early.start() + 1, False  # “ after the punctuation
         # Primary: comma + space + SV verb (e.g. \u2018, sagte er\u2019)
         m = _re.search(r',\s+(' + _SV + r')\b', text, _re.IGNORECASE)
         if m:
@@ -1450,7 +1476,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         elif role == "close":
             if _en_has_post_close_attribution(eng):
                 # EN has attribution after close → find SV verb in German
-                pos, needs_comma = _find_speech_end(stripped)
+                pos, needs_comma = _find_speech_end(stripped, eng)
                 if needs_comma:
                     fixed = stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
                 elif pos < len(stripped):
@@ -1465,7 +1491,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
             if en_starts_quote:
                 # Start-of-row both: „ at start, “ guided by EN attribution
                 if _en_has_post_close_attribution(eng):
-                    pos, needs_comma = _find_speech_end(stripped)
+                    pos, needs_comma = _find_speech_end(stripped, eng)
                     if needs_comma:
                         fixed = _QE_OPEN + stripped[:pos] + _QE_CLOSE + ',' + stripped[pos:]
                     elif pos < len(stripped):
@@ -1482,7 +1508,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                     narration = stripped[:start_pos]
                     speech_part = stripped[start_pos:]
                     if _en_has_post_close_attribution(eng):
-                        end_pos, needs_comma = _find_speech_end(speech_part)
+                        end_pos, needs_comma = _find_speech_end(speech_part, eng)
                         if needs_comma:
                             fixed = narration + _QE_OPEN + speech_part[:end_pos] + _QE_CLOSE + ',' + speech_part[end_pos:]
                         elif end_pos < len(speech_part):
