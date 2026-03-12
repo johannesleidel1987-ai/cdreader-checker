@@ -1397,40 +1397,44 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
 
     def _find_speech_end(text, eng=""):
         """Find where closing “ should be inserted in German text.
-        Returns (insert_pos, needs_comma).
-        insert_pos = position in text; needs_comma = True if “, should be inserted."""
-        # Short-speech early boundary: when EN speech is very short (≤2 words),
-        # check for a sentence boundary in the first few German words BEFORE SV
-        # detection. Short speech like "Good." or "No." almost always ends at
-        # the first sentence boundary — any SV verb found later is narration.
+        Returns (insert_pos, needs_comma)."""
+        # ── Priority 0: Stripped-quote punctuation boundary ──────────────
+        # After stripping quotes, 'wird?", schnauzte' becomes 'wird?, schnauzte'.
+        # The [.!?], pattern (sentence punct immediately followed by comma)
+        # ONLY occurs when a closing quote was stripped between them.
+        # Normal German never has ?, or !, or ., without a quote between.
+        # This is the most reliable speech boundary — completely verb-independent.
+        m_sq = _re.search(r'[.!?…],\s+', text)
+        if m_sq:
+            return m_sq.start() + 1, False  # “ after punct, before comma
+        # ── Priority 1: Short-speech early boundary ─────────────────────
+        # When EN speech is very short (≤2 words like "Good." or "No."),
+        # check for a sentence boundary in the first few German words BEFORE
+        # SV detection. Any SV verb found later is narration, not attribution.
         if eng:
             _esw = _en_speech_word_count(eng)
             if _esw <= 2:
                 m_early = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
                 if m_early and len(text[:m_early.start()].split()) <= 3:
-                    return m_early.start() + 1, False  # “ after the punctuation
-        # Primary: comma + space + SV verb (e.g. \u2018, sagte er\u2019)
+                    return m_early.start() + 1, False
+        # ── Priority 2: SV verb with comma ──────────────────────────
         m = _re.search(r',\s+(' + _SV + r')\b', text, _re.IGNORECASE)
         if m:
-            return m.start(), False  # insert “ before the comma
-        # Secondary: space + SV verb without comma
-        m2 = _re.search(r'(?<=[a-zäöüß!?.\u2026])\s+(' + _SV + r')\b', text, _re.IGNORECASE)
+            return m.start(), False
+        # ── Priority 3: SV verb without comma ───────────────────────
+        m2 = _re.search(r'(?<=[a-zäöüß!?.…])\s+(' + _SV + r')\b', text, _re.IGNORECASE)
         if m2:
-            return m2.start(), True  # insert “, (add comma)
-        # Tertiary: sentence boundary — punct + space + uppercase name/word.
-        # Catches non-SV attribution: "anrufen? Kristina hob die Augenbrauen"
-        # The closing “ goes after the sentence-ending punctuation.
+            return m2.start(), True
+        # ── Priority 4: Sentence boundary (.!? + uppercase) ───────────
         m3 = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
         if m3:
-            return m3.start() + 1, False  # “ after the punctuation mark
-        # Quaternary: comma + uppercase name when speech portion is very short (<=4 words).
-        # Catches: "Nein, Deannas Antwort..." where Gemini converted period to comma.
+            return m3.start() + 1, False
+        # ── Priority 5: Short speech + comma + uppercase name ────────
         m4 = _re.search(r',\s+([A-ZÄÖÜ][a-zäöüß])', text)
         if m4 and len(text[:m4.start()].split()) <= 4:
-            return m4.start(), False  # “ before the comma
-        # Fallback: end of text
+            return m4.start(), False
+        # ── Fallback: end of text ───────────────────────────────
         return len(text), False
-
     _QE_OPEN  = '„'
     _QE_CLOSE = '“'
     qe_fixes = 0
