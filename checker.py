@@ -2695,6 +2695,10 @@ def find_active_chapter(token, books):
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
+class _AlreadyProcessedRetry(Exception):
+    """Signal that a chapter was already processed and the pipeline should claim the next one."""
+    pass
+
 def run():
     try:
         token = login()
@@ -2703,7 +2707,13 @@ def run():
         # Exit cleanly — next scheduled run will retry automatically
         return
     try:
-        _run_inner(token)
+        for _attempt in range(3):
+            try:
+                _run_inner(token)
+                break  # success or no chapters — done
+            except _AlreadyProcessedRetry as e:
+                log(f"  {e} — looking for next chapter... (attempt {_attempt + 1}/3)")
+                continue
     except Exception as e:
         log(f"❌ Unhandled exception in pipeline: {e}")
         import traceback
@@ -2879,7 +2889,7 @@ def _run_inner(token):
     if status == "claimed" and is_recheck_chapter(token, proc_id):
         log(f"  Skipping chapter {proc_id} — recheck detected after claim.")
         log("  The chapter was already processed in a previous run. Skipping to save API quota.")
-        return
+        raise _AlreadyProcessedRetry(f"Chapter {proc_id} is a recheck")
 
     # Start chapter (unlock for editing)
     start_chapter(token, proc_id)
@@ -2924,7 +2934,7 @@ def _run_inner(token):
                 close_task(token, task_id)
             except Exception:
                 pass
-        return
+        raise _AlreadyProcessedRetry(f"Chapter {proc_id} already processed")
 
     content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
     if not content_rows:
