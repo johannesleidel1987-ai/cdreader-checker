@@ -540,7 +540,12 @@ _SV = (
     # Added: template row 30 — "neckte" (teased)
     r"neckte|"
     # Added: Screenshot 2 — spottete (mocked), höhnte (sneered/jeered)
-    r"spottete|höhnte"
+    r"spottete|höhnte|"
+    # Added: 2026-03-13 — common speech-adjacent reaction verbs
+    # lachte (laughed), grinste (grinned), schmunzelte (smirked),
+    # kicherte (giggled), schnaubte (snorted), brummte (grumbled)
+    # stotterte (stammered) — confirmed missing from Screenshot 3 new batch
+    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte"
 )
 # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
 _NEGATION_AFTER_SV = _re.compile(
@@ -1435,6 +1440,76 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
             return m4.start(), False
         # ── Fallback: end of text ───────────────────────────────
         return len(text), False
+
+    def _count_en_inline_attribution(eng):
+        """Count words in the EN attribution between first close-quote and next open-quote.
+        Used for INLINE_SPLIT rows: "Speech1," ATTRIBUTION, "Speech2..."
+        Returns the word count of the attribution, or 0 if not an inline pattern."""
+        _q_chars = set('\u201e\u201c\u201d""\u00ab\u00bb')
+        balance = 0
+        first_close_pos = -1
+        second_open_pos = -1
+
+        for i, ch in enumerate(eng):
+            if ch not in _q_chars:
+                continue
+            # Classify opener/closer with same logic as _classify_quote_role
+            if i == 0:
+                is_opener = True
+            else:
+                prev = eng[i - 1]
+                is_opener = prev in ' \t\n(:;'
+                if not is_opener and prev in '.!?\u2014\u2013-' and i + 1 < len(eng) and eng[i + 1].isupper():
+                    is_opener = True
+            if is_opener:
+                if first_close_pos >= 0 and second_open_pos < 0:
+                    second_open_pos = i
+                    break  # found both boundaries, stop
+                balance += 1
+            else:
+                balance -= 1
+                if balance == 0 and first_close_pos < 0:
+                    first_close_pos = i
+        if first_close_pos < 0 or second_open_pos < 0:
+            return 0
+        between = eng[first_close_pos + 1:second_open_pos].strip()
+        return len(between.split()) if between else 0
+
+    def _find_second_speech_start(text, en_attrib_wc):
+        """Find where the second speech segment starts in text.
+        text: DE text from first speech-end position onward (contains attribution + speech 2).
+        en_attrib_wc: word count of the EN attribution (guide for finding the boundary).
+        Returns char index in text where the second speech content begins, or -1 if not found.
+
+        Algorithm: find the comma whose preceding word count is closest to en_attrib_wc.
+        The EN attribution word count approximates the German attribution length (+-30%),
+        so the nearest comma reliably marks the attribution/speech-2 boundary.
+        """
+        comma_positions = [i for i, ch in enumerate(text) if ch == ',']
+        if not comma_positions:
+            return -1
+        best_pos = -1
+        best_dist = 999
+        for cp in comma_positions:
+            before = text[:cp].strip()
+            wc = len(before.split()) if before else 0
+            if wc < 1:
+                continue  # skip leading comma (0 words before = SV prefix)
+            dist = abs(wc - en_attrib_wc)
+            if dist < best_dist:
+                best_dist = dist
+                best_pos = cp
+        if best_pos < 0:
+            return -1
+        # Sanity: if best distance is far from expected, bail
+        if best_dist > max(3, en_attrib_wc):
+            return -1
+        # Return position after comma + whitespace (where the speech content begins)
+        rest = text[best_pos + 1:]
+        m = _re.match(r'\s*', rest)
+        skip = m.end() if m else 0
+        return best_pos + 1 + skip
+
     _QE_OPEN  = '„'
     _QE_CLOSE = '“'
     qe_fixes = 0
@@ -1525,6 +1600,73 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
                 else:
                     # Fallback: keep original
                     pass
+
+        elif role in ("inline_open", "inline_both"):
+            # INLINE_SPLIT: "Speech1," attribution, "Speech2[..."]
+            # Place 4 quote marks: „Speech1", attribution, „Speech2["]
+            _close_second = (role == "inline_both")
+            _en_attr_wc = _count_en_inline_attribution(eng)
+
+            if _en_attr_wc > 0:
+                if en_starts_quote:
+                    # Start-of-row inline: „ at start
+                    pos1, needs_comma1 = _find_speech_end(stripped, eng)
+                    if pos1 < len(stripped):
+                        text_after = stripped[pos1:]
+                        pos2_rel = _find_second_speech_start(text_after, _en_attr_wc)
+                        if pos2_rel >= 0:
+                            speech1 = stripped[:pos1]
+                            attrib  = text_after[:pos2_rel]
+                            speech2 = text_after[pos2_rel:]
+                            if needs_comma1:
+                                fixed = (_QE_OPEN + speech1 + _QE_CLOSE + ','
+                                         + attrib + _QE_OPEN + speech2
+                                         + (_QE_CLOSE if _close_second else ''))
+                            else:
+                                fixed = (_QE_OPEN + speech1 + _QE_CLOSE
+                                         + attrib + _QE_OPEN + speech2
+                                         + (_QE_CLOSE if _close_second else ''))
+                            log(f"  💬 Inline split (start-of-row, {role}): sort={sort_n} "
+                                f"en_attr={_en_attr_wc}w pos1={pos1} pos2_rel={pos2_rel}")
+                        else:
+                            # Couldn't find second boundary — fall back to simple open/both
+                            if _close_second:
+                                fixed = _QE_OPEN + stripped + _QE_CLOSE
+                            else:
+                                fixed = _QE_OPEN + stripped
+                    else:
+                        # _find_speech_end returned end-of-text — fall back
+                        if _close_second:
+                            fixed = _QE_OPEN + stripped + _QE_CLOSE
+                        else:
+                            fixed = _QE_OPEN + stripped
+                else:
+                    # Mid-row inline: narration + „Speech1", attrib, „Speech2["]
+                    start_pos = _find_speech_start(stripped)
+                    if start_pos >= 0:
+                        narration = stripped[:start_pos]
+                        speech_part = stripped[start_pos:]
+                        pos1, needs_comma1 = _find_speech_end(speech_part, eng)
+                        if pos1 < len(speech_part):
+                            text_after = speech_part[pos1:]
+                            pos2_rel = _find_second_speech_start(text_after, _en_attr_wc)
+                            if pos2_rel >= 0:
+                                s1     = speech_part[:pos1]
+                                attrib = text_after[:pos2_rel]
+                                s2     = text_after[pos2_rel:]
+                                if needs_comma1:
+                                    fixed = (narration + _QE_OPEN + s1 + _QE_CLOSE + ','
+                                             + attrib + _QE_OPEN + s2
+                                             + (_QE_CLOSE if _close_second else ''))
+                                else:
+                                    fixed = (narration + _QE_OPEN + s1 + _QE_CLOSE
+                                             + attrib + _QE_OPEN + s2
+                                             + (_QE_CLOSE if _close_second else ''))
+                                log(f"  💬 Inline split (mid-row, {role}): sort={sort_n} "
+                                    f"en_attr={_en_attr_wc}w pos1={pos1} pos2_rel={pos2_rel}")
+                    # If any sub-step failed, fixed == original → no change (Gemini's placement kept)
+
+            # _en_attr_wc == 0: couldn't detect inline pattern in EN → keep Gemini output
 
         if fixed != original:
             row["content"] = fixed
@@ -1840,6 +1982,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         lowest = 0
         any_open = False
         any_close = False
+        _reopened = False   # True if a new open occurs after balance returned to 0
         
         for i, ch in enumerate(t):
             if ch not in _q_chars:
@@ -1863,6 +2006,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     is_opener = True
             
             if is_opener:
+                # INLINE_SPLIT detection: if balance is 0 and we already saw a close,
+                # this open starts a SECOND speech segment within the same row.
+                # Pattern: "Speech1," attribution, "Speech2..."
+                if balance == 0 and any_close:
+                    _reopened = True
                 balance += 1
                 any_open = True
             else:
@@ -1879,6 +2027,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         #   both:         row both closes previous speech AND opens new speech
         has_unmatched_open = balance > 0
         has_unmatched_close = lowest < 0
+        
+        # INLINE_SPLIT: balance returned to 0 (speech 1 closed), then a new opener
+        # was seen (speech 2 starts). This is the "Speech1," attrib, "Speech2" pattern.
+        # Return specialised roles so the reinject system can place 4 quote marks
+        # (close+open for the mid-row boundary) instead of just 2.
+        if _reopened and not has_unmatched_close:
+            if has_unmatched_open:
+                return "inline_open"   # 2nd segment continues to next row
+            else:
+                return "inline_both"   # 2nd segment also closes in this row
         
         if has_unmatched_open and has_unmatched_close:
             return "both"  # rare: closes one speech, opens another
@@ -1922,6 +2080,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         elif role == "close":
             in_dialogue = False
             quote_roles.append("close")
+        elif role == "inline_open":
+            # "Speech1," attrib, "Speech2... — 2nd segment continues to next row
+            in_dialogue = True
+            quote_roles.append("inline_open")
+        elif role == "inline_both":
+            # "Speech1," attrib, "Speech2." — both segments self-contained
+            in_dialogue = False
+            quote_roles.append("inline_both")
         elif role == "middle_or_none":
             if in_dialogue:
                 quote_roles.append("middle")
@@ -1947,14 +2113,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Then retroactively assign "open" + mark intermediates as "middle".
     _in_speech = False
     for i in range(len(quote_roles)):
-        if quote_roles[i] in ("open", "both"):
-            _in_speech = True
+        if quote_roles[i] in ("open", "both", "inline_open", "inline_both"):
+            _in_speech = True if quote_roles[i] in ("open", "inline_open") else False
         elif quote_roles[i] == "close":
             if not _in_speech:
                 # Orphan close — walk backwards to find opener
                 _found_opener = -1
                 for j in range(i - 1, max(i - 15, -1), -1):  # look back up to 15 rows
-                    if quote_roles[j] in ("open", "both", "close"):
+                    if quote_roles[j] in ("open", "both", "close", "inline_open", "inline_both"):
                         break  # hit another dialogue block, stop
                     en_j = english_originals[j] if j < len(english_originals) else ""
                     mt_j = raw_contents[j] if j < len(raw_contents) else ""
@@ -2293,10 +2459,20 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             _en_trigger = (_en_w >= 2 and _en_w < 8
                            and _out_w > _en_w * 3
                            and (_out_w - _en_w) >= 4)
-            if _mt_trigger or _en_trigger:
+            # Tiny-row check: catches bleed on 1-2 word EN rows where the standard
+            # thresholds are too lenient. A 1-word row ("Yeah.") growing to 4 words
+            # has delta=3 which slips under the >=4 delta guard. For very short EN
+            # source rows (≤2 words), an absolute delta of +3 words is suspicious
+            # regardless of MT length — Gemini pulled content from an adjacent row.
+            # Example: EN="Yeah." (1w) → DE="Ja. Ich habe Hunger." (4w) = bleed.
+            # Example: EN="Busy where?" (2w) → DE="Beschäftigt wo denn? Und —" (5w) = bleed.
+            # NOT triggered: EN=2w → DE=4w (delta=2, legitimate expansion).
+            _tiny_trigger = (_en_w >= 1 and _en_w <= 2
+                             and _out_w >= _en_w + 3)
+            if _mt_trigger or _en_trigger or _tiny_trigger:
                 _mt_orig = next((r.get("content", "") for r in batch if r.get("sort") == _s), "")
                 if _mt_orig:
-                    _trigger_src = "MT" if _mt_trigger else "EN"
+                    _trigger_src = "MT" if _mt_trigger else ("EN" if _en_trigger else "TINY")
                     log(f"  \u26a0\ufe0f  Bleed guard: sort={_s} inflated ({_out_w}w vs MT={_inp_w}w EN={_en_w}w, trigger={_trigger_src}) \u2014 restored from MT")
                     _r["content"] = _mt_orig
                     _bleed_count += 1
