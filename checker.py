@@ -545,7 +545,7 @@ _SV = (
     # lachte (laughed), grinste (grinned), schmunzelte (smirked),
     # kicherte (giggled), schnaubte (snorted), brummte (grumbled)
     # stotterte (stammered) — confirmed missing from Screenshot 3 new batch
-    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte|"
+    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte|schnurrte|"
     # Added: 2026-03-13 — systematic sweep of remaining attribution verbs
     # versicherte (assured), tröstete (comforted), beschwichtigte (appeased),
     # beteuerte (avowed), behauptete (claimed), feststellte (stated),
