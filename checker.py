@@ -1454,7 +1454,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # This eliminates the whack-a-mole of adding individual verbs.
         _ATTRIB_PRONOUNS = r'(?:er|sie|es|ich|wir|ihr|man|du)\b'
         m_struct = _re.search(
-            r',\s+[a-zäöüß]\w+\s+(?:' + _ATTRIB_PRONOUNS + r'|[A-ZÄÖÜ][a-zäöüß])',
+            r',\s+[a-zäöüß]\w{2,}\s+(?:' + _ATTRIB_PRONOUNS + r'|[A-ZÄÖÜ][a-zäöüß])',
             text
         )
         if m_struct:
