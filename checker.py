@@ -545,7 +545,18 @@ _SV = (
     # lachte (laughed), grinste (grinned), schmunzelte (smirked),
     # kicherte (giggled), schnaubte (snorted), brummte (grumbled)
     # stotterte (stammered) — confirmed missing from Screenshot 3 new batch
-    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte"
+    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte|"
+    # Added: 2026-03-13 — systematic sweep of remaining attribution verbs
+    # versicherte (assured), tröstete (comforted), beschwichtigte (appeased),
+    # beteuerte (avowed), behauptete (claimed), feststellte (stated),
+    # korrigierte (corrected), vermutete (guessed), krächzte (croaked),
+    # säuselte (cooed), flötete (said sweetly), donnerte (thundered),
+    # bellte (barked), nuschelte (mumbled), meckerte (complained),
+    # witzelte (joked), triumphierte (triumphed), jubelte (cheered),
+    # überredete (persuaded), beruhigte sich (calmed — already in _SV_CORE partial)
+    r"versicherte|tröstete|beschwichtigte|beteuerte|behauptete|feststellte|"
+    r"korrigierte|vermutete|krächzte|säuselte|flötete|donnerte|"
+    r"bellte|nuschelte|meckerte|witzelte|triumphierte|jubelte|überredete"
 )
 # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
 _NEGATION_AFTER_SV = _re.compile(
@@ -1430,6 +1441,24 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         m2 = _re.search(r'(?<=[a-zäöüß!?.…])\s+(' + _SV + r')\b', text, _re.IGNORECASE)
         if m2:
             return m2.start(), True
+        # ── Priority 3.5: Structural attribution fallback ─────────────
+        # Catches attribution verbs NOT in _SV by matching the universal
+        # German Begleitsatz structure:  , [lowercase-verb] [Name/pronoun]
+        # After a closing quote, German inverts to V1 word order — the verb
+        # comes first (lowercase), followed by the subject (proper name =
+        # uppercase, or pronoun). This pattern ONLY occurs in attribution:
+        #   ✓ , versicherte Greta  (lowercase verb + capitalized name)
+        #   ✓ , tröstete sie       (lowercase verb + pronoun)
+        #   ✗ , öffnete die Tür    (article "die" — not a name/pronoun)
+        #   ✗ , nahm den Schlüssel (article "den" — not a name/pronoun)
+        # This eliminates the whack-a-mole of adding individual verbs.
+        _ATTRIB_PRONOUNS = r'(?:er|sie|es|ich|wir|ihr|man|du)\b'
+        m_struct = _re.search(
+            r',\s+[a-zäöüß]\w+\s+(?:' + _ATTRIB_PRONOUNS + r'|[A-ZÄÖÜ][a-zäöüß])',
+            text
+        )
+        if m_struct:
+            return m_struct.start(), False
         # ── Priority 4: Sentence boundary (.!? + uppercase) ───────────
         m3 = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
         if m3:
