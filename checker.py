@@ -360,12 +360,24 @@ def find_chapter_processing_id(token, book, claimed_chapter_name):
     """
     After claiming, find the internal chapterId used by Start/CatChapterList/Submit/Finish.
     Searches AuthorChapterList for the claimed chapter by name.
+
+    Pass 1: exact name match (case-insensitive) — returns immediately on first hit.
+    Pass 2: numeric suffix match — handles zero-padded or subtitle-suffixed names
+            e.g. "Chapter 1" == "Chapter 001" == "Kapitel 1 - Der Anfang".
+    Replaces the former bidirectional substring match which caused false collisions:
+    "Chapter 1" is a substring of "Chapter 10", "Chapter 100", etc.
     """
+    def _chap_num(s):
+        m = _re.search(r"\d+", s or "")
+        return int(m.group()) if m else -1
+
     book_id_for_list = (
         book.get("id") or book.get("objectBookId") or book.get("bookId")
     )
     log(f"  Searching AuthorChapterList for '{claimed_chapter_name}' (bookId={book_id_for_list})...")
 
+    target_num = _chap_num(claimed_chapter_name)
+    all_chapters_seen = []
     page = 1
     while True:
         resp = requests.post(
@@ -391,20 +403,31 @@ def find_chapter_processing_id(token, book, claimed_chapter_name):
             if chapters:
                 log(f"  First chapter fields: {list(chapters[0].keys())}")
 
+        # Pass 1: exact name match (case-insensitive) — return immediately
         for ch in chapters:
             name = ch.get("chapterName") or ch.get("name") or ""
-            # Match by name (exact or partial)
-            if claimed_chapter_name.lower() in name.lower() or name.lower() in claimed_chapter_name.lower():
+            if name.strip().lower() == claimed_chapter_name.strip().lower():
                 proc_id = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
-                log(f"  Found match: '{name}' → processing ID: {proc_id}")
+                log(f"  Exact match: '{name}' -> processing ID: {proc_id}")
                 log(f"  Full chapter fields: {ch}")
                 return proc_id, ch
 
+        all_chapters_seen.extend(chapters)
         if not chapters or len(chapters) < 100:
             break
         page += 1
 
-    log(f"  ⚠️ Could not find chapter '{claimed_chapter_name}' in AuthorChapterList")
+    # Pass 2: numeric suffix match across all collected pages
+    if target_num >= 0:
+        for ch in all_chapters_seen:
+            name = ch.get("chapterName") or ch.get("name") or ""
+            if _chap_num(name) == target_num:
+                proc_id = ch.get("id") or ch.get("chapterId") or ch.get("objectChapterId")
+                log(f"  Numeric match (#{target_num}): '{name}' -> processing ID: {proc_id}")
+                log(f"  Full chapter fields: {ch}")
+                return proc_id, ch
+
+    log(f"  Could not find chapter '{claimed_chapter_name}' in AuthorChapterList")
     return None, None
 
 
@@ -532,7 +555,7 @@ _SV_CORE = (
 _SV = (
     _SV_CORE + r"|"
     r"nickte|lächelte|seufzte|wisperte|schnappte|stöhnte|schluchzte|"
-    r"keuchte|grunzte|gluckste|bettelte|jammerte|klagte|schimpfte|fuhr|setzte|"
+    r"keuchte|grunzte|gluckste|bettelte|jammerte|klagte|schimpfte|setzte|"
     r"warf|stieß|spuckte|platzte|brach|fiel|gab|presste|rang|"
     r"drängte|keifte|ächzte|sprach|gestand|bekannte|schwor|versprach|"
     r"drohte|warnte|befahl|forderte|appellierte|bestätigte|verneinte|"
@@ -1978,6 +2001,61 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
 
 
 # ─── Phase 4: Rephrase with Gemini ───────────────────────────────────────────
+def _build_register_block(processed_rows):
+    """Scan completed German output rows for unambiguous du/Sie register signals.
+
+    Returns a prompt injection string for subsequent batches, or '' if nothing detected.
+    Uses only morphologically unambiguous markers:
+      - du-register:  du / dich / dir / dein* (2nd-person familiar, never ambiguous)
+      - Sie-register: Ihnen / Ihrem / Ihren / Ihrer / Ihres (formal dative/genitive,
+                      never 3rd-person, completely unambiguous)
+    Associates pronouns with character names via attribution patterns inside quotes.
+    First-occurrence wins; once a name is mapped it is never overwritten.
+    Called after each batch; injected into all subsequent batch prompts.
+    """
+    _du_re = _re.compile(r'\b(du|dich|dir|dein\w*)\b', _re.IGNORECASE)
+    _formal_re = _re.compile(r'\b(Ihnen|Ihrem|Ihren|Ihrer|Ihres)\b')
+    _attrib_re = _re.compile(
+        r'[\u201c\u201e"](.*?)[\u201c\u201e"]\s*[,.]?\s*'
+        r'(?:sagte|fragte|fl\u00fcsterte|antwortete|rief|meinte|erwiderte|sprach|'
+        r'murmelte|zischte|raunte|hauchte|stammelte|schrie|br\u00fcllte|wisperte|'
+        r'knurrte|erg\u00e4nzte|verk\u00fcndete|bat|flehte|konterte|erkl\u00e4rte|'
+        r'betonte|lachte|grinste|nickte|seufzte|schnaubte|brummte|stotterte)\s+'
+        r'([A-Z\u00c4\u00d6\u00dc][a-z\u00e4\u00f6\u00fc\u00df]{2,})\b'
+    )
+    register_map = {}
+
+    _HONORIFICS = {'Herr', 'Frau', 'Fräulein', 'Doktor', 'Doktorin', 'Professor', 'Professorin'}
+    for row in processed_rows:
+        text = row.get('content', '')
+        if not text:
+            continue
+        for m in _attrib_re.finditer(text):
+            char_name = m.group(2)
+            if char_name in _HONORIFICS:
+                continue  # "sagte Herr Weber" → skip "Herr", don't register
+            if char_name in register_map:
+                continue
+            dialogue = m.group(1)
+            if _du_re.search(dialogue):
+                register_map[char_name] = 'du'
+            elif _formal_re.search(dialogue):
+                register_map[char_name] = 'Sie'
+
+    if not register_map:
+        return ''
+
+    du_chars  = sorted(n for n, r in register_map.items() if r == 'du')
+    sie_chars = sorted(n for n, r in register_map.items() if r == 'Sie')
+    lines = ['\nESTABLISHED PRONOUN REGISTERS - carry forward UNCHANGED into all remaining rows:']
+    if du_chars:
+        lines.append(f'du-register (family / romantic partners): {", ".join(du_chars)}')
+    if sie_chars:
+        lines.append(f'Sie-register (professional / formal / strangers): {", ".join(sie_chars)}')
+    lines.append('If a name appears in both lists, Sie-register takes priority.\n')
+    return '\n'.join(lines)
+
+
 def rephrase_with_gemini(rows, glossary_terms, book_name):
     global _batch_account_offset
     if not GEMINI_KEYS:
@@ -2221,7 +2299,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 result.append(ch)
         return ''.join(result)
 
-    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None):
+    def _build_prompt(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
         """Build the prompt string and clean batch data, shared by both providers."""
         lookahead_note = ""
         if next_batch_first is not None:
@@ -2282,6 +2360,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             f"{BASE_PROMPT}\n\n"
             f"BOOK-SPECIFIC GLOSSARY FOR \"{book_name}\" (apply these in addition to universal glossary above):\n"
             f"{batch_glossary_text}\n\n"
+            f"{register_block}"
             f"ROWS TO REPHRASE (batch {batch_num}/{total_batches}, {len(clean_batch)} rows):\n"
             f"For each row:\n"
             f"  - \"original\": English source text (may be empty) — for context and meaning verification only.\n"
@@ -2307,8 +2386,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         except json.JSONDecodeError:
             return json.loads(_fix_json_strings(text))
 
-    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None):
-        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first)
+    def _call_gemini(batch_data, batch_num, total_batches, next_batch_first=None, register_block=''):
+        batch_prompt, _ = _build_prompt(batch_data, batch_num, total_batches, next_batch_first, register_block=register_block)
 
         # Retry loop: try each key once, then if all RPM-exhausted wait 60s for reset.
         # RPD-exhausted keys (daily quota) are marked permanently and never retried.
@@ -2436,6 +2515,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
+    _register_block = ''  # built from processed rows; injected into batches 2+
     key_count = len(GEMINI_KEYS)
     _ag_info = ", ".join(f"{_ACCOUNT_LABELS[i]}:{len(g)}" for i, g in enumerate(_ACCOUNT_GROUPS) if g)
     log(f"  Using {key_count} Gemini key(s) across {len(_ACCOUNT_GROUPS)} accounts ({_ag_info}) with group rotation.")
@@ -2443,7 +2523,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         _preferred_group = _batch_account_offset % len(_ACCOUNT_GROUPS) if _ACCOUNT_GROUPS else 0
         log(f"  Sending batch {i}/{total_batches} ({len(batch)} rows) via Gemini (prefer Account {_ACCOUNT_LABELS[_preferred_group]})...")
         next_first = batches[i][0] if i < total_batches else None
-        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first)
+        result = _call_gemini(batch, i, total_batches, next_batch_first=next_first, register_block=_register_block)
         _batch_account_offset += 1  # rotate to next account for next batch
         if result is None:
             # Fall back to MT content for this batch — the similarity guard will
@@ -2616,6 +2696,10 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         # RPD-exhausted keys are preserved in _rpd_exhausted_keys and not affected.
         _exhausted_keys.intersection_update(_rpd_exhausted_keys)
         if i < total_batches:
+            _register_block = _build_register_block(all_rephrased)
+            if _register_block:
+                mapped = sum(1 for ln in _register_block.splitlines() if "register" in ln.lower())
+                log(f"  Register block updated after batch {i}: {mapped} character(s) mapped.")
             time.sleep(_INTER_BATCH_SLEEP)
 
     log(f"  Total rows rephrased: {len(all_rephrased)}")
@@ -3278,38 +3362,30 @@ def _run_inner(token):
             single_batch = [{
                 "sort": sort_n,
                 "original": orig_row.get("eContent") or orig_row.get("eeContent") or orig_row.get("peContent") or "",
-                "content": orig_row.get("chapterConetnt") or orig_row.get("content") or orig_row.get("modifChapterContent") or "",
+                "content": (orig_row.get("machineChapterContent")
+                        or orig_row.get("modifChapterContent")
+                        or orig_row.get("chapterConetnt")  # English source only if no German MT
+                        or ""),
                 "_quote_role": "both",
             }]
             # Single-row retry via Gemini
             retry_result = None
-            retry_key = next((k for k in GEMINI_KEYS if k not in _rpd_exhausted_keys), None)
-            if retry_key:
-                single_prompt = (
-                    "Du bist ein deutscher Korrektor. Mache eine MINIMALE Änderung an diesem Satz — "
-                    "ersetze ein einzelnes Wort durch ein Synonym oder passe einen Artikel an. Verändere NICHT die Satzstruktur. "
-                    "Antworte NUR mit einem JSON-Array: [{\"sort\": " + str(sort_n) + ", \"content\": \"<korrigiert>\"}]\n"
-                    + json.dumps([{"sort": sort_n, "content": single_batch[0]["content"]}], ensure_ascii=False)
-                )
-                try:
-                    r_resp = requests.post(
-                        f"{GEMINI_URL}?key={retry_key}",
-                        json={"contents": [{"parts": [{"text": single_prompt}]}],
-                              "generationConfig": {"temperature": 0.7, "maxOutputTokens": 256}},
-                        timeout=30,
-                    )
-                    if r_resp.status_code == 200:
-                        r_text = r_resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        if r_text.startswith("```"):
-                            r_text = r_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                        parsed = json.loads(r_text)
-                        if isinstance(parsed, list) and parsed and parsed[0].get("content", "").strip():
-                            retry_result = parsed
-                except Exception as exc:
-                    log(f"    ⚠️  Empty-row Gemini retry error for sort={sort_n}: {exc}")
+            single_prompt = (
+            "Du bist ein deutscher Korrektor. Mache eine MINIMALE Änderung an diesem Satz — "
+            "ersetze ein einzelnes Wort durch ein Synonym oder passe einen Artikel an. "
+            "Verändere NICHT die Satzstruktur.\n"
+            "Antworte NUR mit einem JSON-Array: "
+            "[{\"sort\": " + str(sort_n) + ", \"content\": \"...\"}]\n"
+            + json.dumps([{"sort": sort_n, "content": single_batch[0]["content"]}], ensure_ascii=False)
+            )
+            # Route through _call_gemini_simple: account-group rotation, RPM/RPD
+            # tracking, 503 retry, and 2048-token budget for thinking tokens.
+            retry_result = _call_gemini_simple(single_prompt, temperature=0.7, max_tokens=2048)
+            if retry_result and not retry_result[0].get("content", "").strip():
+                retry_result = None
             # Simple direct approach: just copy original content as fallback
             if not retry_result or not retry_result[0].get("content", "").strip():
-                fallback_content = orig_row.get("chapterConetnt") or orig_row.get("modifChapterContent") or ""
+                fallback_content = orig_row.get("machineChapterContent") or orig_row.get("modifChapterContent") or orig_row.get("chapterConetnt") or ""
                 log(f"    ↩️  Row {sort_n}: using original content as fallback.")
                 rephrased_by_sort[sort_n]["content"] = fallback_content
             else:
