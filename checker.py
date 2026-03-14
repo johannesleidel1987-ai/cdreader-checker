@@ -545,7 +545,7 @@ _SV = (
     # lachte (laughed), grinste (grinned), schmunzelte (smirked),
     # kicherte (giggled), schnaubte (snorted), brummte (grumbled)
     # stotterte (stammered) — confirmed missing from Screenshot 3 new batch
-    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte|schnurrte|"
+    r"lachte|grinste|schmunzelte|kicherte|schnaubte|brummte|stotterte|"
     # Added: 2026-03-13 — systematic sweep of remaining attribution verbs
     # versicherte (assured), tröstete (comforted), beschwichtigte (appeased),
     # beteuerte (avowed), behauptete (claimed), feststellte (stated),
@@ -3154,33 +3154,37 @@ def _run_inner(token):
     # After our pipeline submits, modifChapterContent is updated with our edits.
     # If a significant fraction already differs, the chapter was already processed
     # by a previous run — skip to avoid duplicate work and API waste.
-    _edited_count = 0
-    _total_check = 0
-    for r in rows:
-        if r.get("sort", 0) == 0:
-            continue
-        _mt = (r.get("machineChapterContent") or "").strip()
-        _mod = (r.get("modifChapterContent") or "").strip()
-        if _mt and _mod:
-            _total_check += 1
-            if _mt != _mod:
-                _edited_count += 1
-    _edit_pct = (_edited_count / _total_check * 100) if _total_check > 0 else 0
-    if _total_check > 0 and _edit_pct > 30:
-        log(f"  ⚠️  Already-processed guard: {_edited_count}/{_total_check} rows ({_edit_pct:.0f}%) "
-            f"already differ from MT — chapter was edited by a previous run. Skipping.")
-        log(f"  Finishing chapter {proc_id} without re-submitting...")
-        # Finish the chapter to clear the Task Center entry
-        try:
-            finish_chapter(token, proc_id)
-        except Exception:
-            pass
-        if task_id:
+    # OVERRIDE MODE: skip this guard — the whole point of override is to re-process.
+    if status != "override":
+        _edited_count = 0
+        _total_check = 0
+        for r in rows:
+            if r.get("sort", 0) == 0:
+                continue
+            _mt = (r.get("machineChapterContent") or "").strip()
+            _mod = (r.get("modifChapterContent") or "").strip()
+            if _mt and _mod:
+                _total_check += 1
+                if _mt != _mod:
+                    _edited_count += 1
+        _edit_pct = (_edited_count / _total_check * 100) if _total_check > 0 else 0
+        if _total_check > 0 and _edit_pct > 30:
+            log(f"  ⚠️  Already-processed guard: {_edited_count}/{_total_check} rows ({_edit_pct:.0f}%) "
+                f"already differ from MT — chapter was edited by a previous run. Skipping.")
+            log(f"  Finishing chapter {proc_id} without re-submitting...")
+            # Finish the chapter to clear the Task Center entry
             try:
-                close_task(token, task_id)
+                finish_chapter(token, proc_id)
             except Exception:
                 pass
-        raise _AlreadyProcessedRetry(f"Chapter {proc_id} already processed")
+            if task_id:
+                try:
+                    close_task(token, task_id)
+                except Exception:
+                    pass
+            raise _AlreadyProcessedRetry(f"Chapter {proc_id} already processed")
+    else:
+        log(f"  ℹ️  Override mode — skipping already-processed guard.")
 
     content_rows = [r for r in rows if r.get("sort", 0) > 0 and (r.get("chapterConetnt") or r.get("modifChapterContent") or "").strip()]
     if not content_rows:
