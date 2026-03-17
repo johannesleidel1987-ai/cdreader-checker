@@ -930,14 +930,20 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
     
     Returns parsed JSON list or None.
     
-    Key design (2026-03-10, 3-account rewrite):
+    Key design (2026-03-17, timeout + deadline update):
       1. ACCOUNT-GROUP ROTATION: Keys are in 3 Google accounts with independent RPM/RPD.
          Try one key from each account group. When a group returns 429-RPM, skip only
          that group — other accounts are unaffected.
-      2. 503 RETRY: Transient 5xx errors get one retry after a 3s wait.
-      3. INCREASED OUTPUT BUDGET: Default maxOutputTokens=2048 (was 512). gemini-2.5-flash
+      2. FAST TIMEOUT: 20s per call (was 45s). Single-row prompts are small; a 20s
+         non-response means a transient hang. Fail fast → group rotation immediately
+         tries the next account group instead of blocking 45s+ per key.
+      3. SINGLE ATTEMPT PER KEY: _one_call no longer retries the same key internally.
+         Group rotation provides sufficient resilience without compounding timeouts.
+      4. INCREASED OUTPUT BUDGET: Default maxOutputTokens=2048 (was 512). gemini-2.5-flash
          uses internal thinking tokens that consume the output budget, causing truncated
          JSON responses at 512.
+      5. PER-ROW DEADLINE: Caller injects a 90s wall-clock cap per row; if _call_gemini_simple
+         takes longer (all groups slow), deterministic fallback is used for that row.
     """
     global _retry_scan_offset
 
@@ -955,33 +961,31 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
         return (time.time() - last) >= _min_interval(api_key)
 
     def _one_call(api_key):
-        """Execute one Gemini request with 503 retry.
-        Returns (parsed_list_or_None, is_429_rpd, is_429_rpm)."""
-        for _attempt in range(2):  # up to 2 attempts (1 original + 1 retry on 5xx)
-            _key_last_used[api_key] = time.time()
-            try:
-                resp = requests.post(
-                    f"{GEMINI_URL}?key={api_key}",
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
-                    },
-                    timeout=45,
-                )
-            except requests.exceptions.RequestException as e:
-                if _attempt == 0:
-                    log(f"    ⚠️ Network error (will retry): {e}")
-                    time.sleep(3)
-                    continue
-                raise
-            if resp.status_code in (500, 502, 503, 504):
-                if _attempt == 0:
-                    log(f"    ⚠️ Gemini {resp.status_code} (will retry in 3s)")
-                    time.sleep(3)
-                    continue
-                else:
-                    resp.raise_for_status()  # give up on second 5xx
-            break  # non-5xx response, proceed to parse
+        """Execute one Gemini request. Single attempt — caller (group rotation) retries
+        via a different key/group on failure, so we do not retry the same key here.
+        Returns (parsed_list_or_None, is_429_rpd, is_429_rpm).
+
+        Timeout: 20s — single-row prompts are small; if Google hasn't responded
+        in 20s it is almost certainly a transient hang, not slow processing.
+        Failing fast lets group rotation immediately try the next account group
+        rather than blocking for 45s+ per key.
+        """
+        _key_last_used[api_key] = time.time()
+        try:
+            resp = requests.post(
+                f"{GEMINI_URL}?key={api_key}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+                },
+                timeout=20,
+            )
+        except requests.exceptions.RequestException as e:
+            # Propagate — caller will log and try next group key
+            raise
+        if resp.status_code in (500, 502, 503, 504):
+            # Single transient 5xx: raise so group rotation tries another key/group
+            resp.raise_for_status()
 
         if resp.status_code == 429:
             is_rpd = False
@@ -3417,7 +3421,16 @@ def _run_inner(token):
             )
             # Route through _call_gemini_simple: account-group rotation, RPM/RPD
             # tracking, 503 retry, and 2048-token budget for thinking tokens.
+            # ── Per-row wall-clock deadline ──────────────────────────────────────────
+            # Max 90s per row: with 20s timeout × 3 groups, a full sweep of all
+            # groups takes ≤ 60s. The extra 30s cushion covers RPM-cooldown waits.
+            # If we blow past this deadline, skip to deterministic fallback so
+            # remaining rows still get processed within the job time limit.
+            _row_deadline = time.time() + 90
             retry_result = _call_gemini_simple(single_prompt, temperature=0.7, max_tokens=2048)
+            if time.time() > _row_deadline:
+                log(f"    ⏱️  sort={sort_n}: per-row deadline exceeded — using deterministic fallback")
+                retry_result = None
             if retry_result and not retry_result[0].get("content", "").strip():
                 retry_result = None
             # Simple direct approach: just copy original content as fallback
@@ -3563,7 +3576,13 @@ def run_test():
         {"sort": 7,  "machineChapterContent": "sagte er mit ruhiger Stimme.",                        "chapterConetnt": "he said in a calm voice."},
         {"sort": 8,  "machineChapterContent": "Die Williams-Familie hatte immer zu ihr gehalten.",   "chapterConetnt": "The Williams family had always stood by her."},
         {"sort": 9,  "machineChapterContent": "Er trat einen Schritt zurück und verschränkte die Arme.", "chapterConetnt": "He took a step back and crossed his arms."},
-        {"sort": 10, "machineChapterContent": "Er sagte kalt, sie solle jetzt gehen.",              "chapterConetnt": '"You should leave now," he said coldly.'},
+        # Sort 10: indirect speech (Konjunktiv I) — must NOT be converted to direct speech
+        # even though English source uses direct speech. Expect: solle/solle-form preserved.
+        {"sort": 10, "machineChapterContent": "Er sagte kalt, sie solle jetzt gehen.",
+              "chapterConetnt": '"You should leave now," he said coldly.'},
+        # Sort 12: clean indirect speech, no EN/DE mode conflict — model must not inject quotes
+        {"sort": 12, "machineChapterContent": "Sie erklärte, er habe keine Wahl mehr.",
+              "chapterConetnt": "She explained that he no longer had a choice."},
         {"sort": 11, "machineChapterContent": "Sie nickte langsam und verließ das Zimmer ohne ein weiteres Wort.", "chapterConetnt": "She nodded slowly and left the room without another word."},
     ]
 
