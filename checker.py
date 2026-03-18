@@ -736,7 +736,8 @@ def _row_sim(output, ref):
     return max(_jaccard(no, nr), _trigram(no, nr))
 
 
-SIM_THRESHOLD = 0.88   # flag rows at or above this combined similarity
+SIM_THRESHOLD = 0.88      # flag rows at or above this combined similarity
+PRE_FINISH_THRESHOLD = 0.86  # Remedy C/D: chapter-level gate before finish call
 # 0.88: CDReader rejects chapters with avg similarity >~80%. Catching rows at 88%+
 # while keys are still alive pulls the average into the 72-77% finish zone.
 
@@ -1320,6 +1321,267 @@ def _unified_retry(all_rephrased, input_data, rows):
 
     return sorted(rephrased_by_sort.values(), key=lambda r: r.get("sort", 0))
 
+
+
+# ─── Remedy A: Force-retry pass for trunc-guard rows ─────────────────────────
+_FORCE_RETRY_PROMPT = (
+    "You are a German MT post-editor. The previous output for this row was discarded "
+    "because it was too short or truncated.\n\n"
+    "ENGLISH SOURCE:\n{en_source}\n\n"
+    "MACHINE TRANSLATION (German):\n{mt_content}\n\n"
+    "Produce a correct, complete German post-edit of this row. Apply all standard rules: "
+    "fix grammar, noun capitalisation, register, localization (Dollar\u2192Euro, CEO\u2192Gesch\u00e4ftsf\u00fchrer). "
+    "If the machine translation is already correct, produce the same meaning in a naturally "
+    "fluent German formulation.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
+)
+
+
+def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glossary_terms):
+    """Remedy A: Unconditional individual Gemini retry for every sort registered by
+    the trunc-guard. Bypasses _MAX_RETRIES cap and the dialogue-row similarity exemption.
+    Runs after _unified_retry and _post_process. Returns updated sorted_final list."""
+    if not force_retry_sorts:
+        return sorted_final
+
+    log(f"  \U0001f504 Force-retry pass: {len(force_retry_sorts)} trunc-guard row(s) queued...")
+
+    rows_by_sort  = {r.get("sort"): r for r in rows}
+    input_by_sort = {r.get("sort"): r for r in input_data}
+    final_by_sort = {r.get("sort"): r for r in sorted_final}
+
+    success = 0
+    for sort in sorted(force_retry_sorts):
+        raw_row    = rows_by_sort.get(sort, {})
+        inp_row    = input_by_sort.get(sort, {})
+        en_source  = (raw_row.get("eContent") or raw_row.get("chapterConetnt") or "").strip()
+        mt_content = (inp_row.get("content") or raw_row.get("machineChapterContent") or "").strip()
+
+        if not mt_content:
+            log(f"  \u26a0\ufe0f  Force-retry sort={sort}: no MT content \u2014 skipping.")
+            continue
+
+        prompt = _FORCE_RETRY_PROMPT.format(
+            en_source=en_source or "(not available)",
+            mt_content=mt_content,
+            sort_num=sort,
+        )
+
+        log(f"  \U0001f504 Force-retry sort={sort}...")
+        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048)
+
+        if result and isinstance(result, list) and result[0].get("content", "").strip():
+            new_content = result[0]["content"].strip()
+            new_sim = _row_sim(new_content, mt_content)
+            if final_by_sort.get(sort):
+                final_by_sort[sort]["content"] = new_content
+            log(f"  \u2705 Force-retry sort={sort}: accepted (sim={new_sim:.0%}): {new_content[:60]!r}")
+            success += 1
+        else:
+            log(f"  \u26a0\ufe0f  Force-retry sort={sort}: Gemini call failed \u2014 verbatim MT remains.")
+
+    log(f"  \U0001f4ac Force-retry pass complete: {success}/{len(force_retry_sorts)} row(s) re-edited.")
+    return sorted(final_by_sort.values(), key=lambda r: r.get("sort", 0))
+
+
+# ─── Remedy C: Pre-finish chapter-level similarity scan ───────────────────────
+_PRE_FINISH_PROMPT = (
+    "You are a German MT post-editor performing a mandatory quality review pass.\n\n"
+    "ENGLISH SOURCE:\n{en_source}\n\n"
+    "MACHINE TRANSLATION (German):\n{mt_content}\n\n"
+    "CURRENT POST-EDIT (similarity to MT: {sim_pct}% \u2014 above rejection threshold):\n{current_content}\n\n"
+    "This row is too close to the original machine translation. Review it carefully:\n"
+    "- If you find a real error (noun capitalisation, article agreement, wrong case, tense "
+    "inconsistency, register violation, localization missing): correct it.\n"
+    "- If the text is genuinely correct, write the same meaning in a naturally different "
+    "formulation that a fluent German editor would produce independently.\n"
+    "- Do NOT fabricate errors. Do NOT make changes that would surprise a native German reader.\n"
+    "- A single-word micro-edit is not sufficient.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
+)
+
+
+def _pre_finish_scan(rephrased, rows):
+    """Remedy C: Called immediately before submit_chapter.
+    Scans all rephrased rows for sim >= PRE_FINISH_THRESHOLD against original MT.
+    Sends each offending row for a targeted second-pass Gemini edit.
+    Accepts the result only if it reduces similarity.
+    Returns updated rephrased list."""
+    rows_by_sort = {r.get("sort"): r for r in rows}
+    result_map   = {r.get("sort"): dict(r) for r in rephrased}
+
+    offenders = []
+    for sort, row in result_map.items():
+        content = row.get("content", "")
+        raw     = rows_by_sort.get(sort, {})
+        mt      = (raw.get("machineChapterContent") or raw.get("modifChapterContent") or "").strip()
+        if not mt or not content or sort == 0:
+            continue
+        sim = _row_sim(content, mt)
+        if sim >= PRE_FINISH_THRESHOLD:
+            offenders.append((sort, sim))
+
+    if not offenders:
+        log(f"  \u2705 Pre-finish scan: all rows below {PRE_FINISH_THRESHOLD:.0%} threshold.")
+        return rephrased
+
+    offenders.sort(key=lambda x: x[1], reverse=True)
+    log(f"  \u26a0\ufe0f  Pre-finish scan: {len(offenders)} row(s) at sim >= {PRE_FINISH_THRESHOLD:.0%} \u2014 re-editing...")
+
+    improved = 0
+    for sort, sim in offenders:
+        raw     = rows_by_sort.get(sort, {})
+        mt      = (raw.get("machineChapterContent") or raw.get("modifChapterContent") or "").strip()
+        en_src  = (raw.get("eContent") or raw.get("chapterConetnt") or "").strip()
+        current = result_map[sort].get("content", "")
+
+        prompt = _PRE_FINISH_PROMPT.format(
+            en_source=en_src or "(not available)",
+            mt_content=mt,
+            sim_pct=f"{sim * 100:.0f}",
+            current_content=current,
+            sort_num=sort,
+        )
+
+        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048)
+
+        if result and isinstance(result, list) and result[0].get("content", "").strip():
+            new_content = result[0]["content"].strip()
+            new_sim     = _row_sim(new_content, mt)
+            if new_sim < sim:
+                result_map[sort]["content"] = new_content
+                log(f"  \u2705 Pre-finish sort={sort}: {sim:.0%} \u2192 {new_sim:.0%}")
+                improved += 1
+            else:
+                log(f"  \u26a0\ufe0f  Pre-finish sort={sort}: no improvement ({new_sim:.0%} \u2265 {sim:.0%}), keeping previous.")
+        else:
+            log(f"  \u26a0\ufe0f  Pre-finish sort={sort}: Gemini call failed, keeping previous.")
+
+    log(f"  \U0001f4ac Pre-finish scan: {improved}/{len(offenders)} row(s) improved.")
+    return sorted(result_map.values(), key=lambda r: r.get("sort", 0))
+
+
+# ─── Remedy D: ErrMessage10 self-healing recovery ─────────────────────────────
+_RECOVERY_MAX_ROWS = 10
+
+_RECOVERY_PROMPT = (
+    "You are a German MT post-editor performing an urgent quality correction.\n\n"
+    "ENGLISH SOURCE:\n{en_source}\n\n"
+    "MACHINE TRANSLATION (German):\n{mt_content}\n\n"
+    "CURRENT SAVED TEXT (similarity to MT: {sim_pct}% \u2014 chapter finish rejected):\n{saved_content}\n\n"
+    "The chapter was rejected because this row is too similar to the original machine translation.\n"
+    "- If you find a real error (noun capitalisation, article agreement, wrong case, tense "
+    "inconsistency, register violation, localization missing): correct it.\n"
+    "- If the text is genuinely correct, produce a natural alternative formulation with the "
+    "same meaning \u2014 different word order, a more precise expression, or a restructured clause.\n"
+    "- The output MUST differ from the current saved text by more than a single word.\n"
+    "- Do NOT make changes that would surprise a native German reader or alter the meaning.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
+)
+
+
+def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
+    """Remedy D: Called when finish_chapter returns ErrMessage10.
+    Re-fetches saved rows, identifies the top _RECOVERY_MAX_ROWS rows by highest
+    similarity to original MT, re-edits via Gemini, re-submits, retries finish once.
+    Returns True if recovery succeeded, False otherwise."""
+    log(f"  \U0001f501 ErrMessage10 recovery: re-fetching saved rows for chapter {chapter_id}...")
+
+    try:
+        saved_rows = get_chapter_rows(token, chapter_id)
+    except Exception as e:
+        log(f"  \u274c Recovery: could not re-fetch rows: {e}")
+        return False
+
+    if not saved_rows:
+        log(f"  \u274c Recovery: no rows returned from re-fetch.")
+        return False
+
+    rows_by_sort = {r.get("sort"): r for r in rows}
+
+    sim_scores = []
+    for row in saved_rows:
+        sort       = row.get("sort")
+        saved      = (row.get("modifChapterContent") or "").strip()
+        source_row = rows_by_sort.get(sort, {})
+        mt_content = (source_row.get("machineChapterContent") or "").strip()
+        if not sort or not saved or not mt_content or sort == 0:
+            continue
+        sim = _row_sim(saved, mt_content)
+        if sim >= PRE_FINISH_THRESHOLD:
+            sim_scores.append((sort, sim, saved, mt_content))
+
+    if not sim_scores:
+        log(f"  \u26a0\ufe0f  Recovery: no high-similarity rows found in saved data.")
+        return False
+
+    sim_scores.sort(key=lambda x: x[1], reverse=True)
+    targets = sim_scores[:_RECOVERY_MAX_ROWS]
+    log(f"  \U0001f501 Recovery: re-editing {len(targets)} row(s) "
+        f"(worst sim: {targets[0][1]:.0%}, threshold: {PRE_FINISH_THRESHOLD:.0%})...")
+
+    corrections = []
+
+    for sort, sim, saved_content, mt_content in targets:
+        source_row = rows_by_sort.get(sort, {})
+        en_source  = (source_row.get("eContent") or source_row.get("chapterConetnt") or "").strip()
+
+        prompt = _RECOVERY_PROMPT.format(
+            en_source=en_source or "(not available)",
+            mt_content=mt_content,
+            sim_pct=f"{sim * 100:.0f}",
+            saved_content=saved_content,
+            sort_num=sort,
+        )
+
+        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048)
+
+        if result and isinstance(result, list) and result[0].get("content", "").strip():
+            new_content = result[0]["content"].strip()
+            new_sim     = _row_sim(new_content, mt_content)
+            log(f"  \u2705 Recovery sort={sort}: {sim:.0%} \u2192 {new_sim:.0%}")
+            corrections.append({"sort": sort, "content": new_content})
+        else:
+            log(f"  \u26a0\ufe0f  Recovery sort={sort}: Gemini call failed.")
+
+    if not corrections:
+        log(f"  \u274c Recovery: all re-edit calls failed.")
+        return False
+
+    log(f"  \U0001f501 Recovery: re-submitting {len(corrections)} corrected row(s)...")
+    try:
+        sub_result = submit_fn(token, chapter_id, corrections, rows)
+        sub_ok = (
+            sub_result.get("status") is True
+            or sub_result.get("message") in ("SaveSuccess", "OperSuccess")
+            or sub_result.get("code") in ("311", "315", 0)
+        )
+        if not sub_ok:
+            log(f"  \u274c Recovery: re-submit failed: {sub_result}")
+            return False
+    except Exception as e:
+        log(f"  \u274c Recovery: re-submit exception: {e}")
+        return False
+
+    log(f"  \U0001f501 Recovery: retrying finish (once)...")
+    try:
+        import time as _time
+        _time.sleep(2)
+        finish_response = finish_fn(token, chapter_id)
+        finish_ok = (
+            finish_response.get("status") is True
+            or finish_response.get("message") in ("SaveSuccess", "OperSuccess", "UpdateSuccess")
+            or finish_response.get("code") in ("311", "315", "200", 0)
+        )
+        if finish_ok:
+            log(f"  \u2705 Recovery: finish succeeded after ErrMessage10.")
+            return True
+        else:
+            log(f"  \u274c Recovery: finish still failing: {finish_response}")
+            return False
+    except Exception as e:
+        log(f"  \u274c Recovery: finish exception: {e}")
+        return False
 
 def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False):
     """Run all post-processing passes on sorted_rows (modified in place).
@@ -2556,6 +2818,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
+    _force_retry_sorts: set = set()  # Remedy A: sorts from trunc-guard for unconditional retry
     _register_block = ''  # built from processed rows; injected into batches 2+
     key_count = len(GEMINI_KEYS)
     _ag_info = ", ".join(f"{_ACCOUNT_LABELS[i]}:{len(g)}" for i, g in enumerate(_ACCOUNT_GROUPS) if g)
@@ -2710,6 +2973,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
                     _r["content"] = _mt_orig
                     _truncated_sorts.add(_s)
+                    _force_retry_sorts.add(_s)  # Remedy A: bypass _MAX_RETRIES + dialogue exemption
                     _trunc_count += 1
         # Cascade unwind: restore the row immediately following each truncated row.
         # It almost certainly received the displaced content of the truncated row.
@@ -2780,6 +3044,16 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
     sorted_final = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
     _post_process(sorted_final, input_data, glossary_terms, skip_bgs_guard=True)
+
+    # ── Remedy A: Force-retry pass for trunc-guard rows ──────────────────────────
+    if _force_retry_sorts:
+        sorted_final = _run_force_retry_pass(
+            force_retry_sorts=_force_retry_sorts,
+            sorted_final=sorted_final,
+            rows=rows,
+            input_data=input_data,
+            glossary_terms=glossary_terms,
+        )
 
     return sorted_final
 
@@ -3476,6 +3750,9 @@ def _run_inner(token):
         send_telegram(f"[DRY RUN] Rephrasing verified OK for <b>{ch_name}</b>")
         return
 
+    # ── Remedy C: Pre-finish scan — corrects high-sim rows before submit ──────
+    rephrased = _pre_finish_scan(rephrased, rows)
+
     submit_result = submit_chapter(token, proc_id, rephrased, rows)
     submit_ok = (
         submit_result.get("status") is True
@@ -3506,14 +3783,25 @@ def _run_inner(token):
     if not finish_ok:
         err_msg = finish_result.get("message", "unknown")
         if "ErrMessage10" in str(err_msg) or "10" in str(finish_result.get("code", "")):
-            msg = (
-                f"⚠️ <b>CDReader: Finish rejected (ErrMessage10)</b>\n\n"
-                f"📖 {book_name}\n"
-                f"📄 {ch_name}\n\n"
-                f"CDReader detected insufficient rephrasing — the output was too similar "
-                f"to the machine translation. Please open the chapter manually, make "
-                f"meaningful edits, and finish it from the CDReader interface."
+            # ── Remedy D: Self-healing ErrMessage10 recovery ───────────────────────────
+            log(f"  ⚠️  ErrMessage10 — attempting automatic recovery...")
+            recovered = _errmessage10_recovery(
+                token=token, chapter_id=proc_id, rows=rows,
+                finish_fn=finish_chapter, submit_fn=submit_chapter,
             )
+            if not recovered:
+                msg = (
+                    f"⚠️ <b>CDReader: Finish rejected (ErrMessage10)</b>\n\n"
+                    f"📖 {book_name}\n"
+                    f"📄 {ch_name}\n\n"
+                    f"CDReader detected insufficient rephrasing. Automatic recovery also "
+                    f"failed. Please open the chapter manually, make meaningful edits, "
+                    f"and finish it from the CDReader interface."
+                )
+                send_telegram(msg)
+                log(f"  ⚠️  Finish failed and recovery exhausted: {finish_result}")
+                return
+            log(f"  ✅ Recovery succeeded — continuing to task close.")
         else:
             msg = (
                 f"⚠️ <b>CDReader: Finish failed</b>\n\n"
@@ -3522,9 +3810,9 @@ def _run_inner(token):
                 f"Response: {finish_result}\n\n"
                 f"Please finish manually."
             )
-        send_telegram(msg)
-        log(f"  ⚠️  Finish failed: {finish_result}")
-        return
+            send_telegram(msg)
+            log(f"  ⚠️  Finish failed: {finish_result}")
+            return
 
     # Close the Task Center task (equivalent to clicking "verify and close")
     time.sleep(2)
