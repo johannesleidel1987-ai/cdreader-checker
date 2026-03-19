@@ -737,7 +737,6 @@ def _row_sim(output, ref):
 
 
 SIM_THRESHOLD = 0.88      # flag rows at or above this combined similarity
-PRE_FINISH_THRESHOLD = 0.86  # Remedy C/D: chapter-level gate before finish call
 # 0.88: CDReader rejects chapters with avg similarity >~80%. Catching rows at 88%+
 # while keys are still alive pulls the average into the 72-77% finish zone.
 
@@ -1121,18 +1120,16 @@ def _unified_retry(all_rephrased, input_data, rows):
             continue
 
         # Check 2: Too similar to MT
-        # Concept D: skip rows ≤ 4 words — too short to meaningfully affect chapter
-        # average, and the synonym table rarely matches them anyway.
-        # Dialogue rows (containing „/“/”) are exempt: post-processing adjusts quote
-        # marks which changes the text enough for CDReader acceptance, and retrying
-        # dialogue rows through the API or deterministic fallback is unreliable
-        # (quote-aware guard blocks most synonym substitutions inside speech).
+        # Rows ≤ 4 words are skipped — too short to meaningfully affect chapter average.
+        # The previous dialogue-quote exemption („/“/”) has been removed: post-processing
+        # only normalises quote characters, not content — a dialogue row at 92%
+        # similarity is still 92% similar to the MT regardless of quote style. The
+        # exemption created a blind spot where high-similarity speech rows escaped retry.
         if mt and len(out.split()) >= 5:
-            if not any(q in out for q in ('„', '“', '”')):
-                sim = _row_sim(out, mt)
-                if sim >= SIM_THRESHOLD:
-                    retry_candidates[sort_n] = (out, mt, f"similar ({sim:.0%})")
-                    continue
+            sim = _row_sim(out, mt)
+            if sim >= SIM_THRESHOLD:
+                retry_candidates[sort_n] = (out, mt, f"similar ({sim:.0%})")
+                continue
 
         # Check 3: Truncated (output < 35% of input words, input >= 6 words)
         if inp:
@@ -1384,85 +1381,10 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
     return sorted(final_by_sort.values(), key=lambda r: r.get("sort", 0))
 
 
-# ─── Remedy C: Pre-finish chapter-level similarity scan ───────────────────────
-_PRE_FINISH_PROMPT = (
-    "You are a German MT post-editor performing a mandatory quality review pass.\n\n"
-    "ENGLISH SOURCE:\n{en_source}\n\n"
-    "MACHINE TRANSLATION (German):\n{mt_content}\n\n"
-    "CURRENT POST-EDIT (similarity to MT: {sim_pct}% \u2014 above rejection threshold):\n{current_content}\n\n"
-    "This row is too close to the original machine translation. Review it carefully:\n"
-    "- If you find a real error (noun capitalisation, article agreement, wrong case, tense "
-    "inconsistency, register violation, localization missing): correct it.\n"
-    "- If the text is genuinely correct, write the same meaning in a naturally different "
-    "formulation that a fluent German editor would produce independently.\n"
-    "- Do NOT fabricate errors. Do NOT make changes that would surprise a native German reader.\n"
-    "- A single-word micro-edit is not sufficient.\n\n"
-    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
-)
-
-
-def _pre_finish_scan(rephrased, rows):
-    """Remedy C: Called immediately before submit_chapter.
-    Scans all rephrased rows for sim >= PRE_FINISH_THRESHOLD against original MT.
-    Sends each offending row for a targeted second-pass Gemini edit.
-    Accepts the result only if it reduces similarity.
-    Returns updated rephrased list."""
-    rows_by_sort = {r.get("sort"): r for r in rows}
-    result_map   = {r.get("sort"): dict(r) for r in rephrased}
-
-    offenders = []
-    for sort, row in result_map.items():
-        content = row.get("content", "")
-        raw     = rows_by_sort.get(sort, {})
-        mt      = (raw.get("machineChapterContent") or raw.get("modifChapterContent") or "").strip()
-        if not mt or not content or sort == 0:
-            continue
-        sim = _row_sim(content, mt)
-        if sim >= PRE_FINISH_THRESHOLD:
-            offenders.append((sort, sim))
-
-    if not offenders:
-        log(f"  \u2705 Pre-finish scan: all rows below {PRE_FINISH_THRESHOLD:.0%} threshold.")
-        return rephrased
-
-    offenders.sort(key=lambda x: x[1], reverse=True)
-    log(f"  \u26a0\ufe0f  Pre-finish scan: {len(offenders)} row(s) at sim >= {PRE_FINISH_THRESHOLD:.0%} \u2014 re-editing...")
-
-    improved = 0
-    for sort, sim in offenders:
-        raw     = rows_by_sort.get(sort, {})
-        mt      = (raw.get("machineChapterContent") or raw.get("modifChapterContent") or "").strip()
-        en_src  = (raw.get("eContent") or raw.get("chapterConetnt") or "").strip()
-        current = result_map[sort].get("content", "")
-
-        prompt = _PRE_FINISH_PROMPT.format(
-            en_source=en_src or "(not available)",
-            mt_content=mt,
-            sim_pct=f"{sim * 100:.0f}",
-            current_content=current,
-            sort_num=sort,
-        )
-
-        result = _call_gemini_simple(prompt, temperature=0.7, max_tokens=2048)
-
-        if result and isinstance(result, list) and result[0].get("content", "").strip():
-            new_content = result[0]["content"].strip()
-            new_sim     = _row_sim(new_content, mt)
-            if new_sim < sim:
-                result_map[sort]["content"] = new_content
-                log(f"  \u2705 Pre-finish sort={sort}: {sim:.0%} \u2192 {new_sim:.0%}")
-                improved += 1
-            else:
-                log(f"  \u26a0\ufe0f  Pre-finish sort={sort}: no improvement ({new_sim:.0%} \u2265 {sim:.0%}), keeping previous.")
-        else:
-            log(f"  \u26a0\ufe0f  Pre-finish sort={sort}: Gemini call failed, keeping previous.")
-
-    log(f"  \U0001f4ac Pre-finish scan: {improved}/{len(offenders)} row(s) improved.")
-    return sorted(result_map.values(), key=lambda r: r.get("sort", 0))
-
 
 # ─── Remedy D: ErrMessage10 self-healing recovery ─────────────────────────────
 _RECOVERY_MAX_ROWS = 10
+_RECOVERY_SIM_THRESHOLD = 0.86  # cast slightly wider net than SIM_THRESHOLD=0.88
 
 _RECOVERY_PROMPT = (
     "You are a German MT post-editor performing an urgent quality correction.\n\n"
@@ -1508,7 +1430,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
         if not sort or not saved or not mt_content or sort == 0:
             continue
         sim = _row_sim(saved, mt_content)
-        if sim >= PRE_FINISH_THRESHOLD:
+        if sim >= _RECOVERY_SIM_THRESHOLD:
             sim_scores.append((sort, sim, saved, mt_content))
 
     if not sim_scores:
@@ -1518,7 +1440,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
     sim_scores.sort(key=lambda x: x[1], reverse=True)
     targets = sim_scores[:_RECOVERY_MAX_ROWS]
     log(f"  \U0001f501 Recovery: re-editing {len(targets)} row(s) "
-        f"(worst sim: {targets[0][1]:.0%}, threshold: {PRE_FINISH_THRESHOLD:.0%})...")
+        f"(worst sim: {targets[0][1]:.0%}, threshold: {_RECOVERY_SIM_THRESHOLD:.0%})...")
 
     corrections = []
 
@@ -3750,8 +3672,6 @@ def _run_inner(token):
         send_telegram(f"[DRY RUN] Rephrasing verified OK for <b>{ch_name}</b>")
         return
 
-    # ── Remedy C: Pre-finish scan — corrects high-sim rows before submit ──────
-    rephrased = _pre_finish_scan(rephrased, rows)
 
     submit_result = submit_chapter(token, proc_id, rephrased, rows)
     submit_ok = (
