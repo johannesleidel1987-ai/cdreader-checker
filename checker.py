@@ -1,6 +1,22 @@
 """
 CDReader Complete Pipeline
 Claim → Fetch rows → Fetch glossary → Rephrase with Gemini → Verify → Submit → Finish
+
+checker-28.py — changes from checker-27.py:
+  Issue A: Removed redundant `import time as _time` in _errmessage10_recovery
+  Issue B: Removed circular synonym ruhig↔gelassen (kept gelassen→ruhig only)
+  Issue C: Moved _MAX_RETRIES=35 from _unified_retry body to module level
+  Finding 1: Pre-cache Gemini content before BGS guard so bleed guard reads pre-BGS state
+             Fix3b (lowercase-first restored to MT) neutralised _starts_lc in bleed guard
+  Finding 2: _find_speech_end priority-0.5 em-dash guard: find LAST dash, not first
+             Multiple dashes in a row caused quote to close too early
+  Finding 3: force_retry_sorts set→dict[int,str]; _FORCE_RETRY_PROMPT branches on reason
+             Bleed/BGS rows now get semantically correct retry prompts
+  (checker-27 changes retained below)
+  Fix 1:   Em-dash speech-end guard in _find_speech_end (closing quote after –/—)
+  Fix 2:   Cross-row bleed guard in _post_process (1.3× inflation + lc-start + 0.6× deflation)
+  Fix 3:   Attribution-only quote-injection guard in Quote Reinject loop
+  Fix 4:   _is_begleitsatz _max_words 15→10 (catches bleed attribution rows)
 """
 
 import requests
@@ -10,9 +26,14 @@ import re
 import sys
 import time
 from datetime import datetime
+from collections import namedtuple
 
-# Alias used throughout — avoids repeated local `import re` inside closures
-_re = re
+# Claimed chapter record — replaces fragile positional tuple unpacking
+ClaimedChapter = namedtuple('ClaimedChapter', [
+    'book', 'ch_name', 'ch_id', 'status', 'claim_proc_id', 'task_id'
+])
+
+
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_URL    = "https://translatorserverwebapi-de.cdreader.com/api"
@@ -88,14 +109,20 @@ _PAID_KEY: str = os.environ.get("GEMINI_API_KEY_28", "").strip()
 #   Account C: GEMINI_API_KEY_19 through GEMINI_API_KEY_28 (positions 18-27, includes paid)
 # When ONE key in an account returns 429-RPM, ALL keys in that account are blocked
 # (rate limits are per Google Cloud project). But OTHER accounts are still available.
-_ACCOUNT_GROUPS: list = []  # list of list[str], built from _GEMINI_KEYS_RAW
+_ACCOUNT_GROUPS: list = []  # list of list[str], populated by _init_account_groups()
 _ACCOUNT_LABELS = ['A', 'B', 'C']
-for _ag_start, _ag_end in [(0, 9), (9, 18), (18, 28)]:
-    _ag_keys = [k for k in _GEMINI_KEYS_RAW[_ag_start:_ag_end] if k.strip()]
-    _ACCOUNT_GROUPS.append(_ag_keys)
-_ag_counts = [len(g) for g in _ACCOUNT_GROUPS]
-log_msg = ", ".join(f"Account {_ACCOUNT_LABELS[i]}: {_ag_counts[i]} keys" for i in range(len(_ACCOUNT_GROUPS)))
-# (logged at runtime, not import time)
+
+def _init_account_groups():
+    """Build account group lists from _GEMINI_KEYS_RAW. Called once at pipeline start.
+    Separated from module level to avoid side effects at import time (testability)."""
+    _ACCOUNT_GROUPS.clear()
+    for _ag_start, _ag_end in [(0, 9), (9, 18), (18, 28)]:
+        _ag_keys = [k for k in _GEMINI_KEYS_RAW[_ag_start:_ag_end] if k.strip()]
+        _ACCOUNT_GROUPS.append(_ag_keys)
+    _ag_counts = [len(g) for g in _ACCOUNT_GROUPS]
+    _ag_info = ", ".join(f"Account {_ACCOUNT_LABELS[i]}: {_ag_counts[i]} keys"
+                         for i in range(len(_ACCOUNT_GROUPS)))
+    log(f"Account groups initialized: {_ag_info}")
 
 # Rotating counter: determines which account group gets tried first for each batch/retry.
 # Incremented after each batch call to spread RPD load evenly across accounts.
@@ -405,7 +432,7 @@ def find_chapter_processing_id(token, book, claimed_chapter_name):
     "Chapter 1" is a substring of "Chapter 10", "Chapter 100", etc.
     """
     def _chap_num(s):
-        m = _re.search(r"\d+", s or "")
+        m = re.search(r"\d+", s or "")
         return int(m.group()) if m else -1
 
     book_id_for_list = (
@@ -619,9 +646,9 @@ _SV = (
     r"bellte|nuschelte|meckerte|witzelte|triumphierte|jubelte|überredete"
 )
 # Negation guard: "antwortete nicht", "sagte kein Wort" etc. are NARRATIVE, not attribution
-_NEGATION_AFTER_SV = _re.compile(
+_NEGATION_AFTER_SV = re.compile(
     rf"(?:{_SV_CORE})\s+(?:nicht|kein|keine|keinen|keinem|keiner|nie|niemals|nichts)",
-    _re.IGNORECASE
+    re.IGNORECASE
 )
 
 # _BEGLEITSATZ_BASE: a genuine Begleitsatz starts DIRECTLY with the speech verb
@@ -634,29 +661,30 @@ _NEGATION_AFTER_SV = _re.compile(
 # 'sprach' matches 'Sprache' — all legitimate dialogue/narrative rows that
 # would be incorrectly restored from MT by the BGS confusion guard.
 # Confirmed by simulation (2026-03-08): sort=116 „Wieso?" was falsely flagged.
-_BEGLEITSATZ_BASE = _re.compile(
+_BEGLEITSATZ_BASE = re.compile(
     rf"""^(?:
         (?:(?:{_SV_CORE})\b)
         |
         (?:(?:er|sie|es|ich|wir|ihr|man)\s+(?:(?:{_SV_CORE})\b))
     )""",
-    _re.IGNORECASE | _re.VERBOSE
+    re.IGNORECASE | re.VERBOSE
 )
 
-def _is_begleitsatz(text, _max_words=15):
+def _is_begleitsatz(text, _max_words=10):
     """True only if text is a genuine attribution clause after dialogue.
     Guards against false positives:
       - Rows ending with ':' introduce NEW dialogue (not attributing previous speech)
-      - Long rows (> max_words=15) that aren't attribution — genuine Begleitsätze
+      - Long rows (> _max_words=10) that aren't attribution — genuine Begleitsätze
         are short (2-12 words typically). 30 was too permissive: "Er wollte sie
         nicht wegen der Ereignisse..." (23w) matched 'er wollte' and triggered
-        a false positive restoration. 15 excludes all such narrative sentences.
+        a false positive restoration. 15 narrowed the window; 10 (current) is
+        even tighter to exclude borderline narrative sentences.
       - Negated speech verbs ('antwortete nicht', 'sagte kein Wort') = narrative denial
     """
     # Inline speech: attribution verb followed by colon + uppercase = introduces
     # direct speech in the same row („Antwortete sie entschlossen: Nein.“) —
     # this is NOT a pure Begleitsatz following previous speech.
-    if _re.search(r':\s+[A-ZÄÖÜ]', text):
+    if re.search(r':\s+[A-ZÄÖÜ]', text):
         return False
     if text.rstrip().endswith(':'):
         return False  # ends with ':' → introduces new speech, doesn't attribute old
@@ -712,21 +740,21 @@ def _is_continuation_row(text):
 
 _QE_OPEN   = '„'  # „ U+201E
 _QE_CLOSE  = '“'  # " U+201C
-_QE_ANY_CLOSE_RE  = _re.compile(r'[“”"]')
-_QE_CLOSE_AT_END  = _re.compile(r'[“”"]\s*[,!?.]?\s*$')
-_QE_STARTS_OPEN   = _re.compile(r'^[„“”"]')
+_QE_ANY_CLOSE_RE  = re.compile(r'[“”"]')
+_QE_CLOSE_AT_END  = re.compile(r'[“”"]\s*[,!?.]?\s*$')
+_QE_STARTS_OPEN   = re.compile(r'^[„“”"]')
 
-_QE_ENG_OPEN_RE   = _re.compile(r'^[„“”‘\"«]')
-_QE_ENG_CLOSE_RE  = _re.compile(r'[“”\"]\s*[,!?.]?\s*$')
+_QE_ENG_OPEN_RE   = re.compile(r'^[„“”‘\"«]')
+_QE_ENG_CLOSE_RE  = re.compile(r'[“”\"]\s*[,!?.]?\s*$')
 
 
 def _row_sim(output, ref):
     """Combined similarity: max(Jaccard-word, char-trigram) on normalised text."""
     def _norm(s):
-        return _re.sub(r"[^\w\s]", "", s.lower())
+        return re.sub(r"[^\w\s]", "", s.lower())
     def _jaccard(a, b):
-        wa = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
-        wb = set(_re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
+        wa = set(re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", a))
+        wb = set(re.findall(r"[a-z\u00e4\u00f6\u00fc\u00df]+", b))
         return len(wa & wb) / len(wa | wb) if (wa and wb) else 0.0
     def _trigram(a, b):
         na = set(a[i:i+3] for i in range(max(0, len(a)-2)))
@@ -801,7 +829,7 @@ _SYNONYMS = [
     (r'\bwusste\b', 'war sich bewusst'),
     # Common verbs (second tier — matched after Gemini may have already used conjunctions)
     (r'\btrieb\b', 'drängte'),
-    (r'\bstand\b', 'befand sich'),
+    (r'\bstand\b', 'verharrte'),
     # REMOVED: ließ→brachte — different semantics ('sie ließ ihn gehen' ≠ 'sie brachte ihn gehen')
     (r'\bblickte\b', 'schaute'),
     (r'\bhörte\b', 'vernahm'),
@@ -830,8 +858,7 @@ _SYNONYMS = [
     (r'\bjung\b', 'jugendlich'),
     (r'\bstark\b', 'kräftig'),
     (r'\bschwach\b', 'kraftlos'),
-    (r'\bruhig\b', 'gelassen'),
-    (r'\bstrahlend\b', 'leuchtend'),
+        (r'\bstrahlend\b', 'leuchtend'),
     # Sentence adverbs & connectors (second tier)
     (r'\bdaraufhin\b', 'anschließend'),
     (r'\bschließlich\b', 'letztendlich'),
@@ -881,7 +908,7 @@ def _find_synonym_pair(text):
                    for qs, qe in _quote_ranges)
 
     for pattern, replacement in _SYNONYMS:
-        m = _re.search(pattern, text)
+        m = re.search(pattern, text)
         if m and not _in_quotes(m.start(), m.end()):
             return (m.group(0), replacement)
     return None
@@ -916,19 +943,24 @@ def _deterministic_change(text):
                    for qs, qe in _quote_ranges)
 
     for pattern, replacement in _SYNONYMS:
-        m = _re.search(pattern, text)
+        m = re.search(pattern, text)
         if m and not _in_quotes(m.start(), m.end()):
-            return _re.sub(pattern, replacement, text, count=1)
+            return re.sub(pattern, replacement, text, count=1)
     # No synonym matched (very short row, exclamation, single name, etc.) — return as-is.
     # Comma→semicolon was removed: it frequently broke syntax where a comma is
     # grammatically required (subordinate clauses, enumeration, inline attribution).
     return text
 
 
-def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
+def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None):
     """Account-group-aware Gemini call for single-row retries.
     
     Returns parsed JSON list or None.
+    
+    Args:
+        deadline: optional float (time.time() epoch). If set, the function
+                  short-circuits and returns None when wall-clock exceeds this
+                  value, preventing unbounded blocking across group rotations.
     
     Key design (2026-03-17, timeout + deadline update):
       1. ACCOUNT-GROUP ROTATION: Keys are in 3 Google accounts with independent RPM/RPD.
@@ -942,8 +974,8 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
       4. INCREASED OUTPUT BUDGET: Default maxOutputTokens=2048 (was 512). gemini-2.5-flash
          uses internal thinking tokens that consume the output budget, causing truncated
          JSON responses at 512.
-      5. PER-ROW DEADLINE: Caller injects a 90s wall-clock cap per row; if _call_gemini_simple
-         takes longer (all groups slow), deterministic fallback is used for that row.
+      5. PER-ROW DEADLINE: Enforced internally — if deadline is set, each group iteration
+         and the second-pass wait check it before proceeding.
     """
     global _retry_scan_offset
 
@@ -1011,7 +1043,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
             log(f"    ⚠️ Gemini returned empty text (finishReason={candidates[0].get('finishReason', '?')})")
             return None, False, False
         if text.startswith("```"):
-            text = _re.sub(r"^```[^\n]*\n", "", text); text = text.rsplit("```", 1)[0].strip()
+            text = re.sub(r"^```[^\n]*\n", "", text); text = text.rsplit("```", 1)[0].strip()
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
@@ -1028,6 +1060,8 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
     _retry_scan_offset += 1
 
     for gi_offset in range(n_groups):
+        if deadline and time.time() > deadline:
+            return None  # wall-clock deadline exceeded
         gi = (start_group + gi_offset) % n_groups
         if gi in _rpm_blocked_groups:
             continue
@@ -1057,6 +1091,9 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
             break  # only try ONE key per group (success or fail), then move to next group
 
     # ── Second pass: wait for soonest key across non-blocked groups ────────
+    if deadline and time.time() > deadline:
+        return None  # wall-clock deadline exceeded before second pass
+
     available_keys = [k for k in keys_all if k not in _rpd_exhausted_keys
                       and _key_account_group(k) not in _rpm_blocked_groups]
     if not available_keys:
@@ -1074,6 +1111,12 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048):
         if wait_times:
             wait_secs = min(wait_times) + 0.5
             wait_secs = max(1.0, min(wait_secs, 8.0))
+            # Clamp against deadline to avoid overshooting
+            if deadline:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                wait_secs = min(wait_secs, remaining)
             time.sleep(wait_secs)
 
         # Try the soonest-cooled key
@@ -1166,7 +1209,6 @@ def _unified_retry(all_rephrased, input_data, rows):
     # Soft cap — raised from 20 to 35 now that key 28 is correctly protected from
     # RPM misclassification and won't be permanently killed mid-retry loop.
     # High-similarity chapters (25+ flagged rows) were systematically under-retried.
-    _MAX_RETRIES = 35
     if len(retry_candidates) > _MAX_RETRIES:
         log(f"  ⚠️  Unified retry: {len(retry_candidates)} rows flagged — capped at {_MAX_RETRIES}")
         sorted_cands = sorted(retry_candidates.items(), key=lambda x: -len(x[1][0].split()))
@@ -1333,6 +1375,40 @@ _FORCE_RETRY_PROMPT = (
     'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
 )
 
+_FORCE_RETRY_PROMPT_BLEED = (
+    "You are a German MT post-editor. The previous output for this row was discarded "
+    "because it contained content from an adjacent row (cross-row bleed: Gemini merged "
+    "speech from sort N+1 into sort N, leaving sort N+1 with attribution-only content, "
+    "or vice versa).\n\n"
+    "ENGLISH SOURCE:\n{en_source}\n\n"
+    "MACHINE TRANSLATION (German):\n{mt_content}\n\n"
+    "Produce a correct, complete German post-edit of THIS ROW ONLY — its own content, "
+    "nothing borrowed from adjacent rows. "
+    "Apply all standard rules: fix grammar, noun capitalisation, register, "
+    "localization (Dollar->Euro, CEO->Geschaeftsfuehrer). "
+    "If the machine translation is already correct, produce the same meaning in a "
+    "naturally fluent German formulation that differs from the MT.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
+)
+
+_FORCE_RETRY_PROMPT_BGS = (
+    "You are a German MT post-editor. The previous output for this row was discarded "
+    "because it contained only a bare attribution clause (Begleitsatz) instead of the "
+    "full dialogue or narrative content this row requires.\n\n"
+    "ENGLISH SOURCE:\n{en_source}\n\n"
+    "MACHINE TRANSLATION (German):\n{mt_content}\n\n"
+    "Produce a correct, complete German post-edit of THIS ROW. "
+    "The row must contain its own full content - do not output a standalone attribution "
+    "such as sagte er or fragte sie unless the English source itself is only an "
+    "attribution clause. "
+    "Apply all standard rules: fix grammar, noun capitalisation, register, "
+    "localization (Dollar->Euro, CEO->Geschaeftsfuehrer). "
+    "If the machine translation is already correct, produce the same meaning in a "
+    "naturally fluent German formulation that differs from the MT.\n\n"
+    'Return ONLY valid JSON: {{"sort": {sort_num}, "content": "corrected German text"}}'
+)
+
+
 
 def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glossary_terms):
     """Remedy A: Unconditional individual Gemini retry for every sort registered by
@@ -1341,14 +1417,14 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
     if not force_retry_sorts:
         return sorted_final
 
-    log(f"  \U0001f504 Force-retry pass: {len(force_retry_sorts)} trunc-guard row(s) queued...")
+    log(f"  \U0001f504 Force-retry pass: {len(force_retry_sorts)} row(s) queued...")
 
     rows_by_sort  = {r.get("sort"): r for r in rows}
     input_by_sort = {r.get("sort"): r for r in input_data}
     final_by_sort = {r.get("sort"): r for r in sorted_final}
 
     success = 0
-    for sort in sorted(force_retry_sorts):
+    for sort, _frs_reason in sorted(force_retry_sorts.items()):
         raw_row    = rows_by_sort.get(sort, {})
         inp_row    = input_by_sort.get(sort, {})
         en_source  = (raw_row.get("eContent") or raw_row.get("chapterConetnt") or "").strip()
@@ -1358,7 +1434,13 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
             log(f"  \u26a0\ufe0f  Force-retry sort={sort}: no MT content \u2014 skipping.")
             continue
 
-        prompt = _FORCE_RETRY_PROMPT.format(
+        if _frs_reason == 'bleed':
+            _frs_tmpl = _FORCE_RETRY_PROMPT_BLEED
+        elif _frs_reason == 'bgs':
+            _frs_tmpl = _FORCE_RETRY_PROMPT_BGS
+        else:  # 'truncated' — original Remedy A purpose
+            _frs_tmpl = _FORCE_RETRY_PROMPT
+        prompt = _frs_tmpl.format(
             en_source=en_source or "(not available)",
             mt_content=mt_content,
             sort_num=sort,
@@ -1383,6 +1465,7 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
 
 
 # ─── Remedy D: ErrMessage10 self-healing recovery ─────────────────────────────
+_MAX_RETRIES       = 35  # max rows retried per chapter (moved to module level, checker-27)
 _RECOVERY_MAX_ROWS = 10
 _RECOVERY_SIM_THRESHOLD = 0.86  # cast slightly wider net than SIM_THRESHOLD=0.88
 
@@ -1487,8 +1570,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
 
     log(f"  \U0001f501 Recovery: retrying finish (once)...")
     try:
-        import time as _time
-        _time.sleep(2)
+        time.sleep(2)
         finish_response = finish_fn(token, chapter_id)
         finish_ok = (
             finish_response.get("status") is True
@@ -1505,7 +1587,7 @@ def _errmessage10_recovery(token, chapter_id, rows, finish_fn, submit_fn):
         log(f"  \u274c Recovery: finish exception: {e}")
         return False
 
-def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False):
+def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False, force_retry_sorts=None):
     """Run all post-processing passes on sorted_rows (modified in place).
     
     Called after initial Gemini batch processing AND after each retry pass,
@@ -1531,6 +1613,9 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
     # A genuine Begleitsatz never starts with a quote character, so testing the raw
     # output (not stripped) is safe — "„Ich schoss..." does NOT match BGS.
     # (dicts _mt_by_sort and _eng_by_sort built above)
+    # Pre-BGS content cache (Finding 1): Fix3b restores lc-rows to MT before the bleed
+    # guard runs. Without this snapshot _starts_lc is always False for those rows.
+    _pre_bgs_content = {r.get('sort'): r.get('content', '').strip() for r in sorted_rows}
     _bgs_confusion_fixes = 0
     for row in (sorted_rows if not skip_bgs_guard else []):
         sort_n = row.get("sort")
@@ -1555,21 +1640,21 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         _eng_is_attribution = (
             not eng_s.lstrip().startswith('"')           # not itself dialogue
             and len(eng_s.split()) <= _ENG_ATTRIBUTION_MAX_WORDS  # short sentence
-            and bool(_re.search(
+            and bool(re.search(
                 r'\b(?:said|asked|replied|answered|whispered|shouted|called|muttered|'
                 r'remarked|added|continued|insisted|demanded|exclaimed|cried|'
                 r'explained|told|warned|ordered|nodded|smiled|sighed|'
                 r'laughed|teased|snapped|groaned|sobbed|gasped|hissed|'
                 r'growled|chuckled|corrected|interrupted|murmured|suggested|'
                 r'conceded|admitted|acknowledged|declared|announced|breathed)\b',
-                eng_s, _re.IGNORECASE))
+                eng_s, re.IGNORECASE))
         )
         # Fix 3a: strip leading quote before BGS check.
         # Root cause (SS3-row2): Gemini outputs „schalt Henry mich aus. (attribution
         # prefixed with spurious „). _BEGLEITSATZ_BASE requires ^(SV|pronoun+SV), so
         # _is_begleitsatz on the raw output never matches. Stripping the leading quote
         # first lets the pattern see the attribution verb directly.
-        _out_unquoted = _re.sub(r'^[„“"]+', '', out).strip()
+        _out_unquoted = re.sub(r'^[„“"]+', '', out).strip()
         _is_bgs_raw      = _is_begleitsatz(out)
         _is_bgs_unquoted = _is_begleitsatz(_out_unquoted)
         if (_is_bgs_raw or _is_bgs_unquoted) and not _eng_is_attribution:
@@ -1590,6 +1675,55 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
             log(f"  ⚠️  Lowercase-first displaced: sort={sort_n} restored from {out!r} to MT {mt_s[:60]!r}")
     if _bgs_confusion_fixes:
         log(f"  💬 BGS confusion guard: restored {_bgs_confusion_fixes} row(s) from MT.")
+
+    # ── Cross-row bleed guard (checker-27 Fix 2) ──────────────────────────
+    # Detects Gemini row-merge errors: row N absorbs speech from row N+1,
+    # inflating row N while row N+1 is left with attribution-only content.
+    # _INFLATION_THRESHOLD=1.6 misses borderline cases (e.g. 4-word source
+    # → 6-word output = 1.5× — below threshold). Bleed signature:
+    #   row N   inflated:  output > MT × 1.3 AND delta ≥ 2 words
+    #   row N+1 lc-start:  output starts lowercase (attribution bleed)
+    #   row N+1 deflated:  output < MT × 0.6 (lost speech content)
+    # Both rows restored from MT and queued for Remedy A retry.
+    _bleed_fixes = 0
+    _rows_by_sort_pp  = {r.get('sort'): r for r in sorted_rows}
+    _sorted_keys_pp   = sorted(_rows_by_sort_pp.keys())
+    for _bi in range(len(_sorted_keys_pp) - 1):
+        _sn  = _sorted_keys_pp[_bi]
+        _sn1 = _sorted_keys_pp[_bi + 1]
+        if _sn == 0 or _sn1 == 0:
+            continue
+        _row_n   = _rows_by_sort_pp[_sn]
+        _row_n1  = _rows_by_sort_pp[_sn1]
+        # Use pre-BGS snapshot — Fix3b may have already restored these rows to MT (Finding 1)
+        _out_n   = _pre_bgs_content.get(_sn,  '')
+        _out_n1  = _pre_bgs_content.get(_sn1, '')
+        _mt_n    = _mt_by_sort.get(_sn,  '').strip()
+        _mt_n1   = _mt_by_sort.get(_sn1, '').strip()
+        if not _mt_n or not _mt_n1 or not _out_n or not _out_n1:
+            continue
+        _wc_out_n  = len(_out_n.split())
+        _wc_mt_n   = len(_mt_n.split())
+        _wc_out_n1 = len(_out_n1.split())
+        _wc_mt_n1  = len(_mt_n1.split())
+        _inflated  = (_wc_mt_n >= 2
+                      and _wc_out_n > _wc_mt_n * 1.3
+                      and (_wc_out_n - _wc_mt_n) >= 2)
+        _starts_lc = bool(_out_n1 and _out_n1[0].islower())
+        _deflated  = (_wc_mt_n1 >= 3 and _wc_out_n1 < _wc_mt_n1 * 0.6)
+        if _inflated and _starts_lc and _deflated:
+            log(f"  ⚠️ Cross-row bleed: sort={_sn} ({_wc_mt_n}→{_wc_out_n}w) "
+                f"+ sort={_sn1} lc-start ({_wc_mt_n1}→{_wc_out_n1}w) — restoring both from MT")
+            _row_n['content']  = _mt_n
+            _row_n1['content'] = _mt_n1
+            _bleed_fixes += 1
+            if force_retry_sorts is not None:
+                force_retry_sorts[_sn]  = 'bleed'  # Finding 3
+                force_retry_sorts[_sn1] = 'bleed'  # Finding 3
+    if _bleed_fixes:
+        log(f"  💬 Cross-row bleed guard: restored {_bleed_fixes * 2} row(s) from MT, "
+            f"queued for Remedy A retry.")
+
 
 
 
@@ -1613,11 +1747,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         """Find where direct speech begins in German narration+speech text.
         Returns index where „ should go, or -1 if not detectable."""
         # Primary: colon + space + uppercase (standard German direct speech)
-        m = _re.search(r':\s+([A-ZÄÖÜ])', text)
+        m = re.search(r':\s+([A-ZÄÖÜ])', text)
         if m:
             return m.start(1)
         # Secondary: colon + space (even if next char not uppercase)
-        m2 = _re.search(r':\s+', text)
+        m2 = re.search(r':\s+', text)
         if m2:
             return m2.end()
         return -1
@@ -1646,7 +1780,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
     def _en_speech_word_count(eng):
         """Count words in the EN speech portion (between first opener and last closer)."""
         _q_open = set('„“""«')
-        _q_close = set('“”""»')
+        _q_close = set('”"»')        # closers only: ” " »
         first_open = -1
         last_close = -1
         for i, ch in enumerate(eng):
@@ -1668,9 +1802,23 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # ONLY occurs when a closing quote was stripped between them.
         # Normal German never has ?, or !, or ., without a quote between.
         # This is the most reliable speech boundary — completely verb-independent.
-        m_sq = _re.search(r'[.!?…],\s+', text)
+        m_sq = re.search(r'[.!?…],\s+', text)
         if m_sq:
             return m_sq.start() + 1, False  # “ after punct, before comma
+        # ── Priority 0.5: Em-dash speech-end guard (checker-27 Fix 1) ──────
+        # When the EN source has a dash (\u2013 or \u2014) immediately before
+        # the closing quote (e.g. 'I prefer\u2014" Her cheeks turned pink.'),
+        # the closing \u201c belongs right after the dash in German. Without
+        # this guard, _find_speech_end falls to end-of-text and wraps the
+        # entire row (including attribution) inside the quotes:
+        #   BAD:  \u201eIch bevorzuge \u2013 Ihre Wangen wurden rosafarben.\u201c
+        #   GOOD: \u201eIch bevorzuge \u2013\u201c Ihre Wangen wurden rosafarben.
+        if eng and re.search(r'[\u2014\u2013]["\u201c\u201d]', eng):
+            # Finding 2: find the LAST dash, not the first. A row may contain
+            # multiple dashes; the speech ends after the last one, not the first.
+            _all_dashes = list(re.finditer(r'[\u2014\u2013]', text))
+            if _all_dashes:
+                return _all_dashes[-1].end(), False  # insert \u201c after LAST dash
         # ── Priority 1: Short-speech early boundary ─────────────────────
         # When EN speech is very short (≤2 words like "Good." or "No."),
         # check for a sentence boundary in the first few German words BEFORE
@@ -1678,15 +1826,15 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         if eng:
             _esw = _en_speech_word_count(eng)
             if _esw <= 2:
-                m_early = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
+                m_early = re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
                 if m_early and len(text[:m_early.start()].split()) <= 3:
                     return m_early.start() + 1, False
         # ── Priority 2: SV verb with comma ──────────────────────────
-        m = _re.search(r',\s+(' + _SV + r')\b', text, _re.IGNORECASE)
+        m = re.search(r',\s+(' + _SV + r')\b', text, re.IGNORECASE)
         if m:
             return m.start(), False
         # ── Priority 3: SV verb without comma ───────────────────────
-        m2 = _re.search(r'(?<=[a-zäöüß!?.…])\s+(' + _SV + r')\b', text, _re.IGNORECASE)
+        m2 = re.search(r'(?<=[a-zäöüß!?.…])\s+(' + _SV + r')\b', text, re.IGNORECASE)
         if m2:
             return m2.start(), True
         # ── Priority 3.5: Structural attribution fallback ─────────────
@@ -1701,18 +1849,18 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         #   ✗ , nahm den Schlüssel (article "den" — not a name/pronoun)
         # This eliminates the whack-a-mole of adding individual verbs.
         _ATTRIB_PRONOUNS = r'(?:er|sie|es|ich|wir|ihr|man|du)\b'
-        m_struct = _re.search(
+        m_struct = re.search(
             r',\s+[a-zäöüß]\w{2,}\s+(?:' + _ATTRIB_PRONOUNS + r'|[A-ZÄÖÜ][a-zäöüß])',
             text
         )
         if m_struct:
             return m_struct.start(), False
         # ── Priority 4: Sentence boundary (.!? + uppercase) ───────────
-        m3 = _re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
+        m3 = re.search(r'[.!?…]\s+[A-ZÄÖÜ]', text)
         if m3:
             return m3.start() + 1, False
         # ── Priority 5: Short speech + comma + uppercase name ────────
-        m4 = _re.search(r',\s+([A-ZÄÖÜ][a-zäöüß])', text)
+        m4 = re.search(r',\s+([A-ZÄÖÜ][a-zäöüß])', text)
         if m4 and len(text[:m4.start()].split()) <= 4:
             return m4.start(), False
         # ── Fallback: end of text ───────────────────────────────
@@ -1783,12 +1931,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
             return -1
         # Return position after comma + whitespace (where the speech content begins)
         rest = text[best_pos + 1:]
-        m = _re.match(r'\s*', rest)
+        m = re.match(r'\s*', rest)
         skip = m.end() if m else 0
         return best_pos + 1 + skip
 
-    _QE_OPEN  = '„'
-    _QE_CLOSE = '“'
+    # _QE_OPEN and _QE_CLOSE are defined at module level (no need to redefine here)
     qe_fixes = 0
 
     for row in sorted_rows:
@@ -1809,8 +1956,29 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         fixed = c.replace('«', '„').replace('»', '“')
         original = fixed
 
-        en_starts_quote = bool(eng and _re.match(r'^[""„“«]', eng.strip()))
+        en_starts_quote = bool(eng and re.match(r'^[""„“«]', eng.strip()))
         stripped = _strip_outer_quotes(fixed)
+
+        # Fix 3 (checker-27): Attribution-only quote-injection guard.
+        # If Gemini returned a pure Begleitsatz (e.g. "meinte er und
+        # unterbrach...") for a row that should contain speech content,
+        # injecting any quote here is structurally wrong and produces
+        # malformed output like 'und",'. Restore from MT and queue for
+        # Remedy A retry instead.
+        if role not in ("none", "middle") and _is_begleitsatz(stripped):
+            _eng_is_attr_f3 = (
+                not (eng or "").lstrip().startswith('"')
+                and len((eng or "").split()) <= _ENG_ATTRIBUTION_MAX_WORDS
+            )
+            if not _eng_is_attr_f3:
+                _mt_f3 = _mt_by_sort.get(sort_n, "")
+                if _mt_f3:
+                    row["content"] = _mt_f3
+                    log(f"  ⚠️ Quote-inject BGS guard: sort={sort_n} "
+                        f"attribution-only output {stripped[:40]!r} restored from MT")
+                    if force_retry_sorts is not None:
+                        force_retry_sorts[sort_n] = 'bgs'  # Finding 3
+                    continue
 
         if role in ("middle", "none"):
             # No quotes at all — pure continuation or narrative
@@ -1997,7 +2165,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
     _dup_fixes = 0
 
     def _qnorm(s):
-        return _re.sub(r'[„“”"]', '"', s)
+        return re.sub(r'[„“”"]', '"', s)
 
     for idx in range(len(sorted_rows) - 1):
         row_n   = sorted_rows[idx]
@@ -2012,15 +2180,15 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # Row N+1 is already correct — leave it alone.
         # The old guard `orig_n1 != cn1` blocked this when MT == Gemini output
         # for the Begleitsatz (perfectly normal for a short attribution). Removed.
-        m_inline = _re.search(r'[\u201c\u201d"]+\s*,\s*(.+)$', cn)
+        m_inline = re.search(r'[\u201c\u201d"]+\s*,\s*(.+)$', cn)
         if m_inline:
             inline_bgs = m_inline.group(1).strip()
             if inline_bgs and cn1 and (
                 inline_bgs.lower() == cn1.lower() or
                 inline_bgs.lower().rstrip(".") == cn1.lower().rstrip(".")
             ):
-                row_n["content"] = _re.sub(
-                    r"\s*,\s*" + _re.escape(inline_bgs) + r"\s*$", "", cn
+                row_n["content"] = re.sub(
+                    r"\s*,\s*" + re.escape(inline_bgs) + r"\s*$", "", cn
                 ).rstrip(",").rstrip()
                 _dup_fixes += 1
                 continue  # pair handled; row N+1 left as-is
@@ -2053,8 +2221,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         out    = row.get("content", "")
         mt     = (_mt_by_sort.get(sort_n) or "").strip()
         if not mt or not out: continue
-        _mt_words  = _re.findall(r"[a-zA-ZäöüÄÖÜß']+", mt)
-        _out_words = _re.findall(r"[a-zA-ZäöüÄÖÜß']+", out)
+        _mt_words  = re.findall(r"[a-zA-ZäöüÄÖÜß']+", mt)
+        _out_words = re.findall(r"[a-zA-ZäöüÄÖÜß']+", out)
         if len(_mt_words) != 1: continue          # only single-word sources
         if len(_out_words) <= 1: continue         # output already single word
         if _out_words[0].lower() != _mt_words[0].lower(): continue  # legitimate rephrase
@@ -2075,7 +2243,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # Gemini outputs e.g. „Nachmittag",. — period AND comma, which is wrong either way.
         # - If next row IS a Begleitsatz: keep comma (needed), move period inside quote → „Nachmittag.",
         # - If next row is NOT a Begleitsatz: drop comma, move period inside quote → „Nachmittag."
-        if _re.search(r'[“”"],[.]$', c):
+        if re.search(r'[“”"],[.]$', c):
             c_base = c[:-3]           # everything before closing_quote
             c_quote = c[-3]           # the closing quote character
             if _is_continuation_row(next_content):
@@ -2103,8 +2271,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
 
         # Rule C2: Add missing comma after ?" / !" inline (same row as attribution).
         # e.g. „Seit wann trägst du Schmuck?“ fragte Karl → „Seit wann trägst du Schmuck?“, fragte Karl
-        if _re.search(r'[?!][“”"](?!,)', c):
-            c_c2 = _re.sub(
+        if re.search(r'[?!][“”"](?!,)', c):
+            c_c2 = re.sub(
                 r'([?![""\u201d\u201c])(?!,)([ \t]+(?:' + _SV + r'))',
                 r'\1,\2', c
             )
@@ -2116,7 +2284,7 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
 
         # Rule D: Replace literal mid-sentence em-dashes with commas.
         if '—' in c:
-            c_nodash = _re.sub(r'(?<=\w)\s*—\s*(?=\w)', ', ', c)
+            c_nodash = re.sub(r'(?<=\w)\s*—\s*(?=\w)', ', ', c)
             if c_nodash != c:
                 row["content"] = c_nodash
                 dash_fixes += 1
@@ -2125,8 +2293,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # Rule E: Move comma from BEFORE closing quote to AFTER it.
         # Wrong: „Text,“ sagte / „Text," sagte
         # Right: „Text“, sagte / „Text", sagte
-        if not _re.search(r'[?!],[“"]', c):
-            c_e = _re.sub(
+        if not re.search(r'[?!],[“"]', c):
+            c_e = re.sub(
                 r',(\u201c|")([ \t]+(?:' + _SV + r'))',
                 r'\1,\2', c
             )
@@ -2143,14 +2311,14 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # before the attribution verb.
         # Inline:    „Text!" rief er.   →  „Text!", rief er.
         # Cross-row: row ends with !"   and next row is Begleitsatz → add ","
-        if _re.search(r'[!“"]$', c) or _re.search(r'!"[^,]', c):
+        if re.search(r'[!“"]$', c) or re.search(r'!"[^,]', c):
             # Inline: !" followed by space+Begleitsatz without comma
-            c_f = _re.sub(
+            c_f = re.sub(
                 r'(![""\u201d\u201c])(?!,)([ \t]+(?:' + _SV + r'))',
                 r'\1,\2', c
             )
             # Cross-row: row ends with !" and next row is Begleitsatz
-            if c_f == c and _re.search(r'![“"]$', c):
+            if c_f == c and re.search(r'![“"]$', c):
                 if _is_continuation_row(next_content):
                     c_f = c + ','
             if c_f != c:
@@ -2162,8 +2330,8 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
         # Gemini sometimes returns headers all-lowercase, with a spurious colon, or with
         # wrong casing. Match case-insensitively to catch "kapitel 60 ..." variants.
         # Canonical form: "Kapitel {N} {Each Word Title-Cased}" (no colon)
-        if _re.match(r'^[Kk]apitel\s+\d+', c):
-            _m_g = _re.match(r'^[Kk]apitel\s+(\d+)\s*:?\s*(.*)', c, _re.DOTALL)
+        if re.match(r'^[Kk]apitel\s+\d+', c):
+            _m_g = re.match(r'^[Kk]apitel\s+(\d+)\s*:?\s*(.*)', c, re.DOTALL)
             if _m_g:
                 _num_g  = _m_g.group(1)
                 _rest_g = _m_g.group(2).strip()
@@ -2210,11 +2378,11 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False)
             for src, tgt in replacement_pairs:
                 # Word-boundary aware replacement, case-insensitive
                 try:
-                    pattern = _re.compile(r'(?<![\w\-])' + _re.escape(src) + r'(?![\w\-])', _re.IGNORECASE)
+                    pattern = re.compile(r'(?<![\w\-])' + re.escape(src) + r'(?![\w\-])', re.IGNORECASE)
                     replaced = pattern.sub(tgt, new_content)
                     if replaced != new_content:
                         new_content = replaced
-                except _re.error:
+                except re.error:
                     pass  # skip malformed patterns
             if new_content != original_content:
                 row["content"] = new_content
@@ -2238,10 +2406,10 @@ def _build_register_block(processed_rows):
     First-occurrence wins; once a name is mapped it is never overwritten.
     Called after each batch; injected into all subsequent batch prompts.
     """
-    _du_re = _re.compile(r'\b(du|dich|dir|dein\w*)\b', _re.IGNORECASE)
-    _formal_re = _re.compile(r'\b(Ihnen|Ihrem|Ihren|Ihrer|Ihres)\b')
-    _attrib_re = _re.compile(
-        r'[\u201c\u201e"](.*?)[\u201c\u201e"]\s*[,.]?\s*'
+    _du_re = re.compile(r'\b(du|dich|dir|dein\w*)\b', re.IGNORECASE)
+    _formal_re = re.compile(r'\b(Ihnen|Ihrem|Ihren|Ihrer|Ihres)\b')
+    _attrib_re = re.compile(
+        r'[\u201e"](.*?)[\u201c"]\s*[,.]?\s*'
         r'(?:sagte|fragte|fl\u00fcsterte|antwortete|rief|meinte|erwiderte|sprach|'
         r'murmelte|zischte|raunte|hauchte|stammelte|schrie|br\u00fcllte|wisperte|'
         r'knurrte|erg\u00e4nzte|verk\u00fcndete|bat|flehte|konterte|erkl\u00e4rte|'
@@ -2457,7 +2625,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     en_j = english_originals[j] if j < len(english_originals) else ""
                     mt_j = raw_contents[j] if j < len(raw_contents) else ""
                     # Check if EN has colon + content (speech introduction)
-                    has_colon_speech = bool(_re.search(r':\s+[a-zA-Z]', en_j))
+                    has_colon_speech = bool(re.search(r':\s+[a-zA-Z]', en_j))
                     # Check if German MT has „ (MT detected speech start)
                     mt_has_open = '\u201e' in mt_j
                     if has_colon_speech or mt_has_open:
@@ -2511,7 +2679,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             elif ch == '\\':
                 result.append(ch)
                 escape_next = True
-            elif ch == '"' and not escape_next:
+            elif ch == '"':  # escape_next is always False here (handled above)
                 in_string = not in_string
                 result.append(ch)
             elif in_string and ch == '\n':
@@ -2564,11 +2732,11 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
         if glossary_terms:
             # Build a set of all English words present in the batch (lowercased)
             # for efficient multi-word substring matching.
-            batch_text_lower = batch_text.lower()
+            # batch_text is already lowercase from the join above.
             def _term_in_batch(term):
                 key = (term.get("dictionaryKey") or "").strip().lower()
                 sur = (term.get("enSurname") or "").strip().lower()
-                return (key and key in batch_text_lower) or (sur and sur in batch_text_lower)
+                return (key and key in batch_text) or (sur and sur in batch_text)
 
             merged = [t for t in glossary_terms if _term_in_batch(t)]
             # Fallback: if filter produces nothing (e.g. batch is all German already),
@@ -2718,6 +2886,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                 log(f"   Raw response (first 500 chars): {text[:500]}")
                 log(f"  Retrying in 15s...")
                 time.sleep(15)
+                full_rotations += 1  # prevent infinite loop on persistent malformed JSON
                 continue
             except Exception as e:
                 log(f"❌ Gemini error on batch {batch_num}: {e}")
@@ -2740,7 +2909,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
 
     all_rephrased = []
-    _force_retry_sorts: set = set()  # Remedy A: sorts from trunc-guard for unconditional retry
+    _force_retry_sorts: dict = {}    # Remedy A: sorts from trunc-guard for unconditional retry
     _register_block = ''  # built from processed rows; injected into batches 2+
     key_count = len(GEMINI_KEYS)
     _ag_info = ", ".join(f"{_ACCOUNT_LABELS[i]}:{len(g)}" for i, g in enumerate(_ACCOUNT_GROUPS) if g)
@@ -2833,14 +3002,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             if not _cN or not _cN1:
                 continue
             # Look for: ends with closing quote, then whitespace, then new open „..." fragment
-            _echo_match = _re.search(
+            _echo_match = re.search(
                 r'[“"]\s+„(.{3,60}?)[“"]\s*$', _cN
             )
             if not _echo_match:
                 continue
             _echo_phrase = _echo_match.group(1).strip()
             # Check if Row N+1 starts with the same phrase (after its opening „)
-            _n1_inner = _re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
+            _n1_inner = re.match(r'^„(.{3,60}?)[“",\s]', _cN1)
             if not _n1_inner:
                 continue
             _n1_phrase = _n1_inner.group(1).strip()
@@ -2895,7 +3064,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                     log(f"  ⚠️  Trunc guard: sort={_s} too short ({_out_w}w vs MT={_inp_w}w EN={_en_w}w) — restored from MT")
                     _r["content"] = _mt_orig
                     _truncated_sorts.add(_s)
-                    _force_retry_sorts.add(_s)  # Remedy A: bypass _MAX_RETRIES + dialogue exemption
+                    _force_retry_sorts[_s] = 'truncated'    # Remedy A: bypass _MAX_RETRIES + dialogue exemption
                     _trunc_count += 1
         # Cascade unwind: restore the row immediately following each truncated row.
         # It almost certainly received the displaced content of the truncated row.
@@ -2942,7 +3111,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # ── Post-processing + unified retry loop ─────────────────────────────
     # Run post-processing on initial Gemini output
     sorted_rows = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
-    _post_process(sorted_rows, input_data, glossary_terms)
+    _post_process(sorted_rows, input_data, glossary_terms,
+                   force_retry_sorts=_force_retry_sorts)
 
     # Pre-retry RPM cooldown.
     # Problem: after N batches complete, the keys used in those batches are still
@@ -2965,7 +3135,8 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     # Re-run post-processing on retry output to ensure retried rows get
     # the same treatment (Pass QE, comma rules, glossary enforcement, etc.)
     sorted_final = sorted(all_rephrased, key=lambda r: r.get("sort", 0))
-    _post_process(sorted_final, input_data, glossary_terms, skip_bgs_guard=True)
+    _post_process(sorted_final, input_data, glossary_terms, skip_bgs_guard=True,
+                   force_retry_sorts=_force_retry_sorts)
 
     # ── Remedy A: Force-retry pass for trunc-guard rows ──────────────────────────
     if _force_retry_sorts:
@@ -3018,9 +3189,13 @@ def verify_output(original_rows, rephrased_rows):
         )
 
     # Check 5: sample check for English quotation marks (should be German)
+    # Only flag ASCII double quotes (clear signal) and paired English single quotes
+    # ('text'). Bare apostrophes (geht's) and German inner closing quotes (')
+    # are legitimate in German text and must not trigger this warning.
+    _eng_single_quote_pair = re.compile(r"'[^']{2,}'")  # 'text' pattern (English-style)
     english_quotes = [
         r.get("sort") for r in rephrased_rows
-        if '"' in r.get("content", "") or "'" in r.get("content", "")
+        if '"' in r.get("content", "") or _eng_single_quote_pair.search(r.get("content", ""))
     ]
     if len(english_quotes) > 5:
         issues.append(
@@ -3267,6 +3442,7 @@ class _AlreadyProcessedRetry(Exception):
     pass
 
 def run():
+    _init_account_groups()
     try:
         token = login()
     except Exception as e:
@@ -3320,7 +3496,7 @@ def _run_inner(token):
 
         book_name_ovr = matched_book.get("toBookName") or matched_book.get("bookName") or ""
         log(f"  Book: {book_name_ovr} (ID={OVERRIDE_BOOK_ID or 'none'}), Chapter proc_id={proc_id}")
-        claimed_chapters.append((matched_book, f"Override Chapter #{proc_id}", None, "override", proc_id, None))
+        claimed_chapters.append(ClaimedChapter(matched_book, f"Override Chapter #{proc_id}", None, "override", proc_id, None))
 
     # ── Phase 0: Check for already active/claimed chapter ──
     if not claimed_chapters:
@@ -3329,7 +3505,7 @@ def _run_inner(token):
         if active:
             active_book, active_ch_name, active_proc_id, active_task_id = active
             log(f"Found active chapter: {active_ch_name} (proc_id={active_proc_id})")
-            claimed_chapters.append((active_book, active_ch_name, None, "already-claimed", None, active_task_id))
+            claimed_chapters.append(ClaimedChapter(active_book, active_ch_name, None, "already-claimed", None, active_task_id))
         else:
             # ── Phase 1: Claim ──
             for book in books:
@@ -3361,7 +3537,7 @@ def _run_inner(token):
 
                     if DRY_RUN:
                         log(f"  [DRY RUN] Would claim: {ch_name}")
-                        claimed_chapters.append((book, ch_name, ch_id, "dry-run", None, None))
+                        claimed_chapters.append(ClaimedChapter(book, ch_name, ch_id, "dry-run", None, None))
                         break
 
                     result = claim_chapter(token, ch_id)
@@ -3384,7 +3560,7 @@ def _run_inner(token):
                         elif isinstance(rdata, (int, str)) and str(rdata).isdigit():
                             claim_proc_id = int(rdata)
                         log(f"  Claim response data: {rdata} → proc_id={claim_proc_id}")
-                        claimed_chapters.append((book, ch_name, ch_id, "claimed", claim_proc_id, None))
+                        claimed_chapters.append(ClaimedChapter(book, ch_name, ch_id, "claimed", claim_proc_id, None))
                         break
                     elif no_chapter:
                         # Log full response — data may contain the currently active chapter ID
@@ -3398,7 +3574,7 @@ def _run_inner(token):
                             orphan_id = int(rdata)
                         if orphan_id:
                             log(f"  Found orphaned active chapter ID={orphan_id} in submithint response")
-                            claimed_chapters.append((book, ch_name, orphan_id, "claimed", orphan_id, None))
+                            claimed_chapters.append(ClaimedChapter(book, ch_name, orphan_id, "claimed", orphan_id, None))
                             break
                     else:
                         log(f"  ⚠️  Unexpected claim response: {result}")
@@ -3409,9 +3585,12 @@ def _run_inner(token):
 
     # ── Phase 2-6: Process each claimed chapter ──
     entry = claimed_chapters[0]
-    book, ch_name, ch_id, status = entry[0], entry[1], entry[2], entry[3]
-    task_id = entry[5]       # Task Center task ID for closing (None for freshly claimed)
-    claim_proc_id = entry[4]
+    book          = entry.book
+    ch_name       = entry.ch_name
+    ch_id         = entry.ch_id
+    status        = entry.status
+    claim_proc_id = entry.claim_proc_id
+    task_id       = entry.task_id
     book_id   = book.get("id") or book.get("objectBookId") or book.get("bookId")
     book_name = book.get("toBookName") or book.get("bookName") or book.get("name") or ""
 
@@ -3563,11 +3742,11 @@ def _run_inner(token):
     # ── Post-process: fix "X family" / "X-Familie" → "Familie X" ───────────────
     # Two separate patterns to avoid IGNORECASE corrupting the uppercase-name check:
     # Pattern A: hyphenated "Surname-Familie" — safe, no article ambiguity
-    _fam_hyphen = _re.compile(
+    _fam_hyphen = re.compile(
         r"\b([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:-[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)*)-Familie\b"
     )
     # Pattern B: space-separated single-word surname before "family" or " Familie"
-    _fam_space = _re.compile(
+    _fam_space = re.compile(
         r"\b([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)\s+[Ff]amil(?:y|ie)\b"
     )
     _FAM_SKIP = {"Die", "Der", "Das", "Den", "Dem", "Des", "The", "Eine", "Ein",
@@ -3620,13 +3799,11 @@ def _run_inner(token):
             # ── Per-row wall-clock deadline ──────────────────────────────────────────
             # Max 90s per row: with 20s timeout × 3 groups, a full sweep of all
             # groups takes ≤ 60s. The extra 30s cushion covers RPM-cooldown waits.
-            # If we blow past this deadline, skip to deterministic fallback so
-            # remaining rows still get processed within the job time limit.
+            # Deadline is enforced inside _call_gemini_simple — it short-circuits
+            # and returns None when wall-clock exceeds the threshold.
             _row_deadline = time.time() + 90
-            retry_result = _call_gemini_simple(single_prompt, temperature=0.7, max_tokens=2048)
-            if time.time() > _row_deadline:
-                log(f"    ⏱️  sort={sort_n}: per-row deadline exceeded — using deterministic fallback")
-                retry_result = None
+            retry_result = _call_gemini_simple(single_prompt, temperature=0.7, max_tokens=2048,
+                                               deadline=_row_deadline)
             if retry_result and not retry_result[0].get("content", "").strip():
                 retry_result = None
             # Simple direct approach: just copy original content as fallback
@@ -3755,14 +3932,16 @@ def run_test():
     Tests: Gemini key rotation, prompt quality, all post-processors, verification.
     Uses up to 6 Gemini API keys with automatic rotation.
     """
+    _init_account_groups()
     log("=" * 60)
     log("TEST MODE — full pipeline on synthetic data")
     log(f"Gemini keys available: {len(GEMINI_KEYS)}")
     # Log status of every configured Gemini key dynamically
+    # Env var names: GEMINI_API_KEY (no suffix), then GEMINI_API_KEY_2 through _28
     key_statuses = " | ".join(
         f"key {i+1}: {'✅' if k else '⚠️ not set'}"
         for i, k in enumerate(
-            os.environ.get(f"GEMINI_API_KEY{'_' + str(i) if i > 0 else ''}", "")
+            os.environ.get(f"GEMINI_API_KEY{'_' + str(i+1) if i > 0 else ''}", "")
             for i in range(28)
         )
     )
@@ -3829,8 +4008,8 @@ def run_test():
     log("\n[3/4] Post-processors:")
 
     # Count family name fixes
-    _fam_en = _re.compile(r"(?:[Tt]he\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:\s[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})\s+[Ff]amily\b")
-    _fam_de = _re.compile(r"(?:[Dd]ie\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:[-\s][A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})[-\s]Familie\b")
+    _fam_en = re.compile(r"(?:[Tt]he\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:\s[A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})\s+[Ff]amily\b")
+    _fam_de = re.compile(r"(?:[Dd]ie\s+)?([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+(?:[-\s][A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+){0,2})[-\s]Familie\b")
     fam_hits = sum(1 for r in result if _fam_en.search(r.get("content","")) or _fam_de.search(r.get("content","")))
     log(f"  Family name pattern hits before fix: {fam_hits}")
 
