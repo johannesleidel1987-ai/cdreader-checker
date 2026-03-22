@@ -1424,6 +1424,8 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
     final_by_sort = {r.get("sort"): r for r in sorted_final}
 
     success = 0
+    skipped = 0
+    fallback_applied = 0
     for sort, _frs_reason in sorted(force_retry_sorts.items()):
         raw_row    = rows_by_sort.get(sort, {})
         inp_row    = input_by_sort.get(sort, {})
@@ -1433,6 +1435,19 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
         if not mt_content:
             log(f"  \u26a0\ufe0f  Force-retry sort={sort}: no MT content \u2014 skipping.")
             continue
+
+        # Pre-check: if unified retry already produced content that differs from MT,
+        # don't risk clobbering it with a failed Gemini call. The existing result is
+        # already better than raw MT — force-retry can only improve it further, not
+        # replace a working change with a failure.
+        current_content = (final_by_sort.get(sort, {}).get("content") or "").strip()
+        if current_content and current_content != mt_content:
+            current_sim = _row_sim(current_content, mt_content)
+            if current_sim < SIM_THRESHOLD:
+                log(f"  \u2705 Force-retry sort={sort}: unified retry already produced "
+                    f"acceptable result (sim={current_sim:.0%}) \u2014 skipping.")
+                skipped += 1
+                continue
 
         if _frs_reason == 'bleed':
             _frs_tmpl = _FORCE_RETRY_PROMPT_BLEED
@@ -1457,9 +1472,24 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
             log(f"  \u2705 Force-retry sort={sort}: accepted (sim={new_sim:.0%}): {new_content[:60]!r}")
             success += 1
         else:
-            log(f"  \u26a0\ufe0f  Force-retry sort={sort}: Gemini call failed \u2014 verbatim MT remains.")
+            # Gemini call failed — apply deterministic fallback so the row at least
+            # differs from MT, preventing ErrMessage10 rejection on finish.
+            _fb_source = current_content if current_content else mt_content
+            fallback = _deterministic_change(_fb_source)
+            if fallback != _fb_source and final_by_sort.get(sort):
+                final_by_sort[sort]["content"] = fallback
+                fallback_applied += 1
+                log(f"  \U0001f527 Force-retry sort={sort}: Gemini failed \u2014 deterministic fallback applied: {fallback[:60]!r}")
+            elif current_content and current_content != mt_content:
+                # Deterministic change couldn't improve, but unified retry's result
+                # already differs from MT — keep it.
+                log(f"  \u26a0\ufe0f  Force-retry sort={sort}: Gemini failed, no further fallback \u2014 "
+                    f"keeping unified retry result (differs from MT).")
+            else:
+                log(f"  \u26a0\ufe0f  Force-retry sort={sort}: Gemini failed, no fallback possible \u2014 verbatim MT remains.")
 
-    log(f"  \U0001f4ac Force-retry pass complete: {success}/{len(force_retry_sorts)} row(s) re-edited.")
+    log(f"  \U0001f4ac Force-retry pass complete: {success}/{len(force_retry_sorts)} re-edited, "
+        f"{skipped} skipped (already OK), {fallback_applied} deterministic fallback(s).")
     return sorted(final_by_sort.values(), key=lambda r: r.get("sort", 0))
 
 
@@ -1985,7 +2015,15 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
             fixed = stripped
 
         elif role == "open":
-            if en_starts_quote:
+            # Attribution-start guard: if EN starts with speech quotes but the German
+            # output starts with an attribution/speech verb, the speech content was
+            # displaced to an adjacent row. Injecting „ around attribution text produces
+            # malformed output (e.g. „warf Noreen sanft ein...). Skip quote injection.
+            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')\b', stripped, re.IGNORECASE):
+                log(f"  ⚠️  Quote reinject: sort={sort_n} role={role} — DE starts with "
+                    f"attribution verb but EN starts with speech. Skipping quote injection.")
+                fixed = stripped
+            elif en_starts_quote:
                 # Start-of-row opener
                 fixed = _QE_OPEN + stripped
             else:
@@ -2012,7 +2050,13 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
                 fixed = stripped + _QE_CLOSE
 
         elif role == "both":
-            if en_starts_quote:
+            # Attribution-start guard (same as role=="open" above): skip quote injection
+            # when DE starts with an attribution verb but EN starts with speech quotes.
+            if en_starts_quote and re.match(r'^\s*(?:' + _SV + r')\b', stripped, re.IGNORECASE):
+                log(f"  ⚠️  Quote reinject: sort={sort_n} role={role} — DE starts with "
+                    f"attribution verb but EN starts with speech. Skipping quote injection.")
+                fixed = stripped
+            elif en_starts_quote:
                 # Start-of-row both: „ at start, “ guided by EN attribution
                 if _en_has_post_close_attribution(eng):
                     pos, needs_comma = _find_speech_end(stripped, eng)
@@ -3051,6 +3095,14 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
             _en_w  = _en_wc.get(_s, 0)    # English source word count
             _out_w = len((_r.get("content") or "").split())
             _mt_trigger = _inp_w >= _TRUNCATION_MIN_WORDS and _out_w < _inp_w * _TRUNCATION_THRESHOLD
+            # EN-alignment exemption: when EN and MT have very different word counts
+            # (CDReader source data misalignment), Gemini correctly follows the EN length.
+            # The output looks "truncated" relative to MT but is actually EN-aligned.
+            # Example: EN=6w "Did I fail to please you?" / MT=23w (dialogue+narrative).
+            # Gemini outputs 6w matching EN → trunc guard fires (6 < 23×0.35=8).
+            # Suppress MT trigger when output is at least 50% of EN length.
+            if _mt_trigger and _en_w >= 2 and _out_w >= _en_w * 0.5:
+                _mt_trigger = False
             # EN trigger: only fire when MT is also >= 3 words. If MT is 1-2 words,
             # the EN/MT length discrepancy is a CDReader source data issue (EN field
             # sometimes contains concatenated text from adjacent rows), not Gemini truncation.
@@ -3857,6 +3909,29 @@ def _run_inner(token):
         or submit_result.get("code") in ("311", "315", 0)
     )
 
+    # ── Remedy E: Session-expired submit retry (ErrMessage3) ─────────────────
+    # CDReader's editing session opened by StartChapter can expire if processing
+    # takes too long (RPM cooldowns, many retry rows, force-retry timeouts).
+    # ErrMessage3 signals a chapter-state precondition failure — the session lock
+    # is no longer valid.  Fix: re-open the session and retry the submit once.
+    if not submit_ok and "ErrMessage3" in str(submit_result.get("message", "")):
+        log(f"  ⚠️  ErrMessage3 — editing session likely expired. Re-opening session and retrying submit...")
+        try:
+            start_chapter(token, proc_id)
+            time.sleep(2)
+            submit_result = submit_chapter(token, proc_id, rephrased, rows)
+            submit_ok = (
+                submit_result.get("status") is True
+                or submit_result.get("message") in ("SaveSuccess", "OperSuccess")
+                or submit_result.get("code") in ("311", "315", 0)
+            )
+            if submit_ok:
+                log(f"  ✅ Submit succeeded after session refresh.")
+            else:
+                log(f"  ❌ Submit still failing after session refresh: {submit_result}")
+        except Exception as e:
+            log(f"  ❌ Session refresh / resubmit exception: {e}")
+
     if not submit_ok:
         msg = (
             f"❌ <b>CDReader: Submit failed</b>\n"
@@ -3912,6 +3987,36 @@ def _run_inner(token):
             return
 
     # Close the Task Center task (equivalent to clicking "verify and close")
+    # In override mode, task_id is None because Task Center was skipped.
+    # Scan for the matching task entry so the Task Center stays clean.
+    if not task_id and proc_id:
+        log(f"  ℹ️  No task_id — scanning Task Center for chapter {proc_id}...")
+        try:
+            _tc_resp = requests.post(
+                f"{BASE_URL}/TaskCenter/AuthorTaskCenterList",
+                headers={**auth_headers(token), "content-type": "application/json;charset=UTF-8"},
+                json={"PageIndex": 1, "PageSize": 20,
+                      "status": "", "optUsers": "",
+                      "taskType": [], "taskTitle": ""},
+                timeout=15,
+            )
+            _tc_resp.raise_for_status()
+            _tc_data = _tc_resp.json().get("data", {})
+            _tc_tasks = (
+                _tc_data.get("dtolist") or _tc_data.get("list") or
+                _tc_data.get("items") or (_tc_data if isinstance(_tc_data, list) else [])
+            )
+            for _tc_t in _tc_tasks:
+                _tc_cid = _tc_t.get("chapterId") or _tc_t.get("objectChapterId")
+                if str(_tc_cid) == str(proc_id):
+                    task_id = _tc_t.get("id")
+                    log(f"  ✅ Found matching Task Center entry: task_id={task_id}")
+                    break
+            if not task_id:
+                log(f"  ℹ️  No Task Center entry found for chapter {proc_id}.")
+        except Exception as e:
+            log(f"  ⚠️  Task Center scan failed: {e}")
+
     time.sleep(2)
     close_task(token, task_id)
 
