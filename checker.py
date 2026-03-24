@@ -322,6 +322,18 @@ def log(msg):
 def auth_headers(token):
     return {**HEADERS, "authorization": f"Bearer {token}"}
 
+def _safe_raise_for_status(resp):
+    """Like resp.raise_for_status(), but strips API keys from the error message.
+    Gemini URLs contain ?key=... which would be exposed in stack traces."""
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        sanitized = str(e)
+        for k in GEMINI_KEYS:
+            if k in sanitized:
+                sanitized = sanitized.replace(k, "***")
+        raise requests.HTTPError(sanitized, response=resp) from None
+
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         log("Telegram not configured — skipping.")
@@ -771,6 +783,21 @@ SIM_THRESHOLD = 0.88      # flag rows at or above this combined similarity
 
 # Module-level synonym table — shared by _deterministic_change and _find_synonym_pair.
 # Ordered by word frequency so the highest-coverage substitutions are tried first.
+#
+# Each entry is a 3-tuple: (regex_pattern, replacement, register_tag)
+#   'n' = neutral    — safe in all contexts including dialogue
+#   'l' = literary   — shifts toward higher/formal register; skip in dialogue
+#   'e' = emphatic   — dramatically changes meaning or intensity; skip in dialogue
+#
+# ⚠️ CHAIN AWARENESS: Some entries form transitive chains where the replacement of
+# one word is itself a source word further down the table. If multiple retry passes
+# trigger on the same row, successive substitutions can shift meaning:
+#   doch → dennoch → trotz allem  |  hell → strahlend → leuchtend
+#   trotzdem → dennoch → trotz allem
+# This is acceptable because _deterministic_change applies only ONE substitution
+# per call and retry passes don't re-apply to their own output. But avoid adding
+# new entries whose target is an existing source word unless the chain is harmless.
+# Each target should ideally be unique across the table (no two sources → same target).
 _SYNONYMS = [
     # Conjunctions & particles (highest frequency)
     # NOTE: und→sowie intentionally removed. "sowie" only fits nominal/noun-phrase
@@ -779,107 +806,111 @@ _SYNONYMS = [
     # grammatically wrong output on nearly every sentence, and caused _find_synonym_pair
     # to inject an unenforceable mandatory swap into retry prompts, triggering the
     # model to return the sentence unchanged (100% similarity regression).
-    (r'\baber\b', 'jedoch'),
-    (r'\bauch\b', 'ebenfalls'),
-    (r'\bdoch\b', 'dennoch'),
-    (r'\balso\b', 'demnach'),
-    (r'\bdann\b', 'daraufhin'),
-    (r'\bnur\b', 'lediglich'),
-    (r'\bnoch\b', 'weiterhin'),
-    (r'\bschon\b', 'bereits'),
-    (r'\bjetzt\b', 'nun'),
-    (r'\bimmer\b', 'stets'),
-    (r'\bso\b', 'derart'),
-    (r'\bganz\b', 'völlig'),
-    (r'\bwieder\b', 'erneut'),
-    (r'\bwohl\b', 'vermutlich'),
-    (r'\berst\b', 'zunächst'),
+    (r'\baber\b', 'jedoch', 'n'),
+    (r'\bauch\b', 'ebenfalls', 'l'),
+    (r'\bdoch\b', 'dennoch', 'n'),
+    (r'\balso\b', 'demnach', 'l'),
+    (r'\bdann\b', 'daraufhin', 'l'),
+    (r'\bnur\b', 'lediglich', 'l'),
+    (r'\bnoch\b', 'weiterhin', 'n'),
+    (r'\bschon\b', 'bereits', 'n'),
+    (r'\bjetzt\b', 'nun', 'n'),
+    (r'\bimmer\b', 'stets', 'l'),
+    (r'\bso\b', 'derart', 'l'),
+    (r'\bganz\b', 'völlig', 'n'),
+    (r'\bwieder\b', 'erneut', 'n'),
+    (r'\bwohl\b', 'vermutlich', 'n'),
+    (r'\berst\b', 'zunächst', 'n'),
     # Adverbs
-    (r'\bsehr\b', 'äußerst'),
-    (r'\bschnell\b', 'rasch'),
-    (r'\bwirklich\b', 'tatsächlich'),
-    (r'\bgenau\b', 'exakt'),
-    (r'\bplötzlich\b', 'unvermittelt'),
-    (r'\bsofort\b', 'umgehend'),
-    (r'\bnatürlich\b', 'selbstverständlich'),
-    (r'\bvielleicht\b', 'möglicherweise'),
-    (r'\bleise\b', 'still'),
-    (r'\bgelassen\b', 'ruhig'),
-    (r'\bstolz\b', 'selbstbewusst'),
+    (r'\bsehr\b', 'äußerst', 'e'),
+    (r'\bschnell\b', 'rasch', 'n'),
+    (r'\bwirklich\b', 'tatsächlich', 'n'),
+    (r'\bgenau\b', 'exakt', 'n'),
+    (r'\bplötzlich\b', 'unvermittelt', 'l'),
+    (r'\bsofort\b', 'umgehend', 'l'),
+    (r'\bnatürlich\b', 'selbstverständlich', 'l'),
+    (r'\bvielleicht\b', 'möglicherweise', 'l'),
+    (r'\bleise\b', 'still', 'n'),
+    (r'\bgelassen\b', 'ruhig', 'n'),
+    (r'\bstolz\b', 'selbstbewusst', 'n'),
     # Adjectives
-    (r'\bschwer\b', 'schwierig'),
-    (r'\bgroß\b', 'beträchtlich'),
-    (r'\bklein\b', 'gering'),
+    (r'\bschwer\b', 'schwierig', 'n'),
+    (r'\bgroß\b', 'beträchtlich', 'l'),
+    (r'\bklein\b', 'gering', 'l'),
     # REMOVED: gut→angemessen — only fits evaluative contexts, wrong for 'es geht mir gut' etc.
-    (r'\balt\b', 'betagt'),
-    (r'\bkurz\b', 'knapp'),
-    (r'\bfroh\b', 'erfreut'),
+    (r'\balt\b', 'betagt', 'l'),
+    (r'\bkurz\b', 'knapp', 'n'),
+    (r'\bfroh\b', 'erfreut', 'n'),
     # Common verbs
-    (r'\bsagte\b', 'meinte'),
-    (r'\bfragte\b', 'erkundigte sich'),
-    (r'\bantwortete\b', 'erwiderte'),
-    (r'\bnickte\b', 'stimmte zu'),
-    (r'\blächelte\b', 'schmunzelte'),
-    (r'\bging\b', 'begab sich'),
-    (r'\bkam\b', 'erschien'),
-    (r'\bsah\b', 'erblickte'),
-    (r'\bwollte\b', 'beabsichtigte'),
-    (r'\bkonnte\b', 'vermochte'),
-    (r'\bmusste\b', 'war gezwungen zu'),
-    (r'\bwusste\b', 'war sich bewusst'),
+    (r'\bsagte\b', 'meinte', 'n'),
+    (r'\bfragte\b', 'erkundigte sich', 'l'),
+    (r'\bantwortete\b', 'erwiderte', 'n'),
+    (r'\bnickte\b', 'stimmte zu', 'l'),
+    (r'\blächelte\b', 'schmunzelte', 'n'),
+    (r'\bging\b', 'begab sich', 'l'),
+    (r'\bkam\b', 'erschien', 'l'),
+    (r'\bsah\b', 'erblickte', 'l'),
+    (r'\bwollte\b', 'beabsichtigte', 'l'),
+    (r'\bkonnte\b', 'vermochte', 'l'),
+    (r'\bmusste\b', 'war gezwungen zu', 'e'),
+    (r'\bwusste\b', 'war sich bewusst', 'l'),
     # Common verbs (second tier — matched after Gemini may have already used conjunctions)
-    (r'\btrieb\b', 'drängte'),
-    (r'\bstand\b', 'verharrte'),
+    (r'\btrieb\b', 'drängte', 'n'),
+    (r'\bstand\b', 'verharrte', 'l'),
     # REMOVED: ließ→brachte — different semantics ('sie ließ ihn gehen' ≠ 'sie brachte ihn gehen')
-    (r'\bblickte\b', 'schaute'),
-    (r'\bhörte\b', 'vernahm'),
-    (r'\bspürte\b', 'fühlte'),
-    (r'\bdachte\b', 'überlegte'),
+    (r'\bblickte\b', 'schaute', 'n'),
+    (r'\bhörte\b', 'vernahm', 'l'),
+    (r'\bspürte\b', 'fühlte', 'n'),
+    (r'\bdachte\b', 'überlegte', 'n'),
     # REMOVED: warf→richtete — only valid for 'Blick werfen', wrong for physical throwing
     # REMOVED: stieg→erhob sich — wrong for 'stieg aus dem Auto', only works for rising from seat
-    (r'\bzog\b', 'bewegte'),
-    (r'\bhob\b', 'erhob'),
+    (r'\bzog\b', 'bewegte', 'n'),
+    (r'\bhob\b', 'erhob', 'n'),
     # REMOVED: schloss→verschloss — 'closed' vs 'locked', different actions
     # REMOVED: öffnete→entriegelte — 'opened' vs 'unbolted', different actions
-    (r'\bsaß\b', 'befand sich'),
-    (r'\blag\b', 'ruhte'),
+    (r'\bsaß\b', 'befand sich', 'l'),
+    (r'\blag\b', 'ruhte', 'l'),
     # REMOVED: wurde→war geworden — changes tense (Präteritum→Plusquamperfekt), ungrammatical
     # Common adjectives/adverbs (second tier)
-    (r'\bsanft\b', 'zart'),
-    (r'\bfest\b', 'beständig'),
-    (r'\bstill\b', 'ruhig'),
-    (r'\bhell\b', 'strahlend'),
-    (r'\bdunkel\b', 'finster'),
-    (r'\bkalt\b', 'eisig'),
-    (r'\bwarm\b', 'behaglich'),
-    (r'\bleicht\b', 'mühelos'),
-    (r'\btief\b', 'gründlich'),
-    (r'\bhoch\b', 'erhaben'),
-    (r'\bjung\b', 'jugendlich'),
-    (r'\bstark\b', 'kräftig'),
-    (r'\bschwach\b', 'kraftlos'),
-        (r'\bstrahlend\b', 'leuchtend'),
+    (r'\bsanft\b', 'zart', 'n'),
+    (r'\bfest\b', 'beständig', 'l'),
+    (r'\bstill\b', 'geräuschlos', 'n'),  # not 'ruhig' — gelassen→ruhig already maps there
+    (r'\bhell\b', 'strahlend', 'n'),
+    (r'\bdunkel\b', 'finster', 'n'),
+    (r'\bkalt\b', 'eisig', 'e'),
+    (r'\bwarm\b', 'behaglich', 'l'),
+    (r'\bleicht\b', 'mühelos', 'l'),
+    (r'\btief\b', 'gründlich', 'l'),
+    (r'\bhoch\b', 'erhaben', 'e'),
+    (r'\bjung\b', 'jugendlich', 'n'),
+    (r'\bstark\b', 'kräftig', 'n'),
+    (r'\bschwach\b', 'kraftlos', 'n'),
+    (r'\bstrahlend\b', 'leuchtend', 'n'),
     # Sentence adverbs & connectors (second tier)
-    (r'\bdaraufhin\b', 'anschließend'),
-    (r'\bschließlich\b', 'letztendlich'),
-    (r'\btatsächlich\b', 'wahrhaftig'),
-    (r'\baußerdem\b', 'überdies'),
-    (r'\bdeshalb\b', 'daher'),
-    (r'\btrotzdem\b', 'dennoch'),
-    (r'\bjedoch\b', 'allerdings'),
-    (r'\bdennoch\b', 'trotz allem'),
-    (r'\bsicherlich\b', 'gewiss'),
-    (r'\boffensichtlich\b', 'augenscheinlich'),
+    (r'\bdaraufhin\b', 'anschließend', 'n'),
+    (r'\bschließlich\b', 'letztendlich', 'n'),
+    (r'\btatsächlich\b', 'wahrhaftig', 'e'),
+    (r'\baußerdem\b', 'überdies', 'l'),
+    (r'\bdeshalb\b', 'daher', 'n'),
+    (r'\btrotzdem\b', 'dennoch', 'n'),
+    (r'\bjedoch\b', 'allerdings', 'n'),
+    (r'\bdennoch\b', 'trotz allem', 'n'),
+    (r'\bsicherlich\b', 'gewiss', 'n'),
+    (r'\boffensichtlich\b', 'augenscheinlich', 'l'),
     # Nouns & other
-    (r'\betwas\b', 'ein wenig'),
+    (r'\betwas\b', 'ein wenig', 'l'),
     # REMOVED: Worte→Wörter — not synonyms (Worte=utterances, Wörter=vocab items)
-    (r'\bnicht\b', 'keineswegs'),  # last resort — changes meaning slightly
+    (r'\bnicht\b', 'keineswegs', 'e'),  # last resort — changes meaning dramatically
 ]
 
 
-def _find_synonym_pair(text):
+def _find_synonym_pair(text, is_dialogue=False):
     """Return (matched_literal, replacement) for the first synonym that applies to text,
     skipping matches that fall inside German quotation marks („...").
+
+    When is_dialogue=True, only 'n' (neutral) register synonyms are considered.
+    Literary ('l') and emphatic ('e') substitutions are skipped to preserve
+    character voice in dialogue lines.
 
     Used to inject a concrete mandatory word-swap into retry prompts, so the model
     cannot return the same text. If the target word is inside a direct quote the model
@@ -907,19 +938,24 @@ def _find_synonym_pair(text):
         return any(qs <= match_start and match_end <= qe + 1
                    for qs, qe in _quote_ranges)
 
-    for pattern, replacement in _SYNONYMS:
+    for pattern, replacement, register in _SYNONYMS:
+        if is_dialogue and register != 'n':
+            continue  # skip literary/emphatic synonyms in dialogue
         m = re.search(pattern, text)
         if m and not _in_quotes(m.start(), m.end()):
             return (m.group(0), replacement)
     return None
 
 
-def _deterministic_change(text):
+def _deterministic_change(text, is_dialogue=False):
     """Make ONE guaranteed-small change to a German text without any API call.
 
     Used as a last-resort fallback when all Gemini keys are exhausted and the
     similarity/verbatim retry cannot reach the API. Ensures every row differs
     from the MT by at least one word, preventing CDReader ErrMessage10 rejection.
+
+    When is_dialogue=True, only 'n' (neutral) register synonyms are used.
+    Literary and emphatic substitutions are skipped to preserve character voice.
 
     Strategy: try synonym substitutions in priority order; apply the FIRST match only.
     Skips matches inside quoted speech (consistent with _find_synonym_pair).
@@ -942,7 +978,9 @@ def _deterministic_change(text):
         return any(qs <= match_start and match_end <= qe + 1
                    for qs, qe in _quote_ranges)
 
-    for pattern, replacement in _SYNONYMS:
+    for pattern, replacement, register in _SYNONYMS:
+        if is_dialogue and register != 'n':
+            continue  # skip literary/emphatic synonyms in dialogue
         m = re.search(pattern, text)
         if m and not _in_quotes(m.start(), m.end()):
             return re.sub(pattern, replacement, text, count=1)
@@ -950,6 +988,12 @@ def _deterministic_change(text):
     # Comma→semicolon was removed: it frequently broke syntax where a comma is
     # grammatically required (subordinate clauses, enumeration, inline attribution).
     return text
+
+
+def _has_dialogue(text):
+    """Return True if text contains German dialogue markers (opening „ or closing ").
+    Used to decide whether to restrict synonyms to neutral-only register."""
+    return '\u201e' in text or '\u201c' in text
 
 
 def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None):
@@ -1017,7 +1061,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None)
             raise
         if resp.status_code in (500, 502, 503, 504):
             # Single transient 5xx: raise so group rotation tries another key/group
-            resp.raise_for_status()
+            _safe_raise_for_status(resp)
 
         if resp.status_code == 429:
             is_rpd = False
@@ -1032,7 +1076,7 @@ def _call_gemini_simple(prompt, temperature=0.5, max_tokens=2048, deadline=None)
             except Exception:
                 pass
             return None, is_rpd, not is_rpd
-        resp.raise_for_status()
+        _safe_raise_for_status(resp)
         body = resp.json()
         candidates = body.get("candidates", [])
         if not candidates:
@@ -1231,9 +1275,13 @@ def _unified_retry(all_rephrased, input_data, rows):
     _fallback_applied = 0
 
     for sort_n, (current_out, ref_text, reason) in retry_candidates.items():
+        # Dialogue detection: restrict synonym substitutions to neutral register
+        # for rows containing German dialogue markers (Fix #11).
+        _is_dlg = _has_dialogue(current_out)
+
         # Skip API call if keys are dead (Fix C)
         if not _keys_alive:
-            fallback = _deterministic_change(current_out)
+            fallback = _deterministic_change(current_out, is_dialogue=_is_dlg)
             if fallback != current_out:
                 rephrased_by_sort[sort_n]["content"] = fallback
                 _fallback_applied += 1
@@ -1257,7 +1305,7 @@ def _unified_retry(all_rephrased, input_data, rows):
             # Pre-compute the required word swap so the model has a concrete, mandatory
             # anchor. Without this, the model at low temperature sees a correct sentence
             # and returns it unchanged despite the "make a small change" instruction.
-            _swap = _find_synonym_pair(current_out)
+            _swap = _find_synonym_pair(current_out, is_dialogue=_is_dlg)
             if _swap:
                 _swap_instruction = (
                     f"PFLICHT: Ersetze in deiner Antwort \u00bbexakt\u00ab das Wort "
@@ -1281,7 +1329,7 @@ def _unified_retry(all_rephrased, input_data, rows):
             temp = 0.5
         else:  # verbatim
             # Same approach: give the model a specific word to swap, not a vague instruction.
-            _swap = _find_synonym_pair(current_out)
+            _swap = _find_synonym_pair(current_out, is_dialogue=_is_dlg)
             if _swap:
                 _swap_instruction = (
                     f"PFLICHT: Ersetze in deiner Antwort \u00bbexakt\u00ab das Wort "
@@ -1312,7 +1360,7 @@ def _unified_retry(all_rephrased, input_data, rows):
                 # threshold (e.g. sort=15→88%, sort=76→89%, sort=17→100%), apply one
                 # deterministic change on top so it clears the rejection zone.
                 if "similar" in reason and new_sim >= SIM_THRESHOLD:
-                    boosted = _deterministic_change(new_content)
+                    boosted = _deterministic_change(new_content, is_dialogue=_is_dlg)
                     if boosted != new_content:
                         boosted_sim = _row_sim(boosted, ref_text)
                         log(f"    ✅ sort={sort_n}: retry OK but still {new_sim:.0%} — det. boost → {boosted_sim:.0%}: {boosted[:60]!r}")
@@ -1331,7 +1379,7 @@ def _unified_retry(all_rephrased, input_data, rows):
                     _api_retries_ok += 1
             else:
                 # API returned same text — apply deterministic fallback
-                fallback = _deterministic_change(current_out)
+                fallback = _deterministic_change(current_out, is_dialogue=_is_dlg)
                 if fallback != current_out:
                     rephrased_by_sort[sort_n]["content"] = fallback
                     _fallback_applied += 1
@@ -1340,7 +1388,7 @@ def _unified_retry(all_rephrased, input_data, rows):
                     log(f"    ⚠️  sort={sort_n}: retry unchanged, no fallback possible")
         else:
             # API call failed — apply deterministic fallback (Fix B)
-            fallback = _deterministic_change(current_out)
+            fallback = _deterministic_change(current_out, is_dialogue=_is_dlg)
             if fallback != current_out:
                 rephrased_by_sort[sort_n]["content"] = fallback
                 _fallback_applied += 1
@@ -1475,7 +1523,8 @@ def _run_force_retry_pass(force_retry_sorts, sorted_final, rows, input_data, glo
             # Gemini call failed — apply deterministic fallback so the row at least
             # differs from MT, preventing ErrMessage10 rejection on finish.
             _fb_source = current_content if current_content else mt_content
-            fallback = _deterministic_change(_fb_source)
+            _is_dlg = _has_dialogue(_fb_source)
+            fallback = _deterministic_change(_fb_source, is_dialogue=_is_dlg)
             if fallback != _fb_source and final_by_sort.get(sort):
                 final_by_sort[sort]["content"] = fallback
                 fallback_applied += 1
@@ -1989,6 +2038,13 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
         en_starts_quote = bool(eng and re.match(r'^[""„“«]', eng.strip()))
         stripped = _strip_outer_quotes(fixed)
 
+        # Fix #15: After stripping quotes, '?", ' or '!", ' becomes '?, ' or '!, '.
+        # The comma was originally between the closing quote and attribution — correct
+        # in the quoted form but now orphaned. Remove it here; Quote Reinject's comma
+        # rules (C2, F) will re-add the comma in the right position after the new
+        # closing quote. Without this, the interaction produces double commas: ?,,
+        stripped = re.sub(r'([?!]),(\s)', r'\1\2', stripped)
+
         # Fix 3 (checker-27): Attribution-only quote-injection guard.
         # If Gemini returned a pure Begleitsatz (e.g. "meinte er und
         # unterbrach...") for a row that should contain speech content,
@@ -2404,30 +2460,37 @@ def _post_process(sorted_rows, input_data, glossary_terms, skip_bgs_guard=False,
     # and replaces them with the correct German target — bypassing model compliance.
     # Only applies when we have a non-empty glossary.
     if glossary_terms:
-        # Build replacement map: source (lowercased for matching) → target
+        # Build replacement map: pre-compiled pattern + target.
         # Longer terms first so "Black Reef Island" replaces before "Black" could.
+        # Patterns are compiled once here, not inside the per-row loop (Fix #1).
         replacement_pairs = []
         for t in glossary_terms:
             src = (t.get("dictionaryKey") or "").strip()
             tgt = (t.get("dictionaryValue") or "").strip()
             if src and tgt and src != tgt:  # skip no-ops (e.g. Moss→Moss)
-                replacement_pairs.append((src, tgt))
-        # Sort by length descending so multi-word terms match before subterms
+                try:
+                    pat = re.compile(r'(?<![\w\-])' + re.escape(src) + r'(?![\w\-])', re.IGNORECASE)
+                    replacement_pairs.append((src, pat, tgt))
+                except re.error:
+                    pass  # skip malformed patterns
+        # Sort by source length descending so multi-word terms match before subterms
         replacement_pairs.sort(key=lambda x: len(x[0]), reverse=True)
 
         gloss_fixes = 0
         for row in sorted_rows:
+            sort_n = row.get("sort")
             original_content = row.get("content", "")
             new_content = original_content
-            for src, tgt in replacement_pairs:
-                # Word-boundary aware replacement, case-insensitive
-                try:
-                    pattern = re.compile(r'(?<![\w\-])' + re.escape(src) + r'(?![\w\-])', re.IGNORECASE)
-                    replaced = pattern.sub(tgt, new_content)
-                    if replaced != new_content:
-                        new_content = replaced
-                except re.error:
-                    pass  # skip malformed patterns
+            # Fix #14: Only replace a glossary term if the English source for this
+            # row actually contains the term. Prevents false positives where a German
+            # word coincidentally matches a glossary source (e.g. "See" = lake, not sea).
+            eng_source = (_eng_by_sort.get(sort_n, "") or "").lower()
+            for src, pat, tgt in replacement_pairs:
+                if src.lower() not in eng_source:
+                    continue  # EN source doesn't contain this term — skip
+                replaced = pat.sub(tgt, new_content)
+                if replaced != new_content:
+                    new_content = replaced
             if new_content != original_content:
                 row["content"] = new_content
                 gloss_fixes += 1
@@ -2450,14 +2513,11 @@ def _build_register_block(processed_rows):
     First-occurrence wins; once a name is mapped it is never overwritten.
     Called after each batch; injected into all subsequent batch prompts.
     """
-    _du_re = re.compile(r'\b(du|dich|dir|dein\w*)\b', re.IGNORECASE)
+    _du_re = re.compile(r'\b(du|dich|dir|dein\w*)\b')  # lowercase only per prompt capitalisation rules
     _formal_re = re.compile(r'\b(Ihnen|Ihrem|Ihren|Ihrer|Ihres)\b')
     _attrib_re = re.compile(
         r'[\u201e"](.*?)[\u201c"]\s*[,.]?\s*'
-        r'(?:sagte|fragte|fl\u00fcsterte|antwortete|rief|meinte|erwiderte|sprach|'
-        r'murmelte|zischte|raunte|hauchte|stammelte|schrie|br\u00fcllte|wisperte|'
-        r'knurrte|erg\u00e4nzte|verk\u00fcndete|bat|flehte|konterte|erkl\u00e4rte|'
-        r'betonte|lachte|grinste|nickte|seufzte|schnaubte|brummte|stotterte)\s+'
+        r'(?:' + _SV_CORE + r')\s+'
         r'([A-Z\u00c4\u00d6\u00dc][a-z\u00e4\u00f6\u00fc\u00df]{2,})\b'
     )
     register_map = {}
@@ -2876,7 +2936,6 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         err_body = resp.json()
                         err_obj = err_body.get("error", {})
                         err_msg = str(err_obj.get("message", "")).lower()
-                        err_status = str(err_obj.get("status", "")).upper()
                         err_details = str(err_obj.get("details", "")).lower()
                         combined = err_msg + err_details
                         # RPD keywords: covers both "exceeded your current quota / billing"
@@ -2902,7 +2961,7 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
                         remaining = len([k for k in GEMINI_KEYS if k not in _exhausted_keys])
                         log(f"  🔄 Key RPM-limited{limit_hint}, {remaining} key(s) remaining...")
                     continue
-                resp.raise_for_status()
+                _safe_raise_for_status(resp)
                 body = resp.json()
 
                 # Log finish reason for diagnostics
@@ -2947,10 +3006,25 @@ def rephrase_with_gemini(rows, glossary_terms, book_name):
     _title_row = next((r for r in input_data if r.get("sort") == 0), None)
     gemini_input_data = [r for r in input_data if r.get("sort") != 0]
 
-    # Split into batches and call Gemini for each
-    batches = [gemini_input_data[i:i+BATCH_SIZE] for i in range(0, len(gemini_input_data), BATCH_SIZE)]
+    # Split into batches and call Gemini for each.
+    # Adaptive sizing: estimate prompt size per row and reduce BATCH_SIZE if a batch
+    # would exceed ~300K characters (~75K tokens), preventing silent context overflow.
+    _avg_row_chars = sum(
+        len(r.get("original", "")) + len(r.get("content", ""))
+        for r in gemini_input_data
+    ) / max(len(gemini_input_data), 1)
+    _prompt_overhead = len(BASE_PROMPT) + 2000  # glossary + register block + framing
+    _max_prompt_chars = 300_000
+    _effective_batch_size = BATCH_SIZE
+    if _avg_row_chars > 0:
+        _max_rows_for_budget = int((_max_prompt_chars - _prompt_overhead) / (_avg_row_chars + 100))  # +100 for JSON wrapper
+        if _max_rows_for_budget < _effective_batch_size and _max_rows_for_budget >= 5:
+            _effective_batch_size = _max_rows_for_budget
+            log(f"  ⚠️  Token budget guard: avg row={_avg_row_chars:.0f} chars — reducing batch size to {_effective_batch_size}")
+
+    batches = [gemini_input_data[i:i+_effective_batch_size] for i in range(0, len(gemini_input_data), _effective_batch_size)]
     total_batches = len(batches)
-    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{BATCH_SIZE}...")
+    log(f"  Splitting {len(gemini_input_data)} rows into {total_batches} batches of ~{_effective_batch_size}...")
 
     all_rephrased = []
     _force_retry_sorts: dict = {}    # Remedy A: sorts from trunc-guard for unconditional retry
