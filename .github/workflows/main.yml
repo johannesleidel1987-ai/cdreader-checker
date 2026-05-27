@@ -22,7 +22,7 @@ on:
         default: ''
         type: string
   schedule:
-    - cron: '*/8 * * * *'
+    - cron: '*/9 * * * *'
 
 concurrency:
   group: cdreader-checker
